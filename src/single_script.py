@@ -8,7 +8,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from metadrive import MetaDriveEnv
 from metadrive.examples import expert
-from metadrive.component.sensors.rgb_camera import RGBCamera # Bu importu en üste ekleyin
+from metadrive.component.sensors.rgb_camera import RGBCamera 
+
 # ==========================================
 # 1. DEPTH ESTIMATION MODELI
 # ==========================================
@@ -17,7 +18,6 @@ class DepthEstimationModel:
         pass # Kendi modelinizi burada yükleyin
 
     def predict(self, rgb_image: np.ndarray) -> np.ndarray:
-        # Dummy işlem: RGB'yi griye çevirip 1 kanallı hale getirir
         depth_map = np.mean(rgb_image, axis=2, keepdims=True)
         depth_map = np.transpose(depth_map, (2, 0, 1))
         return (depth_map / 255.0).astype(np.float32)
@@ -27,6 +27,7 @@ class DepthEstimationModel:
 # ==========================================
 def collect_expert_data(num_episodes=10, save_dir="dataset"):
     os.makedirs(save_dir, exist_ok=True)
+    print(f"Veriler '{save_dir}' klasörüne kaydediliyor...")
     
     config = {
         "use_render": True,  
@@ -35,7 +36,7 @@ def collect_expert_data(num_episodes=10, save_dir="dataset"):
             "rgb": (RGBCamera, 84, 84), 
         },
         "vehicle_config": dict(image_source="rgb"),
-        "show_interface": False, # <--- Düzeltilen satır burası
+        "show_interface": False, 
         "image_on_cuda": False,  
         "preload_models": True
     }
@@ -48,21 +49,16 @@ def collect_expert_data(num_episodes=10, save_dir="dataset"):
     for ep in range(num_episodes):
         obs, info = env.reset()
         
-        # expert = ExpertPolicy(env.agent)  <--- BU SATIRI SİLDİK
-        
         depth_maps = []
         actions = []
         
         done = False
         while not done:
-            # Artık 'expert' fonksiyonu import ettiğimiz PPO modelini kullanarak çalışacak
             action = expert(env.agent, deterministic=True) 
             
-            # Görüntüyü sensörden al
             rgb_sensor = env.engine.get_sensor("rgb")
             rgb_img = rgb_sensor.perceive(env.agent) 
             
-            # Depth Map
             depth_map = depth_estimator.predict(rgb_img)
             
             depth_maps.append(depth_map)
@@ -96,7 +92,6 @@ class DrivingPolicyNet(nn.Module):
             nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU()
         )
         self.flatten = nn.Flatten()
-        # 84x84 giriş için Conv katmanları sonrasında boyut 64*1*1 kalır.
         self.fc_layers = nn.Sequential(
             nn.Linear(64 * 1 * 1, 100), nn.ReLU(),
             nn.Linear(100, 50), nn.ReLU(),
@@ -125,14 +120,16 @@ class MetaDriveDepthDataset(Dataset):
 # ==========================================
 # 4. EĞİTİM (TRAINING)
 # ==========================================
-def train_policy(epochs=20, batch_size=64, model_path="policy_model.pth"):
+# GÜNCELLEME: data_dir parametresi eklendi
+def train_policy(epochs=20, batch_size=64, model_path="policy_model.pth", data_dir="dataset"):
     print("--- Eğitim Başlıyor ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Kullanılan Cihaz: {device}")
     
-    dataset = MetaDriveDepthDataset(data_dir="dataset")
+    # GÜNCELLEME: Dataset artık dinamik klasörden besleniyor
+    dataset = MetaDriveDepthDataset(data_dir=data_dir)
     if len(dataset) == 0:
-        print("HATA: Dataset boş! Önce veri toplamalısınız.")
+        print(f"HATA: '{data_dir}' klasöründe dataset boş! Önce veri toplamalısınız.")
         return
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -175,7 +172,7 @@ def test_policy(model_path="policy_model.pth"):
     policy_model.eval()
     
     config = {
-        "use_render": True, # Test aşamasında görselleştirmeyi açıyoruz
+        "use_render": True, 
         "image_observation": True,
         "sensors": {"rgb": (84, 84)},
         "vehicle_config": {"image_source": "rgb"}
@@ -197,10 +194,10 @@ def test_policy(model_path="policy_model.pth"):
 
     env.close()
     print("Test tamamlandı.\n")
+
 # ==========================================
 # ANA ÇALIŞTIRMA BLOĞU
 # ==========================================
-import argparse
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MetaDrive Imitation Learning Pipeline")
     parser.add_argument(
@@ -213,13 +210,18 @@ if __name__ == "__main__":
     parser.add_argument("--episodes", type=int, default=10, help="Veri toplama için bölüm sayısı")
     parser.add_argument("--epochs", type=int, default=20, help="Eğitim için epoch sayısı")
     
+    # GÜNCELLEME: Yeni data_dir argümanı eklendi
+    parser.add_argument("--data_dir", type=str, default="dataset", help="Verilerin kaydedileceği/okunacağı klasör")
+    
     args = parser.parse_args()
 
     if args.mode in ["collect", "all"]:
-        collect_expert_data(num_episodes=args.episodes)
+        # GÜNCELLEME: argüman fonksiyona geçirildi
+        collect_expert_data(num_episodes=args.episodes, save_dir=args.data_dir)
         
     if args.mode in ["train", "all"]:
-        train_policy(epochs=args.epochs)
+        # GÜNCELLEME: argüman fonksiyona geçirildi
+        train_policy(epochs=args.epochs, data_dir=args.data_dir)
         
     if args.mode in ["test", "all"]:
         test_policy()
