@@ -1,0 +1,6 @@
+# Python <3.12
+numpy
+torch
+torchvision
+metadrive-simulator
+PyDrive2
