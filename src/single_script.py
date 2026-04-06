@@ -62,19 +62,13 @@ def collect_expert_data(num_episodes=10, save_dir="dataset"):
             rgb_sensor = env.engine.get_sensor("rgb")
             rgb_img = rgb_sensor.perceive(env.agent) 
             
-            # ÇÖZÜM BURADA: MetaDrive'dan gelen BGR formatını RGB'ye çevirip belleği temizliyoruz
-            rgb_img = rgb_img[..., ::-1].copy()
-            
             # 2. Depth Görüntüsünü Al (Ground Truth)
             depth_sensor = env.engine.get_sensor("depth")
             depth_img = depth_sensor.perceive(env.agent)
-            
             # Not: MetaDrive depth verisi genellikle [H, W, 1] formatındadır.
             # PyTorch için (C, H, W) formatına çevirmek isterseniz:
             depth_img = np.transpose(depth_img, (2, 0, 1))
-            
-            # RGB'yi de (3, 84, 84) yapalım (Artık doğru renk formatında!)
-            rgb_img_processed = np.transpose(rgb_img, (2, 0, 1)) 
+            rgb_img_processed = np.transpose(rgb_img, (2, 0, 1)) # RGB'yi de (3, 84, 84) yapalım
             
             rgb_images.append(rgb_img_processed)
             depth_maps.append(depth_img)
