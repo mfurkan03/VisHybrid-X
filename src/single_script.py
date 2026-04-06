@@ -97,12 +97,21 @@ class DrivingPolicyNet(nn.Module):
         )
         self.flatten = nn.Flatten()
         # 84x84 giriş için Conv katmanları sonrasında boyut 64*1*1 kalır.
-        self.fc_layers = nn.Sequential(
+        """self.fc_layers = nn.Sequential(
             nn.Linear(64 * 1 * 1, 100), nn.ReLU(),
             nn.Linear(100, 50), nn.ReLU(),
             nn.Linear(50, 10), nn.ReLU(),
             nn.Linear(10, action_dim)
+        )"""
+
+        self.fc_layers = nn.Sequential(
+            nn.Linear(576, 100), nn.ReLU(), 
+            nn.Linear(100, 50), nn.ReLU(),
+            nn.Linear(50, 10), nn.ReLU(),
+            nn.Linear(10, action_dim)
         )
+
+
 
     def forward(self, x):
         x = self.conv_layers(x)
@@ -111,13 +120,21 @@ class DrivingPolicyNet(nn.Module):
 
 class MetaDriveDepthDataset(Dataset):
     def __init__(self, data_dir):
+        """self.files = glob.glob(os.path.join(data_dir, "*.npz"))
+        self.depths, self.actions = [], []
+        for f in self.files:
+            data = np.load(f)
+            self.depths.extend(data['depth'])
+            self.actions.extend(data['action'])"""
         self.files = glob.glob(os.path.join(data_dir, "*.npz"))
+        if not self.files:
+            print(f"UYARI: {data_dir} klasöründe .npz dosyası bulunamadı!")
+            
         self.depths, self.actions = [], []
         for f in self.files:
             data = np.load(f)
             self.depths.extend(data['depth'])
             self.actions.extend(data['action'])
-            
     def __len__(self): return len(self.actions)
     def __getitem__(self, idx):
         return torch.tensor(self.depths[idx], dtype=torch.float32), torch.tensor(self.actions[idx], dtype=torch.float32)
@@ -130,14 +147,14 @@ def train_policy(epochs=20, batch_size=64, model_path="policy_model.pth"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Kullanılan Cihaz: {device}")
     
-    dataset = MetaDriveDepthDataset(data_dir="dataset")
+    dataset = MetaDriveDepthDataset(data_dir="data/raw")
     if len(dataset) == 0:
         print("HATA: Dataset boş! Önce veri toplamalısınız.")
         return
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     model = DrivingPolicyNet(action_dim=2).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4)
     criterion = nn.MSELoss()
     
     model.train()
