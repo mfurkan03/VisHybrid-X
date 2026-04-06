@@ -9,6 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from metadrive import MetaDriveEnv
 from metadrive.examples import expert
 from metadrive.component.sensors.rgb_camera import RGBCamera 
+from metadrive.component.sensors.depth_camera import DepthCamera
 
 # ==========================================
 # 1. DEPTH ESTIMATION MODELI
@@ -27,13 +28,14 @@ class DepthEstimationModel:
 # ==========================================
 def collect_expert_data(num_episodes=10, save_dir="dataset"):
     os.makedirs(save_dir, exist_ok=True)
-    print(f"Veriler '{save_dir}' klasörüne kaydediliyor...")
+    print(f"Veriler '{save_dir}' klasörüne (RGB + GT Depth + Action) olarak kaydediliyor...")
     
     config = {
         "use_render": True,  
         "image_observation": True,
         "sensors": {
             "rgb": (RGBCamera, 84, 84), 
+            "depth": (DepthCamera, 84, 84), # Ground Truth Depth sensörü eklendi
         },
         "vehicle_config": dict(image_source="rgb"),
         "show_interface": False, 
@@ -42,13 +44,13 @@ def collect_expert_data(num_episodes=10, save_dir="dataset"):
     }
     
     env = MetaDriveEnv(config)
-    depth_estimator = DepthEstimationModel()
 
     total_steps = 0
 
     for ep in range(num_episodes):
         obs, info = env.reset()
         
+        rgb_images = []
         depth_maps = []
         actions = []
         
@@ -56,20 +58,36 @@ def collect_expert_data(num_episodes=10, save_dir="dataset"):
         while not done:
             action = expert(env.agent, deterministic=True) 
             
+            # 1. RGB Görüntüsünü Al (Ground Truth)
             rgb_sensor = env.engine.get_sensor("rgb")
             rgb_img = rgb_sensor.perceive(env.agent) 
             
-            depth_map = depth_estimator.predict(rgb_img)
+            # ÇÖZÜM BURADA: MetaDrive'dan gelen BGR formatını RGB'ye çevirip belleği temizliyoruz
+            rgb_img = rgb_img[..., ::-1].copy()
             
-            depth_maps.append(depth_map)
+            # 2. Depth Görüntüsünü Al (Ground Truth)
+            depth_sensor = env.engine.get_sensor("depth")
+            depth_img = depth_sensor.perceive(env.agent)
+            
+            # Not: MetaDrive depth verisi genellikle [H, W, 1] formatındadır.
+            # PyTorch için (C, H, W) formatına çevirmek isterseniz:
+            depth_img = np.transpose(depth_img, (2, 0, 1))
+            
+            # RGB'yi de (3, 84, 84) yapalım (Artık doğru renk formatında!)
+            rgb_img_processed = np.transpose(rgb_img, (2, 0, 1)) 
+            
+            rgb_images.append(rgb_img_processed)
+            depth_maps.append(depth_img)
             actions.append(action)
             
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             total_steps += 1
             
+        # Kayıt kısmına 'rgb' verisini de ekliyoruz
         np.savez_compressed(
             os.path.join(save_dir, f"episode_{ep}.npz"), 
+            rgb=np.array(rgb_images),
             depth=np.array(depth_maps), 
             action=np.array(actions)
         )
