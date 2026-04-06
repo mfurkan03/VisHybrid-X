@@ -1,4 +1,7 @@
 data/**/*
+!data/**/
 !data/**/.gitkeep
 .vscode
 autodrive
+models/*
+!models/.gitkeep
