@@ -8,11 +8,6 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 from scipy.stats import pearsonr
 from metadrive import MetaDriveEnv
-from metadrive.examples import expert
-from metadrive.component.sensors.rgb_camera import RGBCamera
-from metadrive.component.sensors.depth_camera import DepthCamera
-
-
 # ==========================================
 # 1. DEPTH ESTIMATION MODELİ
 # ==========================================
@@ -24,61 +19,6 @@ class DepthEstimationModel:
         depth_map = np.mean(rgb_image, axis=2, keepdims=True)
         depth_map = np.transpose(depth_map, (2, 0, 1))
         return (depth_map / 255.0).astype(np.float32)
-
-
-# ==========================================
-# 2. VERİ TOPLAMA
-# ==========================================
-def collect_expert_data(num_episodes=10, save_dir="dataset"):
-    os.makedirs(save_dir, exist_ok=True)
-    print(f"Veriler '{save_dir}' klasörüne kaydediliyor...")
-
-    config = {
-        "use_render": False,        # GÖRSELLEŞTİRMEYİ KAPATTIK (Hız için kritik)
-        "image_observation": True,
-        "sensors": {
-            "rgb": (RGBCamera, 84, 84),
-            "depth": (DepthCamera, 84, 84),
-        },
-        "vehicle_config": dict(image_source="rgb"),
-        "show_interface": False,
-        "image_on_cuda": True,      # GPU ÜZERİNDE İŞLEM (Eğer sistemin destekliyorsa)
-        "preload_models": True,
-    }
-
-    env = MetaDriveEnv(config)
-    total_steps = 0
-
-    for ep in range(num_episodes):
-        obs, info = env.reset()
-        rgb_images, depth_maps, actions = [], [], []
-        done = False
-
-        while not done:
-            action = expert(env.agent, deterministic=True)
-            rgb_sensor = env.engine.get_sensor("rgb")
-            rgb_img = rgb_sensor.perceive(env.agent)
-            depth_sensor = env.engine.get_sensor("depth")
-            depth_img = depth_sensor.perceive(env.agent)
-            depth_img = np.transpose(depth_img, (2, 0, 1))
-            rgb_img_processed = np.transpose(rgb_img, (2, 0, 1))
-            rgb_images.append(rgb_img_processed)
-            depth_maps.append(depth_img)
-            actions.append(action)
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            total_steps += 1
-
-        np.savez_compressed(
-            os.path.join(save_dir, f"episode_{ep}.npz"),
-            rgb=np.array(rgb_images),
-            depth=np.array(depth_maps),
-            action=np.array(actions),
-        )
-        print(f"Bölüm {ep+1}/{num_episodes} kaydedildi. (Adım: {len(actions)})")
-
-    env.close()
-    print(f"Veri toplama tamamlandı! Toplam Adım: {total_steps}\n")
 
 
 # ==========================================
@@ -322,9 +262,8 @@ if __name__ == "__main__":
         "--mode",
         type=str,
         required=True,
-        choices=["collect", "train", "test", "all"],
+        choices=["train", "test", "all"],
     )
-    parser.add_argument("--episodes",     type=int,   default=10)
     parser.add_argument("--epochs",       type=int,   default=20)
     parser.add_argument("--data_dir",     type=str,   default="dataset")
     parser.add_argument("--test_episodes",type=int,   default=5,
@@ -332,9 +271,6 @@ if __name__ == "__main__":
     parser.add_argument("--val_split",    type=float, default=0.2,
                         help="Validation için ayrılacak veri oranı (0-1)")
     args = parser.parse_args()
-
-    if args.mode in ["collect", "all"]:
-        collect_expert_data(num_episodes=args.episodes, save_dir=args.data_dir)
 
     if args.mode in ["train", "all"]:
         train_policy(epochs=args.epochs, data_dir=args.data_dir, val_split=args.val_split)
