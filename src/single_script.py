@@ -13,6 +13,10 @@ from metadrive.component.sensors.rgb_camera import RGBCamera
 from metadrive.component.sensors.depth_camera import DepthCamera
 
 
+ # --- YENİ EKLENEN GRAFİK KODU ---
+import cv2
+import matplotlib.pyplot as plt
+
 # ==========================================
 # 1. DEPTH ESTIMATION MODELİ
 # ==========================================
@@ -29,24 +33,24 @@ class DepthEstimationModel:
 # ==========================================
 # 2. VERİ TOPLAMA
 # ==========================================
-def collect_expert_data(num_episodes=10, save_dir="dataset"):
+def collect_expert_data(num_episodes=50, save_dir="dataset"):
     os.makedirs(save_dir, exist_ok=True)
     print(f"Veriler '{save_dir}' klasörüne kaydediliyor...")
 
     config = {
-        "use_render": False,        # GÖRSELLEŞTİRMEYİ KAPATTIK (Hız için kritik)
+        "use_render": False,        # Hız için kapalı
         "image_observation": True,
         "sensors": {
-            "rgb": (RGBCamera, 84, 84),
-            "depth": (DepthCamera, 84, 84),
+            "rgb": (RGBCamera, 84, 84), # <--- SADECE RGB VAR, DEPTH'İ SİLDİK
         },
         "vehicle_config": dict(image_source="rgb"),
         "show_interface": False,
-        "image_on_cuda": True,      # GPU ÜZERİNDE İŞLEM (Eğer sistemin destekliyorsa)
+        "image_on_cuda": False,     # CUDA hatası almamak için kapalı
         "preload_models": True,
     }
 
     env = MetaDriveEnv(config)
+    depth_estimator = DepthEstimationModel() # Kendi gri derinlik modelimizi çağırdık
     total_steps = 0
 
     for ep in range(num_episodes):
@@ -58,13 +62,15 @@ def collect_expert_data(num_episodes=10, save_dir="dataset"):
             action = expert(env.agent, deterministic=True)
             rgb_sensor = env.engine.get_sensor("rgb")
             rgb_img = rgb_sensor.perceive(env.agent)
-            depth_sensor = env.engine.get_sensor("depth")
-            depth_img = depth_sensor.perceive(env.agent)
-            depth_img = np.transpose(depth_img, (2, 0, 1))
+            
+            # --- MetaDrive kamerası yerine KENDİ modelimizle derinlik üretiyoruz ---
+            depth_img = depth_estimator.predict(rgb_img) 
+            
             rgb_img_processed = np.transpose(rgb_img, (2, 0, 1))
             rgb_images.append(rgb_img_processed)
             depth_maps.append(depth_img)
             actions.append(action)
+            
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             total_steps += 1
@@ -78,8 +84,6 @@ def collect_expert_data(num_episodes=10, save_dir="dataset"):
         print(f"Bölüm {ep+1}/{num_episodes} kaydedildi. (Adım: {len(actions)})")
 
     env.close()
-    print(f"Veri toplama tamamlandı! Toplam Adım: {total_steps}\n")
-
 
 # ==========================================
 # 3. MODEL MİMARİSİ VE DATASET
@@ -257,10 +261,15 @@ def test_policy(model_path="policy_model.pth", num_episodes=5):
     config = {
         "use_render": True,
         "image_observation": True,
-        "sensors": {"rgb": (84, 84)},
+        "sensors": {"rgb": (RGBCamera, 84, 84)},
         "vehicle_config": {"image_source": "rgb"},
+        "show_interface": False,
+        "image_on_cuda": False,
+        "preload_models": True,
     }
     env = MetaDriveEnv(config)
+
+    depth_estimator = DepthEstimationModel() # Kendi gri modelimizi çağırıyoruz
 
     # ── Online metrik toplayıcılar ──
     success_flags       = []
@@ -274,19 +283,37 @@ def test_policy(model_path="policy_model.pth", num_episodes=5):
 
         with torch.no_grad():
             while not done:
-                rgb_img = env.vehicle.sensors["rgb"].perceive(
-                    env.vehicle, env.engine.physics_world.dynamic_world, None
-                )
-                depth_map    = depth_estimator.predict(rgb_img)
+                
+                rgb_sensor = env.engine.get_sensor("rgb")
+                rgb_img = rgb_sensor.perceive(env.agent)
+                
+                # Ekranda Göstermek İçin
+                img_to_show = rgb_img.copy()
+                if img_to_show.max() <= 1.0:
+                    img_to_show = img_to_show * 255.0
+                
+                rgb_img_uint8 = img_to_show.astype(np.uint8)
+                vis_image = cv2.cvtColor(rgb_img_uint8, cv2.COLOR_RGB2BGR)
+                vis_image_resized = cv2.resize(vis_image, (400, 400), interpolation=cv2.INTER_NEAREST)
+                cv2.imshow("Test Asamasi - AI", vis_image_resized)
+                cv2.waitKey(1)
+
+                # --- EĞİTİMDEKİ GİBİ KENDİ DERİNLİK MODELİMİZİ KULLANIYORUZ ---
+                depth_map = depth_estimator.predict(rgb_img)
+                
                 depth_tensor = (
                     torch.tensor(depth_map, dtype=torch.float32)
                     .unsqueeze(0)
                     .to(device)
                 )
+                
                 pred_action = policy_model(depth_tensor).cpu().numpy()[0]
+                print(f"Direksiyon: {pred_action[0]:+0.3f} | Gaz/Fren: {pred_action[1]:+0.3f}    ", end="\r")
+                
                 obs, reward, terminated, truncated, info = env.step(pred_action)
                 ep_reward += reward
                 done = terminated or truncated
+                
 
         # MetaDrive info sözlüğünden metrikleri çek
         arrived          = bool(info.get("arrive_dest", False))
@@ -310,6 +337,10 @@ def test_policy(model_path="policy_model.pth", num_episodes=5):
     print(f"  Episode Reward    ↑: {np.mean(episode_rewards):.2f} ± {np.std(episode_rewards):.2f}")
 
     env.close()
+    cv2.destroyAllWindows() 
+    
+    cv2.destroyAllWindows() # <--- DÖRDÜNCÜ EKLEME: Test bitince pencereyi güvenle kapatır
+
     print("Test tamamlandı.\n")
 
 
