@@ -16,18 +16,66 @@ from metadrive.component.sensors.depth_camera import DepthCamera
  # --- YENİ EKLENEN GRAFİK KODU ---
 import cv2
 import matplotlib.pyplot as plt
+import sys
+sys.path.append('/home/berke/Desktop/Projects/Bitirme/Video-Depth-Anything')
+from video_depth_anything.video_depth import VideoDepthAnything
+from video_depth_anything.video_depth_stream import VideoDepthAnything as VideoDepthAnythingStream
 
 # ==========================================
 # 1. DEPTH ESTIMATION MODELİ
 # ==========================================
 class DepthEstimationModel:
-    def __init__(self, model_path=None):
-        pass
+    def __init__(self, encoder='vits'):
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        model_configs = {
+            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+        }
+        self.model = VideoDepthAnything(**model_configs[encoder])
+        self.stream_model = VideoDepthAnythingStream(**model_configs[encoder])
+        ckpt_path = f'/home/berke/Desktop/Projects/Bitirme/Video-Depth-Anything/checkpoints/video_depth_anything_{encoder}.pth'
+        if os.path.exists(ckpt_path):
+            self.model.load_state_dict(torch.load(ckpt_path, map_location='cpu'), strict=True)
+            self.stream_model.load_state_dict(torch.load(ckpt_path, map_location='cpu'), strict=True)
+            print(f"[INFO] VideoDepthAnything Ağırlığı Yüklendi: {ckpt_path}")
+        else:
+            print(f"[UYARI] Yükleme başarısız, dosya yok: {ckpt_path}")
+        self.model = self.model.to(self.device).eval()
+        self.stream_model = self.stream_model.to(self.device).eval()
 
-    def predict(self, rgb_image: np.ndarray) -> np.ndarray:
-        depth_map = np.mean(rgb_image, axis=2, keepdims=True)
-        depth_map = np.transpose(depth_map, (2, 0, 1))
-        return (depth_map / 255.0).astype(np.float32)
+    def process_depth_map(self, depth_raw: np.ndarray) -> np.ndarray:
+        depth_resized = cv2.resize(depth_raw, (84, 84), interpolation=cv2.INTER_AREA)
+        # 0-1 Normalization
+        d_min, d_max = depth_resized.min(), depth_resized.max()
+        if d_max - d_min > 1e-6:
+            depth_norm = (depth_resized - d_min) / (d_max - d_min)
+        else:
+            depth_norm = depth_resized - d_min
+        
+        depth_map = np.expand_dims(depth_norm, axis=0) # (1, 84, 84)
+        return depth_map.astype(np.float32)
+
+    def predict_batch(self, rgb_images: list) -> list:
+        frames = np.stack(rgb_images, axis=0)
+        if frames.max() <= 1.0:
+            frames = (frames * 255.0).astype(np.uint8)
+            
+        print(f"\n[INFO] Batched frames: {frames.shape}. Depth hesaplanıyor...")
+        # input_size=252 works faster for our low res (84x84) images
+        depths_raw, _ = self.model.infer_video_depth(frames, target_fps=30, input_size=252, device=self.device)
+        print("[INFO] Batch derinlik haritaları üretildi.")
+        
+        return [self.process_depth_map(d) for d in depths_raw]
+
+    def predict_single(self, rgb_image: np.ndarray) -> np.ndarray:
+        frame = rgb_image
+        if frame.max() <= 1.0:
+            frame = (frame * 255.0).astype(np.uint8)
+            
+        # Stream modeli 32 karelik cache'i hafızasında tutup sadece 1 yeni karenin feature'ını çıkarır. Çok hızlıdır.
+        depth_raw = self.stream_model.infer_video_depth_one(frame, input_size=252, device=self.device)
+        return self.process_depth_map(depth_raw)
 
 
 # ==========================================
@@ -55,7 +103,7 @@ def collect_expert_data(num_episodes=50, save_dir="dataset"):
 
     for ep in range(num_episodes):
         obs, info = env.reset()
-        rgb_images, depth_maps, actions = [], [], []
+        rgb_images, actions = [], []
         done = False
 
         while not done:
@@ -63,21 +111,20 @@ def collect_expert_data(num_episodes=50, save_dir="dataset"):
             rgb_sensor = env.engine.get_sensor("rgb")
             rgb_img = rgb_sensor.perceive(env.agent)
             
-            # --- MetaDrive kamerası yerine KENDİ modelimizle derinlik üretiyoruz ---
-            depth_img = depth_estimator.predict(rgb_img) 
-            
-            rgb_img_processed = np.transpose(rgb_img, (2, 0, 1))
-            rgb_images.append(rgb_img_processed)
-            depth_maps.append(depth_img)
+            rgb_images.append(rgb_img)
             actions.append(action)
             
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             total_steps += 1
+            
+        # --- Bölüm sonu toplu Depth Üretimi ---
+        depth_maps = depth_estimator.predict_batch(rgb_images)
+        rgb_processed = [np.transpose(img, (2, 0, 1)) for img in rgb_images]
 
         np.savez_compressed(
             os.path.join(save_dir, f"episode_{ep}.npz"),
-            rgb=np.array(rgb_images),
+            rgb=np.array(rgb_processed),
             depth=np.array(depth_maps),
             action=np.array(actions),
         )
@@ -287,19 +334,18 @@ def test_policy(model_path="policy_model.pth", num_episodes=5):
                 rgb_sensor = env.engine.get_sensor("rgb")
                 rgb_img = rgb_sensor.perceive(env.agent)
                 
-                # Ekranda Göstermek İçin
-                img_to_show = rgb_img.copy()
-                if img_to_show.max() <= 1.0:
-                    img_to_show = img_to_show * 255.0
+                # --- VDA ile Anlık Derinlik Üretimi ---
+                depth_map = depth_estimator.predict_single(rgb_img)
                 
-                rgb_img_uint8 = img_to_show.astype(np.uint8)
-                vis_image = cv2.cvtColor(rgb_img_uint8, cv2.COLOR_RGB2BGR)
-                vis_image_resized = cv2.resize(vis_image, (400, 400), interpolation=cv2.INTER_NEAREST)
-                cv2.imshow("Test Asamasi - AI", vis_image_resized)
+                # Ekranda Göstermek İçin Yapay Zekaya Giren Derinlik(Depth) Haritasını Çizdiriyoruz
+                # depth_map şekli (1, 84, 84) ve 0-1 arası değerlere sahip
+                depth_vis = (depth_map[0] * 255.0).astype(np.uint8)
+                # Derinliği daha iyi görebilmek için renklendirme haritası uygulayalım (INFERNO heatmap)
+                depth_vis_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+                vis_image_resized = cv2.resize(depth_vis_colored, (400, 400), interpolation=cv2.INTER_NEAREST)
+                cv2.imshow("Test Asamasi - AI (Depth Map)", vis_image_resized)
                 cv2.waitKey(1)
 
-                # --- EĞİTİMDEKİ GİBİ KENDİ DERİNLİK MODELİMİZİ KULLANIYORUZ ---
-                depth_map = depth_estimator.predict(rgb_img)
                 
                 depth_tensor = (
                     torch.tensor(depth_map, dtype=torch.float32)
