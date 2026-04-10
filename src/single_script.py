@@ -44,6 +44,14 @@ class DepthEstimationModel:
         self.model = self.model.to(self.device).eval()
         self.stream_model = self.stream_model.to(self.device).eval()
 
+        # --- FP16 (Yarım Hassasiyet) Geçişi ---
+        # VDA'nın iç katmanları (dpt_temporal) bazı yerlerde .float() kullandığından
+        # ağırlıkları direkt FP16'ya çeviremiyoruz. Bunun yerine torch.autocast FP16 sarmalayıcısı
+        # ile inference sırasında otomatik Tensor Core ivmelendirmesi yapacağız.
+        self.use_fp16 = (self.device == 'cuda')
+        if self.use_fp16:
+            print("[INFO] VideoDepthAnything FP16 autocast modu etkinleştirildi! (Tensor Core ivmeli)")
+
     def process_depth_map(self, depth_raw: np.ndarray) -> np.ndarray:
         depth_resized = cv2.resize(depth_raw, (84, 84), interpolation=cv2.INTER_AREA)
         # 0-1 Normalization
@@ -68,14 +76,40 @@ class DepthEstimationModel:
         
         return [self.process_depth_map(d) for d in depths_raw]
 
-    def predict_single(self, rgb_image: np.ndarray) -> np.ndarray:
+    def predict_single(self, rgb_image: np.ndarray, return_tensor=False):
         frame = rgb_image
         if frame.max() <= 1.0:
             frame = (frame * 255.0).astype(np.uint8)
             
         # Stream modeli 32 karelik cache'i hafızasında tutup sadece 1 yeni karenin feature'ını çıkarır. Çok hızlıdır.
-        depth_raw = self.stream_model.infer_video_depth_one(frame, input_size=252, device=self.device)
-        return self.process_depth_map(depth_raw)
+        # fp32=True diyerek VDA'nın kendi iç autocast'ini kapatıyoruz çünkü biz burada dıştan sarıyoruz
+        if return_tensor:
+            if self.use_fp16:
+                with torch.cuda.amp.autocast(dtype=torch.float16):
+                    depth_raw = self.stream_model.infer_video_depth_one(frame, input_size=252, device=self.device, fp32=True, return_tensor=True)
+            else:
+                depth_raw = self.stream_model.infer_video_depth_one(frame, input_size=252, device=self.device, return_tensor=True)
+            return self.process_depth_tensor(depth_raw)
+        else:
+            depth_raw = self.stream_model.infer_video_depth_one(frame, input_size=252, device=self.device)
+            return self.process_depth_map(depth_raw)
+
+    def process_depth_tensor(self, depth_raw: torch.Tensor) -> torch.Tensor:
+        import torch.nn.functional as F
+        # Numpy CPU kopyası yerine saf GPU tensöru işlemi
+        # depth_raw shape: (H, W). interpolate için (1, 1, H, W) formatına çeviriyoruz
+        d_tensor = depth_raw.unsqueeze(0).unsqueeze(0)
+        depth_resized = F.interpolate(d_tensor, size=(84, 84), mode='bilinear', align_corners=False)
+        
+        # 0-1 Normalizasyonu da yine PyTorch GPU ile donanım düzeyinde halledeceğiz
+        d_min, d_max = depth_resized.min(), depth_resized.max()
+        if d_max - d_min > 1e-6:
+            depth_norm = (depth_resized - d_min) / (d_max - d_min)
+        else:
+            depth_norm = depth_resized - d_min
+            
+        return depth_norm.float() # dönüş Tipi Tensor (1, 1, 84, 84) GPU, float32'ye geri çevir (PolicyNet ve normalize için)
+
 
 
 # ==========================================
@@ -305,8 +339,15 @@ def test_policy(model_path="policy_model.pth", num_episodes=5):
     )
     policy_model.eval()
 
+    # PolicyNet'i FP16 (Yarım Hassasiyet) moduna geçir
+    # PolicyNet küçük bir model olduğundan .half() kullanmıyoruz,
+    # autocast ile inference zamanında sarmalayacağız
+    use_fp16_policy = (device.type == 'cuda')
+    if use_fp16_policy:
+        print("[INFO] PolicyNet FP16 autocast modu etkinleştirildi!")
+
     config = {
-        "use_render": True,
+        "use_render": False,
         "image_observation": True,
         "sensors": {"rgb": (RGBCamera, 84, 84)},
         "vehicle_config": {"image_source": "rgb"},
@@ -329,37 +370,59 @@ def test_policy(model_path="policy_model.pth", num_episodes=5):
         ep_reward      = 0.0
 
         with torch.no_grad():
+            import time
+            step_count = 0
+            last_time = time.time()
+            anlik_fps = 0.0
+            
             while not done:
+                step_count += 1
                 
                 rgb_sensor = env.engine.get_sensor("rgb")
                 rgb_img = rgb_sensor.perceive(env.agent)
                 
                 # --- VDA ile Anlık Derinlik Üretimi ---
-                depth_map = depth_estimator.predict_single(rgb_img)
+                # return_tensor=True ile VDA-PolicyNet arasına giren Numpy darboğazını eziyoruz! 
+                depth_tensor = depth_estimator.predict_single(rgb_img, return_tensor=True)
                 
                 # Ekranda Göstermek İçin Yapay Zekaya Giren Derinlik(Depth) Haritasını Çizdiriyoruz
-                # depth_map şekli (1, 84, 84) ve 0-1 arası değerlere sahip
-                depth_vis = (depth_map[0] * 255.0).astype(np.uint8)
-                # Derinliği daha iyi görebilmek için renklendirme haritası uygulayalım (INFERNO heatmap)
-                depth_vis_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
-                vis_image_resized = cv2.resize(depth_vis_colored, (400, 400), interpolation=cv2.INTER_NEAREST)
-                cv2.imshow("Test Asamasi - AI (Depth Map)", vis_image_resized)
-                cv2.waitKey(1)
+                # Performansı artırmak için GPU->CPU çekimini ve ekran renderlamayı sadece 4 adımda bir (seyrek) yapıyoruz
+                if step_count % 4 == 0:
+                    depth_vis = (depth_tensor[0, 0].cpu().numpy() * 255.0).astype(np.uint8)
+                    depth_vis_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+                    vis_image_resized = cv2.resize(depth_vis_colored, (400, 400), interpolation=cv2.INTER_NEAREST)
+                    cv2.imshow("Test Asamasi - AI (Depth Map)", vis_image_resized)
+                    cv2.waitKey(1)
 
+                # depth_tensor ZATEN GPU'da hazır! FP16 autocast ile Tensor Core'dan geçiriyoruz
+                if use_fp16_policy:
+                    with torch.cuda.amp.autocast(dtype=torch.float16):
+                        pred_action = policy_model(depth_tensor).float().cpu().numpy()[0]
+                else:
+                    pred_action = policy_model(depth_tensor).cpu().numpy()[0]
+                # FPS Hesaplama (İlk karelerdeki saniyelik Tensor JIT/Compile derlemesini filtreleyen moving average)
+                current_time = time.time()
+                elapsed = current_time - last_time
+                last_time = current_time
                 
-                depth_tensor = (
-                    torch.tensor(depth_map, dtype=torch.float32)
-                    .unsqueeze(0)
-                    .to(device)
-                )
+                if step_count > 1 and elapsed > 0: # 1. karenin devasa derleme süresini yoksay
+                    current_fps = 1.0 / elapsed
+                    if anlik_fps == 0.0:
+                        anlik_fps = current_fps
+                    else:
+                        anlik_fps = 0.85 * anlik_fps + 0.15 * current_fps
                 
-                pred_action = policy_model(depth_tensor).cpu().numpy()[0]
-                print(f"Direksiyon: {pred_action[0]:+0.3f} | Gaz/Fren: {pred_action[1]:+0.3f}    ", end="\r")
+                print(f"Direksiyon: {pred_action[0]:+0.3f} | Gaz/Fren: {pred_action[1]:+0.3f} | AI Beyin FPS: {anlik_fps:.1f} | SİMÜLASYON FPS: {(anlik_fps * 3):.1f}    ", end="\r")
                 
-                obs, reward, terminated, truncated, info = env.step(pred_action)
-                ep_reward += reward
-                done = terminated or truncated
-                
+                # Action Repeat (Frame Skip): Aynı eylemi 3 frame boyunca simüle ederiz
+                # Yapay Zeka beyni (DinoV2) 3 frame süresince yeni tahmin yapmakla yorulmaz, hız fırlar!
+                action_repeat = 3
+                for _ in range(action_repeat):
+                    obs, reward, terminated, truncated, info = env.step(pred_action)
+                    ep_reward += reward
+                    done = terminated or truncated
+                    if done:
+                        break                
 
         # MetaDrive info sözlüğünden metrikleri çek
         arrived          = bool(info.get("arrive_dest", False))
