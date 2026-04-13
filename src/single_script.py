@@ -215,25 +215,60 @@ def collect_expert_data(num_episodes=50, save_dir="dataset"):
 class DrivingPolicyNet(nn.Module):
     def __init__(self, action_dim=2):
         super().__init__()
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(2, 24, kernel_size=5, stride=2), nn.ReLU(),
+        
+        # --- 1. DİREKSİYON BEYNİ (Sadece Şeritleri görecek) ---
+        # Giriş kanalı 1 yapıldı (Çünkü sadece lane_mask girecek)
+        self.steer_conv = nn.Sequential(
+            nn.Conv2d(1, 24, kernel_size=5, stride=2), nn.ReLU(),
             nn.Conv2d(24, 36, kernel_size=5, stride=2), nn.ReLU(),
             nn.Conv2d(36, 48, kernel_size=5, stride=2), nn.ReLU(),
             nn.Conv2d(48, 64, kernel_size=3, stride=1), nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU(),
         )
-        self.flatten = nn.Flatten()
-        self.fc_layers = nn.Sequential(
-            nn.Linear(64 * 3 * 3, 100), nn.ReLU(),  # ← 576
+        self.steer_fc = nn.Sequential(
+            nn.Linear(64 * 3 * 3, 100), nn.ReLU(),
             nn.Linear(100, 50), nn.ReLU(),
             nn.Linear(50, 10), nn.ReLU(),
-            nn.Linear(10, action_dim),
+            nn.Linear(10, 1), # SADECE 1 ÇIKTI (Direksiyon: action_dim 0)
         )
 
+        # --- 2. GAZ/FREN BEYNİ (Sadece Derinliği görecek) ---
+        # Giriş kanalı 1 yapıldı (Çünkü sadece depth_map girecek)
+        self.accel_conv = nn.Sequential(
+            nn.Conv2d(1, 24, kernel_size=5, stride=2), nn.ReLU(),
+            nn.Conv2d(24, 36, kernel_size=5, stride=2), nn.ReLU(),
+            nn.Conv2d(36, 48, kernel_size=5, stride=2), nn.ReLU(),
+            nn.Conv2d(48, 64, kernel_size=3, stride=1), nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU(),
+        )
+        self.accel_fc = nn.Sequential(
+            nn.Linear(64 * 3 * 3, 100), nn.ReLU(),
+            nn.Linear(100, 50), nn.ReLU(),
+            nn.Linear(50, 10), nn.ReLU(),
+            nn.Linear(10, 1), # SADECE 1 ÇIKTI (Gaz/Fren: action_dim 1)
+        )
+        
+        self.flatten = nn.Flatten()
+
     def forward(self, x):
-        x = self.conv_layers(x)
-        x = self.flatten(x)
-        return self.fc_layers(x)
+        # x'in boyutu: (Batch, 2, 84, 84)
+        
+        # Tensörü kanallarına ayırıyoruz (Beyinlere paylaştırıyoruz)
+        depth_input = x[:, 0:1, :, :] # 0. Kanal: Derinlik
+        lane_input  = x[:, 1:2, :, :] # 1. Kanal: Şerit
+        
+        # Direksiyon Tahmini (Sadece Şeritleri Kullanarak)
+        s_feat = self.steer_conv(lane_input)
+        s_feat = self.flatten(s_feat)
+        steer_pred = self.steer_fc(s_feat) # Çıktı: (Batch, 1)
+        
+        # Gaz/Fren Tahmini (Sadece Derinliği Kullanarak)
+        a_feat = self.accel_conv(depth_input)
+        a_feat = self.flatten(a_feat)
+        accel_pred = self.accel_fc(a_feat) # Çıktı: (Batch, 1)
+        
+        # İki beynin sonucunu yan yana yapıştır: Çıktı -> (Batch, 2)
+        return torch.cat([steer_pred, accel_pred], dim=1)
 
 
 class MetaDriveDepthDataset(Dataset):
@@ -312,8 +347,26 @@ def train_policy(
 
     model     = DrivingPolicyNet(action_dim=2).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    criterion = nn.MSELoss()
+    #criterion = nn.MSELoss()
 
+    def custom_driving_loss(pred, target):
+        # 1. Normal karesel hatayı hesapla
+        mse = (pred - target) ** 2
+        
+        # 2. Frenleme anlarını tespit et (Uzmanın eylemi 0'dan küçükse frendir)
+        # target[:, 1] gaz/fren sütunudur.
+        brake_mask = (target[:, 1] < 0.0).float()
+        
+        # 3. Ceza Çarpanı (Fren kaçırılırsa hatayı 10 kat daha fazla cezalandır)
+        # Normal durumlarda çarpan 1.0, fren anlarında 10.0 olur.
+        brake_mult = 2.0 # sweet spot olmayabilir daha denenebilir
+        penalty_weight = 1.0 + (brake_mask * brake_mult) 
+        
+        # 4. Sadece gaz/fren (1. indeks) tahminindeki hatayı bu cezayla çarp
+        mse_weighted = mse.clone()
+        mse_weighted[:, 1] = mse[:, 1] * penalty_weight
+        
+        return mse_weighted.mean()
     for epoch in range(epochs):
         # ── TRAIN ──
         model.train()
@@ -325,7 +378,8 @@ def train_policy(
             batch_actions = batch_actions.to(device)
             optimizer.zero_grad()
             pred = model(batch_depths)
-            loss = criterion(pred, batch_actions)
+            #loss = criterion(pred, batch_actions)
+            loss = custom_driving_loss(pred, batch_actions)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -390,7 +444,7 @@ def test_policy(model_path="policy_model.pth", num_episodes=5):
         print("[INFO] PolicyNet FP16 autocast modu etkinleştirildi!")
 
     config = {
-        "use_render": False,
+        "use_render": True,
         "image_observation": True,
         "sensors": {"rgb": (RGBCamera, 400, 400)},
         "vehicle_config": {"image_source": "rgb"},

@@ -1,60 +1,50 @@
-# Autonomous Driving Project - Sensor Fusion & Dual Architecture
+# Autonomous Driving Project - Dual-Brain V2 & Asymmetric Loss
 
-Bu proje, otonom sürüş görevlerini yerine getirmek (imitation learning) amacıyla [MetaDrive](https://github.com/metadriverse/metadrive) simülatörü üzerinde oluşturulmuştur. Son yapılan köklü güncellemeler ile proje; sadece "Derinlik Haritası"na bakan tek boyutlu bir yapıdan, "Derinlik + Şerit Takibi" yapabilen **Sensör Füzyonu (Sensor Fusion)** tabanlı **Çift Beyinli (Dual-Stream)** bir yapay zeka mimarisine evrilmiştir.
+Bu proje, otonom sürüş görevlerini yerine getirmek (imitation learning) amacıyla [MetaDrive](https://github.com/metadriverse/metadrive) simülatörü üzerinde oluşturulmuştur. Son güncellemelerle proje, basit bir taklitçi olmaktan çıkmış; **Sensör Füzyonu (Sensor Fusion)**, **Çift Beyinli Mimari V2 (Dual-Stream Architecture)** ve **Asimetrik Kayıp Fonksiyonu (Asymmetric Loss)** kullanarak kural tabanlı (rule-based) hiçbir hileye başvurmadan tamamen saf yapay zeka ile sürüş ve acil frenleme (AEB) yapabilen bir seviyeye ulaşmıştır.
 
 ## Neler Değişti & Sisteme Neler Eklendi?
 
-### 1. Şerit Takibi (Lane Masking) ve Sensör Füzyonu
-Sadece Derinlik Haritası (Depth Map) kullanmak, yapay zekanın engelleri ve diğer araçları görmesini sağlasa da; asfalt ile yol dışındaki çimenlik alanın kameraya olan uzaklığı aynı olduğu için aracın sürekli yoldan çıkmasına (out_of_road) sebep oluyordu.
-* **Çözüm:** Kamera çözünürlüğü 84x84'ten 400x400'e çıkarılarak yüksek çözünürlüklü RGB görüntüler üzerinden OpenCV ile **ROI (Region of Interest)** ve **Thresholding (Eşikleme)** işlemleri uygulandı. Gökyüzü ve binalar maskelenerek yoldaki şerit çizgileri siyah-beyaz net bir matrise dönüştürüldü.
-* **Sensör Füzyonu:** Elde edilen bu *Şerit Maskesi*, *Derinlik Haritası* ile üst üste bindirilerek modelin girdisi 1 kanaldan **2 kanala** (Channel) çıkarıldı. Yapay zeka artık hem fiziksel derinliği hem de yoldaki boyaları aynı anda görebilmektedir.
+### 1. Çift Beyin V2: Bağımsız Tam Görüş (Dual-Stream Architecture)
+İlk Çift Beyin denemesinde direksiyon sadece şeride, gaz/fren ise sadece derinliğe bakıyordu. Bu durum "Kör Direksiyon" sorununa yol açtı: Araç önüne araba kırdığında gaz beyni frene basıyor ancak direksiyon beyni engeli göremediği için şerit değiştirmeyi akıl edemiyordu.
+* **Çözüm (V2):** `DrivingPolicyNet` mimarisi güncellendi. Direksiyon (Steering Branch) ve Gaz (Acceleration Branch) beyinlerinin ağırlıkları ve nöronları tamamen ayrık tutulmaya devam edildi, ancak **her iki beyne de 2 Kanallı tam giriş (Şerit + Derinlik) verildi.** Böylece direksiyon beyni artık engelleri de görerek çarpışmadan kaçınmak için şerit değiştirmeyi kendi kendine öğrenebilir duruma getirildi.
 
-### 2. RAM (OOM) ve Veri Depolama Optimizasyonu (On-the-Fly Processing)
-Yüksek çözünürlüklü (400x400) kameralara geçilmesiyle birlikte, veri toplama (`collect`) aşamasında ham RGB resimlerinin RAM'de listelenmesi sistemin çökmesine (Killed / Out of Memory) sebep olmaktaydı.
-* **Çözüm:** Görüntüler artık listelerde bekletilmek yerine simülasyondan alındığı **an (on-the-fly)** işlenerek şerit ve derinlik haritaları çıkartılıp anında 84x84 boyutlarına küçültülmektedir. Eski RGB verileri diske kaydedilmekten çıkarılmış, böylece hem RAM şişmesi tamamen engellenmiş hem de `.npz` veri setlerinin boyutu Gigabaytlardan Megabaytlara düşürülerek muazzam bir hız kazanılmıştır.
-
-### 3. "Çift Beyinli" Sinir Ağı Mimarisi (Dual-Stream Architecture)
-Modelin tek bir ortak sinir ağı üzerinden hem gaz/fren hem de direksiyon kararı vermesi literatürde **Görev Çakışması (Task Interference)** olarak bilinen soruna yol açıyordu. Yapay zeka engellerden (derinlikten) kaçmaya odaklandığında şeritleri okumayı unutuyor, şeritleri okumaya çalıştığında frene basmaya korkuyordu.
-* **Çözüm:** `DrivingPolicyNet` mimarisi kökten değiştirildi. Ortak havuz ikiye bölündü:
-  1. **Şerit Beyni (Steering Branch):** Sadece şerit maskesini (1. Kanal) okuyarak direksiyon kırma eylemini hesaplar.
-  2. **Gaz/Fren Beyni (Acceleration Branch):** Sadece derinlik haritasını (0. Kanal) okuyarak engelleri fark edip hızlanma veya acil frenleme eylemini hesaplar.
-Bu sayede her iki beyin birbirinin ağırlıklarını (gradient) bozmadan kendi görevinde uzmanlaşmıştır.
-
-### 4. VDA Cache (Hafıza) Sıfırlama Düzeltmesi
-Video Depth Anything modelinin Streaming modunda önceki kareleri (cache) aklında tutması özelliği, simülasyonda yeni bir bölüme (episode) geçildiğinde aracın önceki bölümdeki kaza anını hatırlayıp aniden duvara kırmasına sebep oluyordu. Sisteme her bölüm başında VDA modelini sıfırlayan (Cache Reset) bir kod eklenerek bu "hafıza kayması" sorunu kökünden çözülmüştür.
+### 2. Saf Yapay Zeka ile Acil Frenleme: Asimetrik Kayıp Fonksiyonu (Brake Loss Penalty)
+İmitasyon öğrenmesinde (Behavioral Cloning) veri setinin %90'ından fazlası gaza basma (pozitif) eylemlerinden oluşur. Standart bir MSE Loss kullanıldığında yapay zeka hata oranını düşük tutmak için "frene basma" eylemini önemsiz bir detay olarak görüp görmezden gelmekte ve engellere bodoslama çarpmaktaydı.
+* **Çözüm:** Sistemi `if/else` bloklarıyla zorlamak yerine, kayıp fonksiyonuna (Loss Function) matematiksel bir zeka eklendi. Yazılan `custom_driving_loss` sayesinde; yapay zeka normal yolda hata yaparsa standart 1 birim ceza alırken, **frene basması gereken bir yerde bunu kaçırırsa 3 kat (x3) daha fazla ceza çarpanına** maruz bırakıldı. Bu "Asimetrik Ceza" sistemi sayesinde yapay zeka, kural tabanlı bir müdahaleye gerek kalmadan engelleri gördüğünde frene basmayı bizzat kendi inisiyatifiyle öğrenmiştir.
 
 ---
 
 ## Önemli Parametreler ve Değişkenler
 
-`src/single_script.py` içerisinde oynayabileceğiniz veya komut satırından dinamik olarak atayabileceğiniz parametreler şunlardır:
+`src/single_script.py` içerisinde oynayabileceğiniz parametreler:
 
-* **`--episodes` (Veri Toplama için):** Otonom aracın "Expert" algoritmada süreceği ve kaç bölümlük örnek veri toplayacağını (`collect` modunda) belirler.
-* **`--epochs` (Eğitim Kararı):** Yapay zekamızın (`DrivingPolicyNet`) oluşturulan `dataset` içindeki npz uzantılı verileri baştan sona kaç tur izleyerek eğiteceğini belirler. (Çift beyinli mimari için 20 epoch idealdir).
-* **`encoder` (`vits`):** Kodda oluşturulan `DepthEstimationModel` içindeki yapay zekanın devasa parametre büyüklüğüdür. Bilgisayar optimizasyonu ve hız için en ideal olan **`vits`** modeli ayarlanmıştır.
-* **`FPS_DIVIDER=1`:** Test aşamasında yapay zekanın "Şerit" ve "Derinlik" gözlerinin ekrana ne sıklıkla renderlanacağını belirler. Performans darboğazı yaşanırsa bu değeri 3 veya 4 yaparak sistem FPS'sini uçurabilirsiniz.
+* **`--episodes` (Veri Toplama):** "Expert" algoritmanın kaç bölümlük örnek veri toplayacağını belirler.
+* **`--epochs` (Eğitim Kararı):** Veri setinin baştan sona kaç tur izlenerek eğitileceğini belirler. (Çift beyinli asimetrik loss için 20-30 epoch arası idealdir).
+* **`brake_mult = 2.0`:** Eğitim fonksiyonu içindeki frenleme hassasiyeti. Bu değer artırıldıkça araç daha "paranoyak" ve garantici frenler yapar, düşürüldükçe engellere daha çok yaklaşır.
+* **`FPS_DIVIDER=1`:** Test aşamasında AI pencerelerinin ekrana yansıma sıklığı. (Örn: 4 yapılırsa görüntü seyrek yenilenir ancak simülasyon FPS'si tavan yapar).
 
 ---
 
 ## Proje Nasıl Çalıştırılır?
 
-Çalışma ortamımız modüler bir biçimde 3 farklı pipeline'ın tek dosyada buluştuğu (`collect`, `train`, `test`) komut mimarisine sahiptir.
-*Not: Ağ mimarisi (Çift Beyin) ve girdi kanalları (2 Channel) kökten değiştiği için eski modeller ve eski veri setleri ile çalışmaz. Tüm adımların sıfırdan uygulanması gerekir.*
+Proje modüler olarak 3 adımdan oluşur: `collect`, `train`, `test`. 
+
+*Not: Ağ mimarisi (Çift Beyin V2) ve Kayıp Fonksiyonu değiştiği için eski ağırlık dosyaları geçersizdir. Önceden toplanmış 2-kanallı füzyon veriniz varsa sadece `--mode train` adımıyla modeli yeniden eğitmeniz yeterlidir.*
 
 ### 1- Çevre Verilerini Toplama (Data Collect)
-Expert sistem yola çıkar, 400x400 kameradan aldığı görüntüleri anında Şerit Maskesine ve Derinlik Haritasına çevirip birleştirerek RAM dostu bir şekilde kaydeder. *(Ayrıca sisteme eklenen ufak gürültüler (noise) ile uzman botun aracı kurtarma manevraları da veri setine eklenir).*
+Uzman araç, 400x400 kameradan aldığı görüntüleri anında Şerit Maskesi ve Derinlik Haritasına çevirir, "gürültü (noise)" ekleyerek kurtarma manevralarını diske kaydeder.
 ```bash
 python src/single_script.py --mode collect --episodes 10
 ```
 
-### 2- Çift Beyinli Ağı Eğitme (Train)
-`dataset` içerisine çıkarılmış 2-kanallı füzyon verilerini alıp sinir ağımızın (`DrivingPolicyNet`) direksiyon ve gaz/fren kollarını (branch) ayrı ayrı eğittiği evredir.
+### 2- Yeni Mimaride Ağı Eğitme (Train)
+`dataset` içerisindeki veriler kullanılarak Asimetrik Kayıp Fonksiyonu ile Direksiyon ve Gaz/Fren ağları eğitilir.
 ```bash
 python src/single_script.py --mode train --epochs 20
 ```
 
-### 3- Yapay Zeka Testini (Otonom) Çalıştırma (Test)
-Kendi eğittiğimiz sistem gerçek dünya koşullarıyla test edilir! Ekranda 3 farklı pencere açılır: Ana RGB Kamera, AI Derinlik Gözü (Inferno Isı Haritası) ve AI Şerit Gözü. Aracımız çift beyni ile virajları kendi alır, engelleri kendi aşar.
+### 3- Otonom Test (Test)
+Model gerçek zamanlı simülasyonla test edilir. AI Derinlik ve Şerit gözleri ekrandan canlı takip edilebilir.
 ```bash
 python src/single_script.py --mode test
 ```
