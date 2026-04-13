@@ -1,23 +1,27 @@
-# Autonomous Driving Project
+# Autonomous Driving Project - Sensor Fusion & Dual Architecture
 
-Bu proje, otonom sürüş görevlerini yerine getirmek (imitation learning) amacıyla [MetaDrive](https://github.com/metadriverse/metadrive) simülatörü üzerinde oluşturulmuştur. Son yapılan köklü güncellemeler ile projenin çevreyi analiz etme (kodlama/görme) yeteneği tamamen gerçekçi bir Derinlik Haritası (Depth Map) mimarisi üzerine inşa edilmiştir.
+Bu proje, otonom sürüş görevlerini yerine getirmek (imitation learning) amacıyla [MetaDrive](https://github.com/metadriverse/metadrive) simülatörü üzerinde oluşturulmuştur. Son yapılan köklü güncellemeler ile proje; sadece "Derinlik Haritası"na bakan tek boyutlu bir yapıdan, "Derinlik + Şerit Takibi" yapabilen **Sensör Füzyonu (Sensor Fusion)** tabanlı **Çift Beyinli (Dual-Stream)** bir yapay zeka mimarisine evrilmiştir.
 
-## Neler Değişti & Neden Baştan "Train" Ettik?
+## Neler Değişti & Sisteme Neler Eklendi?
 
-### 1. Pseudo-Depth (Sahte Derinlik) Yerine Gerçek "Depth Anything" Adaptasyonu
-Daha önceden sistem, kamera ortamından (MetaDrive) aldığı renkli (RGB) görüntülerin sadece matematiksel olarak renk ortalamasını (Grayscale/Siyah-Beyaz) alıp bunu yapay zekaya "derinlik" olarak yutturuyordu. Bu aldatmaca, yapay zekanın yoldaki silüetleri tanıyabiliyormuş gibi gözükmesine rağmen aslında nesnelerin derinliğini (gökyüzü boşluğu mu yoksa beton duvar mı olduğunu) algılayamamasına sebep oluyordu.
+### 1. Şerit Takibi (Lane Masking) ve Sensör Füzyonu
+Sadece Derinlik Haritası (Depth Map) kullanmak, yapay zekanın engelleri ve diğer araçları görmesini sağlasa da; asfalt ile yol dışındaki çimenlik alanın kameraya olan uzaklığı aynı olduğu için aracın sürekli yoldan çıkmasına (out_of_road) sebep oluyordu.
+* **Çözüm:** Kamera çözünürlüğü 84x84'ten 400x400'e çıkarılarak yüksek çözünürlüklü RGB görüntüler üzerinden OpenCV ile **ROI (Region of Interest)** ve **Thresholding (Eşikleme)** işlemleri uygulandı. Gökyüzü ve binalar maskelenerek yoldaki şerit çizgileri siyah-beyaz net bir matrise dönüştürüldü.
+* **Sensör Füzyonu:** Elde edilen bu *Şerit Maskesi*, *Derinlik Haritası* ile üst üste bindirilerek modelin girdisi 1 kanaldan **2 kanala** (Channel) çıkarıldı. Yapay zeka artık hem fiziksel derinliği hem de yoldaki boyaları aynı anda görebilmektedir.
 
-Biz projeye gerçek zamanlı ve stabil derinlik tespiti için **Video Depth Anything** isimli son teknoloji (Foundation Model) bir mimariyi harici olarak entegre ettik.
-Mevcut ağı baştan eğitmemizin (Train etmemizin) temel sebebi şuydu: Modelimiz `(1, 84, 84)` boyutlarında girdiler alan basit sinir ağı yapısını değiştirmedi ancak ona verilen girdi kökten farklılaştı. Yapay zeka artık siyah-beyaz fotolar yerine gerçek ve piksellerin pürüzsüz karanlıklarına göre derinlikleri bildiren ("yakın olan parlak, uzak olan bölgeler koyu") haritalara göre sürmeyi öğrenmek zorundaydı.
+### 2. RAM (OOM) ve Veri Depolama Optimizasyonu (On-the-Fly Processing)
+Yüksek çözünürlüklü (400x400) kameralara geçilmesiyle birlikte, veri toplama (`collect`) aşamasında ham RGB resimlerinin RAM'de listelenmesi sistemin çökmesine (Killed / Out of Memory) sebep olmaktaydı.
+* **Çözüm:** Görüntüler artık listelerde bekletilmek yerine simülasyondan alındığı **an (on-the-fly)** işlenerek şerit ve derinlik haritaları çıkartılıp anında 84x84 boyutlarına küçültülmektedir. Eski RGB verileri diske kaydedilmekten çıkarılmış, böylece hem RAM şişmesi tamamen engellenmiş hem de `.npz` veri setlerinin boyutu Gigabaytlardan Megabaytlara düşürülerek muazzam bir hız kazanılmıştır.
 
-### 2. Test Ekranında Gerçek Görüntü (Visualization)
-Model, arka planda muazzam bir şekilde gerçek derinlik haritalarını görüp ona göre sürmesine rağmen test ortamında sol pencerede ham "RGB" görüntüsü basan bir kod kalmıştı. Yapılan değişiklikle, yapay zekanın retinasına giren "Asıl Derinlik Haritası", **`INFERNO` (Termal/Isı)** renk haritası paleti kullanılarak insan gözünün göreceği şekilde ekrana (Test Asamasi - AI) yansıtıldı.
+### 3. "Çift Beyinli" Sinir Ağı Mimarisi (Dual-Stream Architecture)
+Modelin tek bir ortak sinir ağı üzerinden hem gaz/fren hem de direksiyon kararı vermesi literatürde **Görev Çakışması (Task Interference)** olarak bilinen soruna yol açıyordu. Yapay zeka engellerden (derinlikten) kaçmaya odaklandığında şeritleri okumayı unutuyor, şeritleri okumaya çalıştığında frene basmaya korkuyordu.
+* **Çözüm:** `DrivingPolicyNet` mimarisi kökten değiştirildi. Ortak havuz ikiye bölündü:
+  1. **Şerit Beyni (Steering Branch):** Sadece şerit maskesini (1. Kanal) okuyarak direksiyon kırma eylemini hesaplar.
+  2. **Gaz/Fren Beyni (Acceleration Branch):** Sadece derinlik haritasını (0. Kanal) okuyarak engelleri fark edip hızlanma veya acil frenleme eylemini hesaplar.
+Bu sayede her iki beyin birbirinin ağırlıklarını (gradient) bozmadan kendi görevinde uzmanlaşmıştır.
 
-### 3. FPS ve Hızlandırma Optimizasyonları (Streaming Modu)
-İlk denemelerde test aşaması (otonom aracın sürüş aşaması) inanılmaz ağırlaşmıştı (0.4 FPS). Bunun nedeni `Video-Depth-Anything` modelinin videoları stabilizesi yüksek şekilde idrak edebilmek için doğası gereği GPU'da her seferinde **Entegre 32-Karelik** kayan bir video matrisi hesaplamasıdır. Araba bir saniyede 5 kare gönderse dahi model bunları 32 kare gibi doldurarak sistemi boğuyordu.
-
-**Optimizasyon Çözümü:** Otonom ajanın sistemi, kaba hesaplama döngüsünden çıkarıldı ve doğrudan Caching mekanizmasına sahip olan `VideoDepthAnythingStream` (Streaming Modu) altyapısına bağlandı. Bu mod, aracın akışındaki önceki 31 karenin özelliklerini saniyelerce hesaplamak yerine onları anında belleğinde (*cache*) tutar. Ağa sadece kameradan o an gelen "1 tekil karenin" özelliği (feature) verilir, eski hafıza ile bir saniyenin küçük bir kısmında kaydırılıp mükemmel bir sonuç çıkartılır.
-***Sonuç:*** Araç kilitlenmeleri saniyelerden milisaniyelere düştü ve sistem GPU kullanırken anlık **20+ FPS** akıcılıkla sürüş yapma hızına kavuştu!
+### 4. VDA Cache (Hafıza) Sıfırlama Düzeltmesi
+Video Depth Anything modelinin Streaming modunda önceki kareleri (cache) aklında tutması özelliği, simülasyonda yeni bir bölüme (episode) geçildiğinde aracın önceki bölümdeki kaza anını hatırlayıp aniden duvara kırmasına sebep oluyordu. Sisteme her bölüm başında VDA modelini sıfırlayan (Cache Reset) bir kod eklenerek bu "hafıza kayması" sorunu kökünden çözülmüştür.
 
 ---
 
@@ -25,33 +29,32 @@ Model, arka planda muazzam bir şekilde gerçek derinlik haritalarını görüp 
 
 `src/single_script.py` içerisinde oynayabileceğiniz veya komut satırından dinamik olarak atayabileceğiniz parametreler şunlardır:
 
-* **`--episodes` (Veri Toplama için):** Otonom aracın "Expert" algoritmada süreceği ve kaç bölümlük örnek veri toplayacağını (`collect` modunda) belirler. (Daha yüksek bölüm daha stabil eğitimi sağlar ancak hafıza kaplar.)
-* **`--epochs` (Eğitim Kararı):** Yapay zekamızın (`DrivingPolicyNet`) oluşturulan `dataset` içindeki npz uzantılı verileri baştan sona kaç tur izleyerek eğiteceğini belirler. (Genellikle 20 idealdir).
-* **`encoder` (`vits` / `vitb` / `vitl`):** Kodda oluşturulan `DepthEstimationModel` içindeki yapay zekanın devasa parametre büyüklüğüdür. `vitb` ve `vitl` modelleri aşırı VRAM isteyeceğinden, bilgisayar optimizasyonu ve hız için en ideal olan **`vits`** modeli ayarlanmıştır.
-* **`input_size=252`:** Derinlik (VDA) tespiti esnasında sinir ağlarına girecek piksellenme işlem boyutudur. Kesinlikle 14'ün katı olmalıdır. Eğer bunu örn: 112 veya 140'lara kadar düşürüp FPS'yi daha da katlamaya çalışırsanız; DINOv2 ağındaki otonomik dikkat (attention) mekanizmaları yapıyı algılayamayacak kadar minyatür göreceği için size derinlik haritası yerine `NaN` (geçersiz, çökmüş bozuk matrix) fırlatmaya başlar. Bu yüzden kalite ve hızın mükemmel ortalaması olan `252`'ye optimize edilmiştir.
-* **`target_fps=30`:** VDA Stream modelinin kendi içindeki saniye tutarlılık oranıdır, değiştirmeyin.
+* **`--episodes` (Veri Toplama için):** Otonom aracın "Expert" algoritmada süreceği ve kaç bölümlük örnek veri toplayacağını (`collect` modunda) belirler.
+* **`--epochs` (Eğitim Kararı):** Yapay zekamızın (`DrivingPolicyNet`) oluşturulan `dataset` içindeki npz uzantılı verileri baştan sona kaç tur izleyerek eğiteceğini belirler. (Çift beyinli mimari için 20 epoch idealdir).
+* **`encoder` (`vits`):** Kodda oluşturulan `DepthEstimationModel` içindeki yapay zekanın devasa parametre büyüklüğüdür. Bilgisayar optimizasyonu ve hız için en ideal olan **`vits`** modeli ayarlanmıştır.
+* **`FPS_DIVIDER=1`:** Test aşamasında yapay zekanın "Şerit" ve "Derinlik" gözlerinin ekrana ne sıklıkla renderlanacağını belirler. Performans darboğazı yaşanırsa bu değeri 3 veya 4 yaparak sistem FPS'sini uçurabilirsiniz.
 
 ---
 
 ## Proje Nasıl Çalıştırılır?
 
-Çalışma ortamımız modüler bir biçimde 3 farklı pipeline'ın tek dosyada buluştuğu (`collect`, `train`, `test`) komut mimarisine sahiptir. İsterseniz `--mode all` kullanabilirsiniz.
-*Lütfen kendi Python Sanal Ortamınızın (venv) ve GPU Cuda sürümünüzün (Örn: pyTorch cu118) uyumlu yüklendiğinden emin olun.*
+Çalışma ortamımız modüler bir biçimde 3 farklı pipeline'ın tek dosyada buluştuğu (`collect`, `train`, `test`) komut mimarisine sahiptir.
+*Not: Ağ mimarisi (Çift Beyin) ve girdi kanalları (2 Channel) kökten değiştiği için eski modeller ve eski veri setleri ile çalışmaz. Tüm adımların sıfırdan uygulanması gerekir.*
 
 ### 1- Çevre Verilerini Toplama (Data Collect)
-Expert sistemin yola çıkıp çevreyi süzdüğü aşama. Simülatör çalışır ve yoldaki bütün RGB fotoğrafları (hiç donma yaşamadan) biriktirir, aracın macerası bittiği saniye o "Sürüş Videosunu" VDA `predict_batch`'ine toplu fırlatıp hepsinin derinlik matrislerini tek seferde çıkararak `dataset` klasörüne yazar. (Sistemi asla boğmaz).
+Expert sistem yola çıkar, 400x400 kameradan aldığı görüntüleri anında Şerit Maskesine ve Derinlik Haritasına çevirip birleştirerek RAM dostu bir şekilde kaydeder. *(Ayrıca sisteme eklenen ufak gürültüler (noise) ile uzman botun aracı kurtarma manevraları da veri setine eklenir).*
 ```bash
 python src/single_script.py --mode collect --episodes 10
 ```
 
-### 2- Yeni Modele Göre Ağı (Beyni) Eğitme (Train)
-`dataset` içerisine çıkarılmış üst kalite derinlik haritalarını alıp sinir ağımızın (`DrivingPolicyNet`) derinlik tabanlı engelleri aşmayı öğrenmesi evresidir.
+### 2- Çift Beyinli Ağı Eğitme (Train)
+`dataset` içerisine çıkarılmış 2-kanallı füzyon verilerini alıp sinir ağımızın (`DrivingPolicyNet`) direksiyon ve gaz/fren kollarını (branch) ayrı ayrı eğittiği evredir.
 ```bash
 python src/single_script.py --mode train --epochs 20
 ```
 
 ### 3- Yapay Zeka Testini (Otonom) Çalıştırma (Test)
-Bizim eğittiğimiz sistem gerçek dünya koşullarıyla test edilir! Araç çalışırken her saniye VDA Stream sayesinde anlık kameralar Isı Temalı (Inferno) bir derinlik (Depth) modellemesine dönüştürüp, ağınıza yedirilir ve araba harikalar yaratır.
+Kendi eğittiğimiz sistem gerçek dünya koşullarıyla test edilir! Ekranda 3 farklı pencere açılır: Ana RGB Kamera, AI Derinlik Gözü (Inferno Isı Haritası) ve AI Şerit Gözü. Aracımız çift beyni ile virajları kendi alır, engelleri kendi aşar.
 ```bash
 python src/single_script.py --mode test
 ```

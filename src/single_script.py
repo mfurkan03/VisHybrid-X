@@ -21,6 +21,27 @@ sys.path.append('/home/berke/Desktop/Projects/Bitirme/Video-Depth-Anything')
 from video_depth_anything.video_depth import VideoDepthAnything
 from video_depth_anything.video_depth_stream import VideoDepthAnything as VideoDepthAnythingStream
 
+# LANE MASK
+def get_lane_mask_visual(rgb_image, threshold_value=180):
+    if rgb_image.max() <= 1.0:
+        img_uint8 = (rgb_image * 255.0).astype(np.uint8)
+    else:
+        img_uint8 = rgb_image.astype(np.uint8)
+        
+    # 1. ROI (Region of Interest) - Sadece Yere Odaklan
+    h, w = img_uint8.shape[:2]
+    roi_img = img_uint8.copy()
+    
+    # Ekranın üst %55'lik kısmını (gökyüzü ve ufuk) simsiyah yap
+    roi_img[0:int(h * 0.55), :] = 0
+    
+    # 2. Şerit Filtreleme
+    gray = cv2.cvtColor(roi_img, cv2.COLOR_RGB2GRAY)
+    
+    # Çözünürlüğü artırdığımız için eşik değerini tekrar 180'e çıkardık ki asfalt siyah kalsın
+    _, mask = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)
+    
+    return mask
 # ==========================================
 # 1. DEPTH ESTIMATION MODELİ
 # ==========================================
@@ -120,46 +141,68 @@ def collect_expert_data(num_episodes=50, save_dir="dataset"):
     print(f"Veriler '{save_dir}' klasörüne kaydediliyor...")
 
     config = {
-        "use_render": False,        # Hız için kapalı
+        "use_render": False,        
         "image_observation": True,
-        "sensors": {
-            "rgb": (RGBCamera, 84, 84), # <--- SADECE RGB VAR, DEPTH'İ SİLDİK
-        },
+        # Çözünürlüğü 400x400 yaptık ki şeritleri net bulalım
+        "sensors": {"rgb": (RGBCamera, 400, 400)},
         "vehicle_config": dict(image_source="rgb"),
         "show_interface": False,
-        "image_on_cuda": False,     # CUDA hatası almamak için kapalı
+        "image_on_cuda": False,     
         "preload_models": True,
     }
 
     env = MetaDriveEnv(config)
-    depth_estimator = DepthEstimationModel() # Kendi gri derinlik modelimizi çağırdık
+    depth_estimator = DepthEstimationModel()
     total_steps = 0
 
     for ep in range(num_episodes):
         obs, info = env.reset()
-        rgb_images, actions = [], []
+        
+        # Sadece 2 kanallı verileri ve eylemleri tutacağız (RAM dostu)
+        combined_observations = []
+        actions = []
         done = False
 
         while not done:
-            action = expert(env.agent, deterministic=True)
+            # 1. Uzmanın O ANKİ kusursuz kararını al
+            expert_action = expert(env.agent, deterministic=True)
+
+            # 2. Arabayı fiziksel olarak savurmak için eylemin bir kopyasını alıp onu boz
+            applied_action = expert_action.copy()
+            import random
+            if total_steps % 10 == 0:
+                applied_action[0] += random.uniform(-0.3, 0.3) # Sadece simülasyona gidecek eylemi boz
+
             rgb_sensor = env.engine.get_sensor("rgb")
-            rgb_img = rgb_sensor.perceive(env.agent)
+            rgb_img = rgb_sensor.perceive(env.agent) 
             
-            rgb_images.append(rgb_img)
-            actions.append(action)
+            # --- ŞERİT VE DERİNLİK HESAPLAMALARI (Aynı Kalacak) ---
+            buyuk_maske = get_lane_mask_visual(rgb_img, threshold_value=180)
+            kucuk_maske = cv2.resize(buyuk_maske, (84, 84), interpolation=cv2.INTER_AREA)
+            lane_norm = (kucuk_maske / 255.0).astype(np.float32)
+            lane_map = np.expand_dims(lane_norm, axis=0) 
             
-            obs, reward, terminated, truncated, info = env.step(action)
+            depth_map = depth_estimator.predict_single(rgb_img, return_tensor=False) 
+            
+            combined_obs = np.concatenate([depth_map, lane_map], axis=0) 
+            
+            # --- 3. KAYIT AŞAMASI (KRİTİK DÜZELTME) ---
+            combined_observations.append(combined_obs)
+            
+            # Listeye GÜRÜLTÜLÜ eylemi değil, uzmanın o an olması gereken KUSURSUZ eylemini kaydediyoruz!
+            actions.append(expert_action.copy()) 
+            
+            # Arabayı yoldan çıkarmak için simülasyona GÜRÜLTÜLÜ eylemi gönderiyoruz
+            obs, reward, terminated, truncated, info = env.step(applied_action)
+            
             done = terminated or truncated
             total_steps += 1
             
-        # --- Bölüm sonu toplu Depth Üretimi ---
-        depth_maps = depth_estimator.predict_batch(rgb_images)
-        rgb_processed = [np.transpose(img, (2, 0, 1)) for img in rgb_images]
-
+        # --- Bölüm sonu Kaydetme ---
+        # Artık gereksiz RGB ham verisini kaydetmiyoruz (Diskten GB'larca tasarruf)
         np.savez_compressed(
             os.path.join(save_dir, f"episode_{ep}.npz"),
-            rgb=np.array(rgb_processed),
-            depth=np.array(depth_maps),
+            depth=np.array(combined_observations), 
             action=np.array(actions),
         )
         print(f"Bölüm {ep+1}/{num_episodes} kaydedildi. (Adım: {len(actions)})")
@@ -173,7 +216,7 @@ class DrivingPolicyNet(nn.Module):
     def __init__(self, action_dim=2):
         super().__init__()
         self.conv_layers = nn.Sequential(
-            nn.Conv2d(1, 24, kernel_size=5, stride=2), nn.ReLU(),
+            nn.Conv2d(2, 24, kernel_size=5, stride=2), nn.ReLU(),
             nn.Conv2d(24, 36, kernel_size=5, stride=2), nn.ReLU(),
             nn.Conv2d(36, 48, kernel_size=5, stride=2), nn.ReLU(),
             nn.Conv2d(48, 64, kernel_size=3, stride=1), nn.ReLU(),
@@ -349,7 +392,7 @@ def test_policy(model_path="policy_model.pth", num_episodes=5):
     config = {
         "use_render": False,
         "image_observation": True,
-        "sensors": {"rgb": (RGBCamera, 84, 84)},
+        "sensors": {"rgb": (RGBCamera, 400, 400)},
         "vehicle_config": {"image_source": "rgb"},
         "show_interface": False,
         "image_on_cuda": False,
@@ -369,6 +412,11 @@ def test_policy(model_path="policy_model.pth", num_episodes=5):
         done           = False
         ep_reward      = 0.0
 
+        # --- YENİ EKLENEN: HAFIZAYI SIFIRLA ---
+        # Her bölüm başında modeli yeniden yükleyerek önceki bölümün hafızasını (cache) siliyoruz.
+        depth_estimator = DepthEstimationModel() 
+        # --------------------------------------
+
         with torch.no_grad():
             import time
             step_count = 0
@@ -383,23 +431,44 @@ def test_policy(model_path="policy_model.pth", num_episodes=5):
                 
                 # --- VDA ile Anlık Derinlik Üretimi ---
                 # return_tensor=True ile VDA-PolicyNet arasına giren Numpy darboğazını eziyoruz! 
+                # 1. Derinlik Haritası (Mevcut)
                 depth_tensor = depth_estimator.predict_single(rgb_img, return_tensor=True)
+                
+                # 2. Şerit Maskesi Çıkarma ve Tensöre Çevirme
+                buyuk_maske = get_lane_mask_visual(rgb_img, threshold_value=180)
+                kucuk_maske = cv2.resize(buyuk_maske, (84, 84), interpolation=cv2.INTER_AREA)
+                lane_norm = (kucuk_maske / 255.0).astype(np.float32)
+                
+                # Numpy dizisini PyTorch tensörüne çevirip GPU'ya atıyoruz
+                lane_tensor = torch.tensor(lane_norm, device=device).unsqueeze(0).unsqueeze(0) # (1, 1, 84, 84)
+                
+                # 3. İkisini Birleştir: (1, 2, 84, 84) boyutunda girdi elde ediyoruz
+                combined_tensor = torch.cat([depth_tensor, lane_tensor], dim=1)
                 
                 # Ekranda Göstermek İçin Yapay Zekaya Giren Derinlik(Depth) Haritasını Çizdiriyoruz
                 # Performansı artırmak için GPU->CPU çekimini ve ekran renderlamayı sadece 4 adımda bir (seyrek) yapıyoruz
-                if step_count % 4 == 0:
+                FPS_DIVIDER = 1
+                if step_count % FPS_DIVIDER == 0:
+                    # DERINLIK HARITASI
                     depth_vis = (depth_tensor[0, 0].cpu().numpy() * 255.0).astype(np.uint8)
                     depth_vis_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
                     vis_image_resized = cv2.resize(depth_vis_colored, (400, 400), interpolation=cv2.INTER_NEAREST)
                     cv2.imshow("Test Asamasi - AI (Depth Map)", vis_image_resized)
+
+                    # 2. ŞERİT MASKESİ (YENİ EKLENEN KISIM)
+                    # Orijinal RGB kameradan şeritleri süz ve ekranda göster
+                    lane_mask = get_lane_mask_visual(rgb_img)
+                    lane_vis_resized = cv2.resize(lane_mask, (400, 400), interpolation=cv2.INTER_NEAREST)
+                    cv2.imshow("AI Gozu - Seritler (Lane)", lane_vis_resized)
                     cv2.waitKey(1)
 
                 # depth_tensor ZATEN GPU'da hazır! FP16 autocast ile Tensor Core'dan geçiriyoruz
                 if use_fp16_policy:
                     with torch.cuda.amp.autocast(dtype=torch.float16):
-                        pred_action = policy_model(depth_tensor).float().cpu().numpy()[0]
+                        pred_action = policy_model(combined_tensor).float().cpu().numpy()[0]
                 else:
-                    pred_action = policy_model(depth_tensor).cpu().numpy()[0]
+                    pred_action = policy_model(combined_tensor).cpu().numpy()[0]
+
                 # FPS Hesaplama (İlk karelerdeki saniyelik Tensor JIT/Compile derlemesini filtreleyen moving average)
                 current_time = time.time()
                 elapsed = current_time - last_time
