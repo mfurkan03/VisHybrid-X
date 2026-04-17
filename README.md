@@ -18,7 +18,7 @@ To run this project, you need to set up the main environment and integrate the D
 
 # 1. Create and activate a new Conda environment
 ```bash
-conda create -n driving-new python=3.10 -y
+conda create -n driving-new python=3.11 -y
 conda activate driving-new
 ```
 # 2. Install PyTorch (Adjust the CUDA version to match your system, e.g., cu118 or cu121 or else)
