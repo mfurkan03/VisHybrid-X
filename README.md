@@ -1,4 +1,4 @@
-Autonomous Driving Project - Dual-Brain V2 & Asymmetric Loss
+# Autonomous Driving Project - Dual-Brain V2 & Asymmetric Loss
 This project is built on the MetaDrive simulator to perform autonomous driving tasks using imitation learning. With recent updates, the project has evolved from a simple imitator; it has reached a level where it can perform driving and Autonomous Emergency Braking (AEB) using purely AI, without relying on any rule-based hacks, utilizing Sensor Fusion, Dual-Stream Architecture (V2), and an Asymmetric Loss Function.
 
 What's Changed & What's New?
