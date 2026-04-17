@@ -5,3 +5,4 @@ data/**/*
 autodrive
 models/*
 !models/.gitkeep
+Depth-Anything-V2
