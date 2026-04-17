@@ -15,30 +15,34 @@ Solution: Instead of forcing the system with hardcoded if/else blocks, a mathema
 Installation Setup
 To run this project, you need to set up the main environment and integrate the Depth Anything V2 repository.
 
-Bash
+
 # 1. Create and activate a new Conda environment
+```bash
 conda create -n driving-new python=3.10 -y
 conda activate driving-new
-
+```
 # 2. Install PyTorch (Adjust the CUDA version to match your system, e.g., cu118 or cu121 or else)
+```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu1xx
-
+```
 # 3. Install the main project requirements
+```bash
 pip install -r requirements.txt
-
+```
 # 4. Clone and Install Video-Depth-Anything
+```bash
 git clone https://github.com/DepthAnything/Depth-Anything-V2
 cd Depth-Anything-V2
 pip install -r requirements.txt
 cd ..
-
+```
 Important Parameters and Variables
 Parameters you can tweak inside src/single_script.py:
-
+```bash
 --episodes (Data Collection): Determines how many episodes of expert data the algorithm will collect.
 
 --epochs (Training): Determines how many times the dataset will be iterated over during training. (20-30 epochs is the sweet spot for the dual-brain asymmetric loss).
-
+```
 brake_mult = 2.0: The braking sensitivity within the training function. Increasing this value makes the vehicle brake more cautiously (paranoid mode); decreasing it allows the vehicle to get closer to obstacles before reacting.
 
 FPS_DIVIDER=1: The refresh rate of the AI vision windows during the testing phase. (e.g., if set to 4, the visual feeds update less frequently, but the simulation FPS skyrockets).
