@@ -6,3 +6,5 @@ autodrive
 models/*
 !models/.gitkeep
 Depth-Anything-V2
+Depth-Anything-V2/checkpoints/*
+dataset

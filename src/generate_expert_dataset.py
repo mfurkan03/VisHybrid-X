@@ -168,34 +168,34 @@ def show_cameras(raw_frames, rgb_cam_names, depth_cam_names, fps_counter: FPSCou
 # GPU İŞLEME (image_on_cuda=True)
 # ==========================================
 def process_gpu(env, rgb_name, depth_name, combined_observations):
-    """CuPy -> torch.as_tensor (sıfır kopya, GPU üzerinde).
-    Döndürülen (rgb_raw, depth_raw) show_cameras tarafından kullanılır — çift render yok."""
-    # RGB — ham CuPy arrayi görselleştirme için sakla
-    rgb_cupy  = env.engine.get_sensor(rgb_name).perceive(
+    rgb_cupy = env.engine.get_sensor(rgb_name).perceive(
         to_float=False, new_parent_node=env.agent.origin
     )
-    rgb_tensor = torch.as_tensor(rgb_cupy, device='cuda').float()   # [400,400,3]
-    rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0)           # [1,3,400,400]
+    rgb_tensor = torch.as_tensor(rgb_cupy, device='cuda').float()
+    rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0)
 
     gray     = (0.2989 * rgb_tensor[:, 0:1] +
                 0.5870 * rgb_tensor[:, 1:2] +
                 0.1140 * rgb_tensor[:, 2:3])
     mask     = (gray > 180).float()
-    lane_map = F.interpolate(mask, size=(84, 84), mode='area').squeeze(0)  # [1,84,84]
+    lane_map = F.interpolate(mask, size=(84, 84), mode='area').squeeze(0)
 
-    # Depth — ham CuPy arrayi görselleştirme için sakla
-    d_cupy  = env.engine.get_sensor(depth_name).perceive(
+    d_cupy   = env.engine.get_sensor(depth_name).perceive(
         to_float=True, new_parent_node=env.agent.origin
     )
     d_tensor  = torch.as_tensor(d_cupy, device='cuda').float()
     if d_tensor.dim() == 3:
         d_tensor = d_tensor[:, :, 0]
-    depth_map = d_tensor.unsqueeze(0)   # [1,84,84]
+    depth_map = d_tensor.unsqueeze(0)
 
-    combined_obs = torch.cat([depth_map, lane_map], dim=0)   # [2,84,84] — GPU'da kalır
+    combined_obs = torch.cat([depth_map, lane_map], dim=0)
     combined_observations[rgb_name].append(combined_obs)
 
-    # Ham görüntüleri döndür (görselleştirme için — CPU'ya taşıma burada yapılır)
+    # +++ Save raw RGB as uint8 CPU numpy for the training pipeline +++
+    rgb_np_uint8 = rgb_cupy.get() if hasattr(rgb_cupy, 'get') else np.array(rgb_cupy)
+    rgb_np_uint8 = rgb_np_uint8.astype(np.uint8)
+    combined_observations[f"{rgb_name}_rgb"].append(rgb_np_uint8)
+
     return rgb_cupy, d_cupy
 
 
@@ -203,24 +203,20 @@ def process_gpu(env, rgb_name, depth_name, combined_observations):
 # CPU İŞLEME (image_on_cuda=False)
 # ==========================================
 def process_cpu(env, rgb_name, depth_name, combined_observations):
-    """Klasik NumPy + OpenCV pipeline (orijinal davranış).
-    Döndürülen (rgb_raw, depth_raw) show_cameras tarafından kullanılır — çift render yok."""
-    # RGB
     rgb_img = env.engine.get_sensor(rgb_name).perceive(
         to_float=False, new_parent_node=env.agent.origin
     )
     if hasattr(rgb_img, 'get'):
         rgb_img = rgb_img.get()
-    rgb_np  = np.array(rgb_img, dtype=np.float32)
+    rgb_np = np.array(rgb_img, dtype=np.float32)
 
     gray     = (0.2989 * rgb_np[:, :, 0] +
                 0.5870 * rgb_np[:, :, 1] +
                 0.1140 * rgb_np[:, :, 2])
     mask     = (gray > 180).astype(np.float32)
     lane_map = cv2.resize(mask, (84, 84), interpolation=cv2.INTER_AREA)
-    lane_map = lane_map[np.newaxis, :, :]   # [1,84,84]
+    lane_map = lane_map[np.newaxis, :, :]
 
-    # Depth
     d_img = env.engine.get_sensor(depth_name).perceive(
         to_float=True, new_parent_node=env.agent.origin
     )
@@ -229,12 +225,15 @@ def process_cpu(env, rgb_name, depth_name, combined_observations):
     d_np = np.array(d_img, dtype=np.float32)
     if d_np.ndim == 3:
         d_np = d_np[:, :, 0]
-    depth_map = d_np[np.newaxis, :, :]   # [1,84,84]
+    depth_map = d_np[np.newaxis, :, :]
 
-    combined_obs = np.concatenate([depth_map, lane_map], axis=0)   # [2,84,84]
+    combined_obs = np.concatenate([depth_map, lane_map], axis=0)
     combined_observations[rgb_name].append(combined_obs)
 
-    # Ham görüntüleri döndür (görselleştirme için)
+    # +++ Save raw RGB as uint8 for the training pipeline +++
+    rgb_np_uint8 = np.array(rgb_img, dtype=np.uint8)
+    combined_observations[f"{rgb_name}_rgb"].append(rgb_np_uint8)
+
     return rgb_img, d_img
 
 
@@ -290,10 +289,15 @@ def collect_expert_data(
         if quit_requested:
             break
 
-        obs, info              = env.reset()
-        combined_observations  = {name: [] for name in rgb_cam_names}
-        actions                = []
-        done                   = False
+        obs, info = env.reset()
+        # +++ Add *_rgb lists alongside the existing *_combined lists +++
+        combined_observations = {
+            key: []
+            for rgb_name in rgb_cam_names
+            for key in (rgb_name, f"{rgb_name}_rgb")
+        }
+        actions = []
+        done    = False
 
         while not done:
             fps_counter.tick()   # <-- adım başında sayaç
@@ -332,13 +336,17 @@ def collect_expert_data(
         # Bölüm kaydı — GPU tensörleri toplu CPU'ya indir, async kayıt
         save_dict = {"action": np.array(actions)}
         for rgb_name in rgb_cam_names:
+            # --- combined (depth+lane, legacy key kept for compatibility) ---
             obs_list = combined_observations[rgb_name]
             if image_on_cuda and isinstance(obs_list[0], torch.Tensor):
-                # Tek seferde toplu GPU->CPU transferi (stack + contiguous)
                 stacked = torch.stack(obs_list).cpu().numpy()
             else:
                 stacked = np.array(obs_list)
             save_dict[f"{rgb_name}_combined"] = stacked
+
+            # +++ raw RGB frames uint8 [N, H, W, 3] — consumed by MetaDriveRGBDataset +++
+            rgb_list = combined_observations[f"{rgb_name}_rgb"]
+            save_dict[f"{rgb_name}_rgb"] = np.array(rgb_list, dtype=np.uint8)
 
         save_path = os.path.join(save_dir, f"episode_{ep}.npz")
         ep_steps  = len(actions)
