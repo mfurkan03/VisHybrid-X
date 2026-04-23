@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from scipy.stats import pearsonr
 from metadrive import MetaDriveEnv
 from metadrive.component.sensors.rgb_camera import RGBCamera
@@ -19,7 +19,6 @@ from tqdm import tqdm
 target_folder = Path(__file__).resolve().parent.parent / 'Depth-Anything-V2'
 sys.path.append(str(target_folder))
 from depth_anything_v2.dpt import DepthAnythingV2
-
 
 # ==========================================
 # 1. HELPERS & FROZEN DEPTH MODEL
@@ -142,8 +141,10 @@ class DrivingPolicyNet(nn.Module):
         return torch.cat([self.steer_fc(s_feat), self.accel_fc(a_feat)], dim=1)
 
 class MetaDriveRGBDataset(Dataset):
-    def __init__(self, data_dir):
-        self.files = glob.glob(os.path.join(data_dir, "*.npz"))
+    def __init__(self, data_dir, split="train"):
+        # Append split to target correct subfolder
+        split_dir = os.path.join(data_dir, split)
+        self.files = glob.glob(os.path.join(split_dir, "*.npz"))
         self.rgb_frames, self.actions = [], []
 
         for f in self.files:
@@ -156,7 +157,7 @@ class MetaDriveRGBDataset(Dataset):
             self.rgb_frames.extend(data[rgb_keys[0]])
             self.actions.extend(data['action'])
 
-        print(f"[INFO] PolicyDataset: {len(self.actions)} samples.")
+        print(f"[INFO] PolicyDataset ({split}): {len(self.actions)} samples loaded from {split_dir}.")
 
     def __len__(self): return len(self.actions)
     def __getitem__(self, idx):
@@ -181,16 +182,16 @@ def compute_offline_metrics(pred_actions, true_actions):
 # ==========================================
 # 3. TRAINING LOOP
 # ==========================================
-def train_policy(epochs=20, batch_size=64, model_path="policy_model.pth", dpt_path=None, data_dir="data/raw", val_split=0.2, lr=1e-4):
+def train_policy(epochs=20, batch_size=64, model_path="policy_model.pth", dpt_path=None, data_dir="data/raw", lr=1e-4):
     print("--- Phase 2: Training Driving Policy (Frozen DPT) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
     policy_model    = DrivingPolicyNet().to(device)
-    dataset         = MetaDriveRGBDataset(data_dir=data_dir)
-
-    v = int(len(dataset) * val_split)
-    train_ds, val_ds = random_split(dataset, [len(dataset) - v, v])
+    
+    # Load separate splits
+    train_ds = MetaDriveRGBDataset(data_dir=data_dir, split="train")
+    val_ds   = MetaDriveRGBDataset(data_dir=data_dir, split="val")
 
     def collate_fn(batch):
         rgbs, actions = zip(*batch)
@@ -247,42 +248,34 @@ def train_policy(epochs=20, batch_size=64, model_path="policy_model.pth", dpt_pa
             f"Epoch [{epoch+1:02d}/{epochs}] "
             f"Loss Tr/Val: {avg_train_loss:.4f}/{avg_val_loss:.4f} | "
             f"Steer MSE Tr/Val: {tr_m['steering_mse']:.4f}/{val_m['steering_mse']:.4f} | "
-            f"Dir Acc: {val_m['direction_acc']:.3f}"
-            f"LR: {scheduler.get_last_lr()}"
+            f"Dir Acc: {val_m['direction_acc']:.3f} | "
+            f"LR: {scheduler.get_last_lr()[0]:.6f}"
         )
         scheduler.step()
 
-        # ==========================================
-        # Save Best and Last Models
-        # ==========================================
-        
-        # 1. Save Best Model
+        # Save Models
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            
-            # Create a name like 'policy_model_best.pth'
             file_root, file_ext = os.path.splitext(model_path)
             best_model_path = f"{file_root}_best{file_ext}"
             
             torch.save(policy_model.state_dict(), best_model_path)
             print(f"*** New best model saved to {best_model_path} (Val Loss: {best_val_loss:.4f}) ***")
             
-        # 2. Save Last Model (overwrites every epoch)
         torch.save(policy_model.state_dict(), model_path)
 
 
 # ==========================================
 # 4. TESTING LOOP
 # ==========================================
-def test_policy(model_path, dpt_path, num_episodes):
-    print("--- Phase 3: Simulation Test ---")
+def test_policy(model_path, dpt_path, data_dir, num_episodes):
+    print("--- Phase 3: Testing Driving Policy ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
     policy_model    = DrivingPolicyNet().to(device)
 
     checkpoint = torch.load(model_path, map_location=device)
-    # Support dict load if migrating from old format
     if isinstance(checkpoint, dict) and 'policy' in checkpoint:
         policy_model.load_state_dict(checkpoint['policy'])
     else:
@@ -290,6 +283,41 @@ def test_policy(model_path, dpt_path, num_episodes):
         
     policy_model.eval()
 
+    # --- OFFLINE TEST (Using strictly the 'test' split) ---
+    print("\n=> Running Offline Evaluation on Test Split...")
+    test_ds = MetaDriveRGBDataset(data_dir=data_dir, split="test")
+    if len(test_ds) > 0:
+        def collate_fn(batch):
+            rgbs, actions = zip(*batch)
+            return np.stack(rgbs), np.stack(actions)
+
+        test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, collate_fn=collate_fn)
+        test_loss = 0.0
+        test_pred, test_true = [], []
+        
+        with torch.no_grad():
+            for rgb_np, actions_np in tqdm(test_loader, desc="Testing"):
+                actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
+                combined  = extract_features_frozen(rgb_np, depth_estimator, device)
+                pred = policy_model(combined)
+                
+                test_loss += custom_driving_loss(pred, actions_t).item()
+                test_pred.append(pred.cpu().numpy())
+                test_true.append(actions_np)
+
+        avg_test_loss = test_loss / len(test_loader)
+        test_m = compute_offline_metrics(np.concatenate(test_pred), np.concatenate(test_true))
+        
+        print("\n=== OFFLINE TEST RESULTS ===")
+        print(f"Test Loss    : {avg_test_loss:.4f}")
+        print(f"Steering MSE : {test_m['steering_mse']:.4f}")
+        print(f"Accel MSE    : {test_m['accel_mse']:.4f}")
+        print(f"Direction Acc: {test_m['direction_acc']:.3f}")
+    else:
+        print("[WARNING] No test data found. Skipping offline evaluation.")
+
+    # --- ONLINE TEST (Simulation) ---
+    print("\n=> Running Online Evaluation (Simulation)...")
     config = {
         "use_render": True,
         "image_observation": True,
@@ -314,30 +342,21 @@ def test_policy(model_path, dpt_path, num_episodes):
             with torch.no_grad():
                 pred_action = policy_model(combined_tensor).cpu().numpy()[0]
 
-            # ==========================================
-            # UPDATED VISUALIZATION BLOCK
-            # ==========================================
             if step_count % 2 == 0:
-                # 1. Extract raw tensors and scale to 0-255
                 depth_uint8 = (combined_tensor[0, 0].cpu().numpy() * 255).astype(np.uint8)
                 lane_uint8  = (combined_tensor[0, 1].cpu().numpy() * 255).astype(np.uint8)
 
-                # 2. Apply colors
                 depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO)
-                lane_color  = cv2.cvtColor(lane_uint8, cv2.COLOR_GRAY2BGR) # Convert to 3-channel for stacking
+                lane_color  = cv2.cvtColor(lane_uint8, cv2.COLOR_GRAY2BGR) 
 
-                # 3. Resize to a larger, consistent resolution (e.g., 400x400)
                 vis_size = (400, 400)
                 depth_resized = cv2.resize(depth_color, vis_size, interpolation=cv2.INTER_LINEAR)
                 lane_resized  = cv2.resize(lane_color, vis_size, interpolation=cv2.INTER_NEAREST)
 
-                # 4. Stack them horizontally into a single dashboard
                 dashboard = np.hstack((depth_resized, lane_resized))
 
-                # 5. Display the single window
                 cv2.imshow("Agent Perception: Depth (Left) | Lane Mask (Right)", dashboard)
                 cv2.waitKey(1)
-            # ==========================================
 
             for _ in range(3):
                 obs, reward, terminated, truncated, info = env.step(pred_action)
@@ -354,7 +373,7 @@ def test_policy(model_path, dpt_path, num_episodes):
         route_completions.append(info.get("route_completion", 0.0))
         print(f"\nEpisode {ep+1} done. Success: {success_flags[-1]}")
 
-    print(f"\n=== SUMMARY ===\nSuccess: {np.mean(success_flags)*100:.1f}%  Route: {np.mean(route_completions)*100:.1f}%")
+    print(f"\n=== ONLINE SUMMARY ===\nSuccess: {np.mean(success_flags)*100:.1f}%  Route: {np.mean(route_completions)*100:.1f}%")
     env.close()
     cv2.destroyAllWindows()
 
@@ -364,13 +383,13 @@ if __name__ == "__main__":
     parser.add_argument("--mode",       type=str, required=True, choices=["train", "test", "all"])
     parser.add_argument("--epochs",     type=int, default=40)
     parser.add_argument("--episodes",   type=int, default=1)
-    parser.add_argument("--data_dir",   type=str, default="data/raw")
+    parser.add_argument("--data_dir",   type=str, default="dataset") # Adjusted default to match data collection
     parser.add_argument("--dpt_path",   type=str, default="models/dpt_finetuned.pth", help="Path to finetuned DPT")
     parser.add_argument("--model_path", type=str, default="models/policy_model.pth")
     parser.add_argument("--lr",         type=float, default=1e-4)
     args = parser.parse_args()
 
     if args.mode in ["train", "all"]:
-        train_policy(args.epochs, 32, args.model_path, args.dpt_path, args.data_dir, 0.2, args.lr)
+        train_policy(args.epochs, 32, args.model_path, args.dpt_path, args.data_dir, args.lr)
     if args.mode in ["test", "all"]:
-        test_policy(args.model_path, args.dpt_path, args.episodes)
+        test_policy(args.model_path, args.dpt_path, args.data_dir, args.episodes)

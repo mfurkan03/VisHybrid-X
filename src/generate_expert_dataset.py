@@ -19,13 +19,12 @@ import torch.nn.functional as F
 from panda3d.core import loadPrcFileData
 loadPrcFileData("", "stm-max-views 20")
 
-
 # ==========================================
-# FPS SAYACI
+# FPS COUNTER
 # ==========================================
 class FPSCounter:
     """
-    Kayan pencere ile anlık ve ortalama FPS hesaplar.
+    Calculates instant and average FPS using a sliding window.
     """
     def __init__(self, window=60):
         self.window = window
@@ -57,15 +56,14 @@ class FPSCounter:
 
     def summary(self):
         return (
-            f"  Toplam Adim : {self.total_steps}\n"
-            f"  Toplam Sure : {self.total_time:.2f} s\n"
-            f"  Ortalama FPS: {self.average_fps:.1f}\n"
-            f"  Anlık FPS   : {self.instant_fps:.1f}"
+            f"  Total Steps : {self.total_steps}\n"
+            f"  Total Time  : {self.total_time:.2f} s\n"
+            f"  Average FPS : {self.average_fps:.1f}\n"
+            f"  Instant FPS : {self.instant_fps:.1f}"
         )
 
-
 # ==========================================
-# KAMERA OLUŞTURUCU
+# CAMERA BUILDER
 # ==========================================
 def create_surround_camera(name, angle_degree, camera_class):
     class CustomCam(camera_class):
@@ -91,11 +89,10 @@ def create_surround_camera(name, angle_degree, camera_class):
     CustomCam.__name__ = name
     return CustomCam
 
-
 def build_cameras(num_cameras):
-    angles         = [round(i * 360 / num_cameras) for i in range(num_cameras)]
-    sensors        = {}
-    rgb_cam_names  = []
+    angles          = [round(i * 360 / num_cameras) for i in range(num_cameras)]
+    sensors         = {}
+    rgb_cam_names   = []
     depth_cam_names = []
 
     for angle in angles:
@@ -108,10 +105,8 @@ def build_cameras(num_cameras):
 
     return angles, sensors, rgb_cam_names, depth_cam_names
 
-
 # ==========================================
-# OPENCV GÖRÜNTÜLEYICI  (FPS overlay dahil)
-# raw_frames: {cam_name: (rgb_raw, depth_raw)} — process_fn'den gelen, zaten render edilmiş
+# OPENCV VIEWER (with FPS overlay)
 # ==========================================
 def show_cameras(raw_frames, rgb_cam_names, depth_cam_names, fps_counter: FPSCounter):
     THUMB = 280
@@ -154,18 +149,17 @@ def show_cameras(raw_frames, rgb_cam_names, depth_cam_names, fps_counter: FPSCou
 
     # ---- FPS overlay ----
     fps_text = (f"FPS: {fps_counter.instant_fps:5.1f}  |  "
-                f"Ort: {fps_counter.average_fps:5.1f}  |  "
-                f"Adim: {fps_counter.total_steps}")
+                f"Avg: {fps_counter.average_fps:5.1f}  |  "
+                f"Steps: {fps_counter.total_steps}")
     cv2.rectangle(combined, (0, 0), (len(fps_text) * 11 + 10, 30), (0, 0, 0), -1)
     cv2.putText(combined, fps_text, (6, 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-    cv2.imshow("MetaDrive Cameras  (Q = cikis)", combined)
+    cv2.imshow("MetaDrive Cameras  (Q = Quit)", combined)
     return (cv2.waitKey(1) & 0xFF) == ord('q')
 
-
 # ==========================================
-# GPU İŞLEME (image_on_cuda=True)
+# GPU PROCESSING (image_on_cuda=True)
 # ==========================================
 def process_gpu(env, rgb_name, depth_name, combined_observations):
     rgb_cupy = env.engine.get_sensor(rgb_name).perceive(
@@ -198,9 +192,8 @@ def process_gpu(env, rgb_name, depth_name, combined_observations):
 
     return rgb_cupy, d_cupy
 
-
 # ==========================================
-# CPU İŞLEME (image_on_cuda=False)
+# CPU PROCESSING (image_on_cuda=False)
 # ==========================================
 def process_cpu(env, rgb_name, depth_name, combined_observations):
     rgb_img = env.engine.get_sensor(rgb_name).perceive(
@@ -236,9 +229,8 @@ def process_cpu(env, rgb_name, depth_name, combined_observations):
 
     return rgb_img, d_img
 
-
 # ==========================================
-# VERİ TOPLAMA FONKSIYONU
+# DATA COLLECTION FUNCTION
 # ==========================================
 def collect_expert_data(
     seed,
@@ -247,16 +239,24 @@ def collect_expert_data(
     visualize      = True,
     num_cameras    = 2,
     image_on_cuda  = True,
+    split_ratios   = (0.8, 0.1, 0.1) # Train, Val, Test ratios
 ):
-    os.makedirs(save_dir, exist_ok=True)
+    # Ensure all required directories exist
+    os.makedirs(os.path.join(save_dir, "train"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "val"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "test"), exist_ok=True)
 
     angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(num_cameras)
 
+    # Calculate split sizes
+    train_count = int(num_episodes * split_ratios[0])
+    val_count = int(num_episodes * split_ratios[1])
+    
     mode_str = "GPU (CUDA)" if image_on_cuda else "CPU (NumPy)"
     print(f"\n{'='*55}")
-    print(f"  İşlem Modu   : {mode_str}")
-    print(f"  Veriler      : '{save_dir}' klasörüne kaydediliyor")
-    print(f"  Kamera sayısı: {num_cameras}  ->  açılar: {angles} derece")
+    print(f"  Processing Mode : {mode_str}")
+    print(f"  Saving to       : '{save_dir}' (Split into train/val/test)")
+    print(f"  Camera Count    : {num_cameras}  ->  Angles: {angles} degrees")
     print(f"{'='*55}\n")
 
     config = {
@@ -289,6 +289,14 @@ def collect_expert_data(
         if quit_requested:
             break
 
+        # Determine the split for current episode
+        if ep < train_count:
+            current_split = "train"
+        elif ep < train_count + val_count:
+            current_split = "val"
+        else:
+            current_split = "test"
+
         obs, info = env.reset()
         # +++ Add *_rgb lists alongside the existing *_combined lists +++
         combined_observations = {
@@ -300,15 +308,15 @@ def collect_expert_data(
         done    = False
 
         while not done:
-            fps_counter.tick()   # <-- adım başında sayaç
+            fps_counter.tick()
 
-            # Uzman karar + gürültü
+            # Expert action + noise
             expert_action  = expert(env.agent, deterministic=True)
             applied_action = expert_action.copy()
             if fps_counter.total_steps % 10 == 0:
                 applied_action[0] += random.uniform(-0.3, 0.3)
 
-            # Kamera işleme (GPU veya CPU) — ham kareler saklanır, çift render yok
+            # Process cameras (GPU or CPU)
             raw_frames = {}
             for rgb_name, depth_name in zip(rgb_cam_names, depth_cam_names):
                 rgb_raw, depth_raw = process_fn(env, rgb_name, depth_name, combined_observations)
@@ -318,12 +326,12 @@ def collect_expert_data(
             obs, reward, terminated, truncated, info = env.step(applied_action)
             done = terminated or truncated
 
-            # Terminal çıktısı (her 50 adımda)
+            # Terminal output (every 50 steps)
             if fps_counter.total_steps % 50 == 0:
                 print(f"  [Ep {ep+1}/{num_episodes}] "
-                      f"Adım: {fps_counter.total_steps:5d}  |  "
-                      f"Anlık FPS: {fps_counter.instant_fps:5.1f}  |  "
-                      f"Ort FPS: {fps_counter.average_fps:5.1f}",
+                      f"Step: {fps_counter.total_steps:5d}  |  "
+                      f"Inst FPS: {fps_counter.instant_fps:5.1f}  |  "
+                      f"Avg FPS: {fps_counter.average_fps:5.1f}",
                       flush=True)
 
             if visualize:
@@ -333,10 +341,9 @@ def collect_expert_data(
                 if quit_requested:
                     done = True
 
-        # Bölüm kaydı — GPU tensörleri toplu CPU'ya indir, async kayıt
+        # Save dictionary
         save_dict = {"action": np.array(actions)}
         for rgb_name in rgb_cam_names:
-            # --- combined (depth+lane, legacy key kept for compatibility) ---
             obs_list = combined_observations[rgb_name]
             if image_on_cuda and isinstance(obs_list[0], torch.Tensor):
                 stacked = torch.stack(obs_list).cpu().numpy()
@@ -344,11 +351,11 @@ def collect_expert_data(
                 stacked = np.array(obs_list)
             save_dict[f"{rgb_name}_combined"] = stacked
 
-            # +++ raw RGB frames uint8 [N, H, W, 3] — consumed by MetaDriveRGBDataset +++
             rgb_list = combined_observations[f"{rgb_name}_rgb"]
             save_dict[f"{rgb_name}_rgb"] = np.array(rgb_list, dtype=np.uint8)
 
-        save_path = os.path.join(save_dir, f"episode_{ep}.npz")
+        # Save to the respective split folder
+        save_path = os.path.join(save_dir, current_split, f"episode_{ep}.npz")
         ep_steps  = len(actions)
 
         def _save(p, d):
@@ -356,22 +363,21 @@ def collect_expert_data(
 
         t = threading.Thread(target=_save, args=(save_path, save_dict), daemon=True)
         t.start()
-        print(f"\n  --> Bölüm {ep+1}/{num_episodes} kaydediliyor (arka planda). "
-              f"(Adım: {ep_steps})")
+        print(f"\n  --> Saving Episode {ep+1}/{num_episodes} to '{current_split}' folder (Background). "
+              f"(Steps: {ep_steps})")
 
     cv2.destroyAllWindows()
     env.close()
 
-    # ---- Özet Rapor ----
+    # ---- Summary Report ----
     print(f"\n{'='*55}")
-    print(f"  VERİ TOPLAMA TAMAMLANDI")
-    print(f"  Mod: {mode_str}")
+    print(f"  DATA COLLECTION COMPLETED")
+    print(f"  Mode: {mode_str}")
     print(fps_counter.summary())
     print(f"{'='*55}\n")
 
-
 # ==========================================
-# ANA ÇALIŞTIRMA BLOĞU
+# MAIN EXECUTION BLOCK
 # ==========================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -381,12 +387,11 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir",       type=str,  default="dataset")
     parser.add_argument("--start_seed",     type=int,  default=42)
     parser.add_argument("--num_cameras",    type=int,  default=1,
-                        help="Aracın etrafına eşit dağıtılacak kamera sayısı")
+                        help="Number of cameras distributed evenly around the vehicle")
     parser.add_argument("--no_vis",         action="store_true",
-                        help="Görüntülemeyi kapat (daha hızlı)")
+                        help="Disable visualization (faster)")
     parser.add_argument("--image_on_cuda",  action="store_true", default=False,
-                        help="GPU (CUDA) işleme pipeline'ını etkinleştir. "
-                             "Kapalıysa klasik CPU/NumPy kullanılır.")
+                        help="Enable GPU (CUDA) processing pipeline.")
 
     args = parser.parse_args()
 

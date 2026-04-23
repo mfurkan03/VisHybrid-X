@@ -4,7 +4,7 @@ import argparse
 import numpy as np
 import torch
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 import cv2
 import sys
 from pathlib import Path
@@ -77,7 +77,7 @@ class DepthEstimationModel:
             if rgb.dtype != np.uint8:
                 rgb = (rgb * 255).astype(np.uint8) if rgb.max() <= 1.0 else rgb.astype(np.uint8)
             
-            # --- THE FIX: Snap dimensions to a multiple of 14 ---
+            # --- SNAP DIMENSIONS TO A MULTIPLE OF 14 ---
             h, w = rgb.shape[:2]
             new_h = int(np.round(h / 14.0)) * 14
             new_w = int(np.round(w / 14.0)) * 14
@@ -116,8 +116,10 @@ class DepthEstimationModel:
 # 2. DATASET & LOSS
 # ==========================================
 class MetaDriveDepthDataset(Dataset):
-    def __init__(self, data_dir):
-        self.files      = glob.glob(os.path.join(data_dir, "*.npz"))
+    def __init__(self, data_dir, split="train"):
+        # Target the explicit split folder
+        split_dir = os.path.join(data_dir, split)
+        self.files      = glob.glob(os.path.join(split_dir, "*.npz"))
         self.rgb_frames = []
         self.gt_depths  = []
 
@@ -132,7 +134,7 @@ class MetaDriveDepthDataset(Dataset):
             self.rgb_frames.extend(data[rgb_keys[0]])
             self.gt_depths.extend(data[combined_keys[0]][:, 0:1, :, :])
 
-        print(f"[INFO] DepthDataset: {len(self.gt_depths)} samples.")
+        print(f"[INFO] DepthDataset ({split}): {len(self.gt_depths)} samples loaded from {split_dir}.")
 
     def __len__(self): return len(self.gt_depths)
     def __getitem__(self, idx):
@@ -154,15 +156,15 @@ def silog_loss(pred: torch.Tensor, target: torch.Tensor, variance_focus: float =
 # ==========================================
 # 3. DPT TRAINING LOOP
 # ==========================================
-def train_dpt(epochs=20, batch_size=64, model_path="dpt_finetuned.pth", data_dir="data/raw", val_split=0.2, lr=1e-5):
+def train_dpt(epochs=20, batch_size=64, model_path="dpt_finetuned.pth", data_dir="dataset", lr=1e-5):
     print("--- Phase 1: Training Depth Model (DPT) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     depth_estimator = DepthEstimationModel(trainable=True)
-    dataset = MetaDriveDepthDataset(data_dir=data_dir)
     
-    v = int(len(dataset) * val_split)
-    train_ds, val_ds = random_split(dataset, [len(dataset) - v, v])
+    # Explicitly load train and val datasets from their respective folders
+    train_ds = MetaDriveDepthDataset(data_dir=data_dir, split="train")
+    val_ds   = MetaDriveDepthDataset(data_dir=data_dir, split="val")
 
     def collate_fn(batch):
         rgbs, depths = zip(*batch)
@@ -175,6 +177,7 @@ def train_dpt(epochs=20, batch_size=64, model_path="dpt_finetuned.pth", data_dir
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-8)
     import math
     min_val_loss = math.inf
+    
     for epoch in range(epochs):
         depth_estimator.set_train_mode()
         train_loss = 0.0
@@ -198,21 +201,26 @@ def train_dpt(epochs=20, batch_size=64, model_path="dpt_finetuned.pth", data_dir
                 pred_depth = depth_estimator.predict_batch(rgb_np)
                 val_loss += silog_loss(pred_depth, gt_depth).item()
 
-        print(f"Epoch [{epoch+1:02d}/{epochs}] | Train Loss: {train_loss/len(train_loader):.4f} | Val Loss: {val_loss/len(val_loader):.4f}")
+        avg_train_loss = train_loss / len(train_loader)
+        avg_val_loss = val_loss / len(val_loader)
+        
+        print(f"Epoch [{epoch+1:02d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6e}")
         scheduler.step()
-        if val_loss<min_val_loss:
+        
+        if avg_val_loss < min_val_loss:
             # Save Checkpoint
-            min_val_loss = val_loss
+            min_val_loss = avg_val_loss
             torch.save(depth_estimator.model.state_dict(), model_path)
-            print(f"Saved DPT checkpoint: {model_path}")
+            print(f"*** Saved new best DPT checkpoint: {model_path} (Val Loss: {min_val_loss:.4f}) ***")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs",     type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--data_dir",   type=str, default="data/raw")
+    parser.add_argument("--data_dir",   type=str, default="dataset") # Defaults to 'dataset' to match the generated data structure
     parser.add_argument("--model_path", type=str, default="models/dpt_finetuned.pth")
     parser.add_argument("--lr",         type=float, default=5e-5)
     args = parser.parse_args()
 
-    train_dpt(args.epochs, args.batch_size, args.model_path, args.data_dir, 0.2, args.lr)
+    # Pass the data_dir directly instead of passing a val_split ratio
+    train_dpt(args.epochs, args.batch_size, args.model_path, args.data_dir, args.lr)
