@@ -127,41 +127,57 @@ def extract_features_frozen(rgb_batch: np.ndarray,
 class DrivingPolicyNet(nn.Module):
     def __init__(self, action_dim=2):
         super().__init__()
-        self.steer_conv = nn.Sequential(
+        
+        # Separate feature extractors for each modality
+        self.depth_conv = nn.Sequential(
             nn.Conv2d(1, 24, kernel_size=5, stride=2), nn.ReLU(),
             nn.Conv2d(24, 36, kernel_size=5, stride=2), nn.ReLU(),
             nn.Conv2d(36, 48, kernel_size=5, stride=2), nn.ReLU(),
             nn.Conv2d(48, 64, kernel_size=3, stride=1), nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU(),
         )
-        self.steer_fc = nn.Sequential(
-            nn.Linear(64 * 3 * 3, 100), nn.ReLU(),
-            nn.Linear(100, 50), nn.ReLU(),
-            nn.Linear(50, 10), nn.ReLU(),
-            nn.Linear(10, 1),
-        )
-        self.accel_conv = nn.Sequential(
+        self.lane_conv = nn.Sequential(
             nn.Conv2d(1, 24, kernel_size=5, stride=2), nn.ReLU(),
             nn.Conv2d(24, 36, kernel_size=5, stride=2), nn.ReLU(),
             nn.Conv2d(36, 48, kernel_size=5, stride=2), nn.ReLU(),
             nn.Conv2d(48, 64, kernel_size=3, stride=1), nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU(),
         )
-        self.accel_fc = nn.Sequential(
-            nn.Linear(64 * 3 * 3, 100), nn.ReLU(),
-            nn.Linear(100, 50), nn.ReLU(),
-            nn.Linear(50, 10), nn.ReLU(),
-            nn.Linear(10, 1),
+
+        # Fused shared trunk: both modalities inform both outputs
+        fused_dim = 64 * 3 * 3 * 2  # 1152 — concatenated depth + lane features
+
+        self.shared_fc = nn.Sequential(
+            nn.Linear(fused_dim, 256), nn.ReLU(),
+            nn.Linear(256, 128),       nn.ReLU(),
         )
+
+        # Two heads — each sees the full fused representation
+        self.steer_head = nn.Sequential(
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+        self.accel_head = nn.Sequential(
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
         self.flatten = nn.Flatten()
 
     def forward(self, x):
-        depth_input = x[:, 0:1, :, :]
-        lane_input  = x[:, 1:2, :, :]
-        s_feat = self.flatten(self.steer_conv(lane_input))
-        a_feat = self.flatten(self.accel_conv(depth_input))
-        return torch.cat([self.steer_fc(s_feat), self.accel_fc(a_feat)], dim=1)
+        depth_input = x[:, 0:1, :, :]   # (B, 1, 84, 84)
+        lane_input  = x[:, 1:2, :, :]   # (B, 1, 84, 84)
 
+        depth_feat = self.flatten(self.depth_conv(depth_input))  # (B, 576)
+        lane_feat  = self.flatten(self.lane_conv(lane_input))    # (B, 576)
+
+        fused  = torch.cat([depth_feat, lane_feat], dim=1)       # (B, 1152)
+        shared = self.shared_fc(fused)                           # (B, 128)
+
+        steer = self.steer_head(shared)   # (B, 1)
+        accel = self.accel_head(shared)   # (B, 1)
+
+        return torch.cat([steer, accel], dim=1)                  # (B, 2)
 
 # ==========================================
 # 3. DATASETS
@@ -413,7 +429,7 @@ def train_policy(
 # ==========================================
 # 6. TESTING LOOP
 # ==========================================
-def test_policy(model_path, dpt_path, data_dir, num_episodes, pred_dir=None):
+def test_policy(model_path, dpt_path, data_dir, num_episodes, pred_dir=None, test_mode="all"):
     print("--- Phase 3: Testing Driving Policy ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -425,127 +441,132 @@ def test_policy(model_path, dpt_path, data_dir, num_episodes, pred_dir=None):
         policy_model.load_state_dict(checkpoint)
     policy_model.eval()
 
+    depth_estimator = None  # loaded lazily only when needed
+
     # ---- Offline test ----
-    print("\n=> Running Offline Evaluation on Test Split...")
+    if test_mode in ("offline", "all"):
+        print("\n=> Running Offline Evaluation on Test Split...")
 
-    use_precomputed = (
-        pred_dir is not None
-        and os.path.isdir(os.path.join(pred_dir, "test"))
-    )
+        use_precomputed = (
+            pred_dir is not None
+            and os.path.isdir(os.path.join(pred_dir, "test"))
+        )
 
-    if use_precomputed:
-        print(f"[INFO] Using precomputed predictions for offline test: {pred_dir}")
-        test_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="test")
-        depth_estimator = None
+        if use_precomputed:
+            print(f"[INFO] Using precomputed predictions for offline test: {pred_dir}")
+            test_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="test")
 
-        def collate_fn(batch):
-            combined, actions = zip(*batch)
-            return (
-                torch.tensor(np.stack(combined), dtype=torch.float32),
-                np.stack(actions),
-            )
-    else:
-        depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
-        test_ds = MetaDriveRGBDataset(data_dir=data_dir, split="test")
+            def collate_fn(batch):
+                combined, actions = zip(*batch)
+                return (
+                    torch.tensor(np.stack(combined), dtype=torch.float32),
+                    np.stack(actions),
+                )
+        else:
+            depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
+            test_ds = MetaDriveRGBDataset(data_dir=data_dir, split="test")
 
-        def collate_fn(batch):
-            rgbs, actions = zip(*batch)
-            return np.stack(rgbs), np.stack(actions)
+            def collate_fn(batch):
+                rgbs, actions = zip(*batch)
+                return np.stack(rgbs), np.stack(actions)
 
-    if len(test_ds) > 0:
-        test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, collate_fn=collate_fn)
-        test_loss = 0.0
-        test_pred, test_true = [], []
-
-        with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Testing"):
-                if use_precomputed:
-                    combined_t, actions_np = batch
-                    combined  = combined_t.to(device)
-                    actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
-                else:
-                    rgb_np, actions_np = batch
-                    actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
-                    combined  = extract_features_frozen(rgb_np, depth_estimator, device)
-
-                pred = policy_model(combined)
-                test_loss += custom_driving_loss(pred, actions_t).item()
-                test_pred.append(pred.cpu().numpy())
-                test_true.append(actions_np)
-
-        avg_test_loss = test_loss / len(test_loader)
-        test_m = compute_offline_metrics(np.concatenate(test_pred), np.concatenate(test_true))
-
-        print("\n=== OFFLINE TEST RESULTS ===")
-        print(f"Test Loss    : {avg_test_loss:.4f}")
-        print(f"Steering MSE : {test_m['steering_mse']:.4f}")
-        print(f"Accel MSE    : {test_m['accel_mse']:.4f}")
-        print(f"Direction Acc: {test_m['direction_acc']:.3f}")
-    else:
-        print("[WARNING] No test data found. Skipping offline evaluation.")
-
-    # ---- Online simulation test ----
-    print("\n=> Running Online Evaluation (Simulation)...")
-
-    # Always need live DPT for online inference
-    if depth_estimator is None:
-        depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
-
-    config = {
-        "use_render": True,
-        "image_observation": True,
-        "sensors": {"rgb": (RGBCamera, 200, 200)},
-        "vehicle_config": {"image_source": "rgb"},
-        "show_interface": False,
-        "image_on_cuda": False,
-    }
-    env = MetaDriveEnv(config)
-    success_flags, route_completions = [], []
-
-    for ep in range(num_episodes):
-        obs, info = env.reset()
-        done, step_count, anlik_fps = False, 0, 0.0
-        last_time = time.time()
-
-        while not done:
-            step_count += 1
-            rgb_img        = env.engine.get_sensor("rgb").perceive(env.agent)
-            combined_tensor = extract_features_frozen(rgb_img[np.newaxis], depth_estimator, device)
+        if len(test_ds) > 0:
+            test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, collate_fn=collate_fn)
+            test_loss = 0.0
+            test_pred, test_true = [], []
 
             with torch.no_grad():
-                pred_action = policy_model(combined_tensor).cpu().numpy()[0]
+                for batch in tqdm(test_loader, desc="Testing"):
+                    if use_precomputed:
+                        combined_t, actions_np = batch
+                        combined  = combined_t.to(device)
+                        actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
+                    else:
+                        rgb_np, actions_np = batch
+                        actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
+                        combined  = extract_features_frozen(rgb_np, depth_estimator, device)
 
-            if step_count % 2 == 0:
-                depth_uint8 = (combined_tensor[0, 0].cpu().numpy() * 255).astype(np.uint8)
-                lane_uint8  = (combined_tensor[0, 1].cpu().numpy() * 255).astype(np.uint8)
-                depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO)
-                lane_color  = cv2.cvtColor(lane_uint8, cv2.COLOR_GRAY2BGR)
-                vis_size    = (400, 400)
-                dashboard   = np.hstack((
-                    cv2.resize(depth_color, vis_size, interpolation=cv2.INTER_LINEAR),
-                    cv2.resize(lane_color,  vis_size, interpolation=cv2.INTER_NEAREST),
-                ))
-                cv2.imshow("Agent Perception: Depth (Left) | Lane Mask (Right)", dashboard)
-                cv2.waitKey(1)
+                    pred = policy_model(combined)
+                    test_loss += custom_driving_loss(pred, actions_t).item()
+                    test_pred.append(pred.cpu().numpy())
+                    test_true.append(actions_np)
 
-            for _ in range(3):
-                obs, reward, terminated, truncated, info = env.step(pred_action)
-                done = terminated or truncated
-                if done: break
+            avg_test_loss = test_loss / len(test_loader)
+            test_m = compute_offline_metrics(np.concatenate(test_pred), np.concatenate(test_true))
 
-            cur_time  = time.time()
-            elapsed   = cur_time - last_time
-            last_time = cur_time
-            if elapsed > 0: anlik_fps = 0.9 * anlik_fps + 0.1 * (1.0 / elapsed)
-            print(f"EP: {ep+1} | Steer: {pred_action[0]:.2f} | Throttle {pred_action[1]:.2f} | FPS: {anlik_fps:.1f}", end="\r")
+            print("\n=== OFFLINE TEST RESULTS ===")
+            print(f"Test Loss    : {avg_test_loss:.4f}")
+            print(f"Steering MSE : {test_m['steering_mse']:.4f}")
+            print(f"Accel MSE    : {test_m['accel_mse']:.4f}")
+            print(f"Direction Acc: {test_m['direction_acc']:.3f}")
+        else:
+            print("[WARNING] No test data found. Skipping offline evaluation.")
 
-        success_flags.append(bool(info.get("arrive_dest", False)))
-        route_completions.append(info.get("route_completion", 0.0))
-        print(f"\nEpisode {ep+1} done. Success: {success_flags[-1]}")
+    # ---- Online simulation test ----
+    if test_mode in ("simulation", "all"):
+        print("\n=> Running Online Evaluation (Simulation)...")
 
-    print(f"\n=== ONLINE SUMMARY ===\nSuccess: {np.mean(success_flags)*100:.1f}%  Route: {np.mean(route_completions)*100:.1f}%")
-    env.close()
-    cv2.destroyAllWindows()
+        if depth_estimator is None:
+            depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
+
+        config = {
+            "use_render": True,
+            "image_observation": True,
+            "sensors": {"rgb": (RGBCamera, 200, 200)},
+            "vehicle_config": {"image_source": "rgb"},
+            "show_interface": False,
+            "image_on_cuda": False,
+        }
+        env = MetaDriveEnv(config)
+        success_flags, route_completions = [], []
+
+        for ep in range(num_episodes):
+            obs, info = env.reset()
+            done, step_count, anlik_fps = False, 0, 0.0
+            last_time = time.time()
+
+            while not done:
+                step_count += 1
+                rgb_img         = env.engine.get_sensor("rgb").perceive(env.agent)
+                combined_tensor = extract_features_frozen(rgb_img[np.newaxis], depth_estimator, device)
+
+                with torch.no_grad():
+                    pred_action = policy_model(combined_tensor).cpu().numpy()[0]
+
+                # ==========================================
+                # VISUALIZATION BLOCK
+                # ==========================================
+                if step_count % 1 == 0:
+                    depth_uint8   = (combined_tensor[0, 0].cpu().numpy() * 255).astype(np.uint8)
+                    lane_uint8    = (combined_tensor[0, 1].cpu().numpy() * 255).astype(np.uint8)
+                    depth_color   = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO)
+                    lane_color    = cv2.cvtColor(lane_uint8, cv2.COLOR_GRAY2BGR)
+                    vis_size      = (400, 400)
+                    depth_resized = cv2.resize(depth_color, vis_size, interpolation=cv2.INTER_LINEAR)
+                    lane_resized  = cv2.resize(lane_color,  vis_size, interpolation=cv2.INTER_NEAREST)
+                    dashboard     = np.hstack((depth_resized, lane_resized))
+                    cv2.imshow("Agent Perception: Depth (Left) | Lane Mask (Right)", dashboard)
+                    cv2.waitKey(1)
+                # ==========================================
+
+                for _ in range(3):
+                    obs, reward, terminated, truncated, info = env.step(pred_action)
+                    done = terminated or truncated
+                    if done: break
+
+                cur_time  = time.time()
+                elapsed   = cur_time - last_time
+                last_time = cur_time
+                if elapsed > 0: anlik_fps = 0.9 * anlik_fps + 0.1 * (1.0 / elapsed)
+                print(f"EP: {ep+1} | Steer: {pred_action[0]:.2f} | Throttle {pred_action[1]:.2f} | FPS: {anlik_fps:.1f}", end="\r")
+
+            success_flags.append(bool(info.get("arrive_dest", False)))
+            route_completions.append(info.get("route_completion", 0.0))
+            print(f"\nEpisode {ep+1} done. Success: {success_flags[-1]}")
+
+        print(f"\n=== ONLINE SUMMARY ===\nSuccess: {np.mean(success_flags)*100:.1f}%  Route: {np.mean(route_completions)*100:.1f}%")
+        env.close()
+        cv2.destroyAllWindows()
 
 
 # ==========================================
@@ -570,6 +591,13 @@ if __name__ == "__main__":
             "Example: data/processed/dpt_pred"
         ),
     )
+    parser.add_argument(
+        "--test_mode",
+        type=str,
+        default="all",
+        choices=["offline", "simulation", "all"],
+        help="Which test phase to run: 'offline' (dataset eval), 'simulation' (live env), or 'all' (both)."
+    )
     args = parser.parse_args()
 
     if args.mode in ["train", "all"]:
@@ -582,4 +610,5 @@ if __name__ == "__main__":
         test_policy(
             args.model_path, args.dpt_path, args.data_dir,
             args.episodes, pred_dir=args.pred_dir,
+            test_mode=args.test_mode,          # ← new
         )
