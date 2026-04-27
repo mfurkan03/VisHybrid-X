@@ -19,13 +19,14 @@ import torch.nn.functional as F
 from panda3d.core import loadPrcFileData
 loadPrcFileData("", "stm-max-views 20")
 
+# Import ego-state helper from models
+from models import extract_ego_state, EGO_DIM
+
+
 # ==========================================
 # FPS COUNTER
 # ==========================================
 class FPSCounter:
-    """
-    Calculates instant and average FPS using a sliding window.
-    """
     def __init__(self, window=60):
         self.window = window
         self._times = deque(maxlen=window)
@@ -62,6 +63,7 @@ class FPSCounter:
             f"  Instant FPS : {self.instant_fps:.1f}"
         )
 
+
 # ==========================================
 # CAMERA BUILDER
 # ==========================================
@@ -89,6 +91,7 @@ def create_surround_camera(name, angle_degree, camera_class):
     CustomCam.__name__ = name
     return CustomCam
 
+
 def build_cameras(num_cameras):
     angles          = [round(i * 360 / num_cameras) for i in range(num_cameras)]
     sensors         = {}
@@ -105,6 +108,7 @@ def build_cameras(num_cameras):
 
     return angles, sensors, rgb_cam_names, depth_cam_names
 
+
 # ==========================================
 # OPENCV VIEWER (with FPS overlay)
 # ==========================================
@@ -116,11 +120,10 @@ def show_cameras(raw_frames, rgb_cam_names, depth_cam_names, fps_counter: FPSCou
     for cam_name, depth_name in zip(rgb_cam_names, depth_cam_names):
         rgb_raw, depth_raw = raw_frames[cam_name]
 
-        # RGB
         img = rgb_raw
-        if hasattr(img, 'get'):   # CuPy -> NumPy
+        if hasattr(img, 'get'):
             img = img.get()
-        img = np.array(img, dtype=np.uint8)
+        img     = np.array(img, dtype=np.uint8)
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         img_big = cv2.resize(img_bgr, (THUMB, THUMB), interpolation=cv2.INTER_NEAREST)
         angle   = cam_name.split("_")[1]
@@ -128,9 +131,8 @@ def show_cameras(raw_frames, rgb_cam_names, depth_cam_names, fps_counter: FPSCou
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         rgb_frames.append(img_big)
 
-        # Depth
         d = depth_raw
-        if hasattr(d, 'get'):     # CuPy -> NumPy
+        if hasattr(d, 'get'):
             d = d.get()
         d = np.array(d, dtype=np.float32)
         if d.ndim == 3:
@@ -147,7 +149,6 @@ def show_cameras(raw_frames, rgb_cam_names, depth_cam_names, fps_counter: FPSCou
     depth_row = np.hstack(depth_frames)
     combined  = np.vstack([rgb_row, depth_row])
 
-    # ---- FPS overlay ----
     fps_text = (f"FPS: {fps_counter.instant_fps:5.1f}  |  "
                 f"Avg: {fps_counter.average_fps:5.1f}  |  "
                 f"Steps: {fps_counter.total_steps}")
@@ -158,8 +159,9 @@ def show_cameras(raw_frames, rgb_cam_names, depth_cam_names, fps_counter: FPSCou
     cv2.imshow("MetaDrive Cameras  (Q = Quit)", combined)
     return (cv2.waitKey(1) & 0xFF) == ord('q')
 
+
 # ==========================================
-# GPU PROCESSING (image_on_cuda=True)
+# GPU PROCESSING
 # ==========================================
 def process_gpu(env, rgb_name, depth_name, combined_observations):
     rgb_cupy = env.engine.get_sensor(rgb_name).perceive(
@@ -185,15 +187,15 @@ def process_gpu(env, rgb_name, depth_name, combined_observations):
     combined_obs = torch.cat([depth_map, lane_map], dim=0)
     combined_observations[rgb_name].append(combined_obs)
 
-    # +++ Save raw RGB as uint8 CPU numpy for the training pipeline +++
     rgb_np_uint8 = rgb_cupy.get() if hasattr(rgb_cupy, 'get') else np.array(rgb_cupy)
     rgb_np_uint8 = rgb_np_uint8.astype(np.uint8)
     combined_observations[f"{rgb_name}_rgb"].append(rgb_np_uint8)
 
     return rgb_cupy, d_cupy
 
+
 # ==========================================
-# CPU PROCESSING (image_on_cuda=False)
+# CPU PROCESSING
 # ==========================================
 def process_cpu(env, rgb_name, depth_name, combined_observations):
     rgb_img = env.engine.get_sensor(rgb_name).perceive(
@@ -223,12 +225,15 @@ def process_cpu(env, rgb_name, depth_name, combined_observations):
     combined_obs = np.concatenate([depth_map, lane_map], axis=0)
     combined_observations[rgb_name].append(combined_obs)
 
-    # +++ Save raw RGB as uint8 for the training pipeline +++
     rgb_np_uint8 = np.array(rgb_img, dtype=np.uint8)
     combined_observations[f"{rgb_name}_rgb"].append(rgb_np_uint8)
 
     return rgb_img, d_img
 
+
+# ==========================================
+# DATA COLLECTION FUNCTION
+# ==========================================
 # ==========================================
 # DATA COLLECTION FUNCTION
 # ==========================================
@@ -239,24 +244,24 @@ def collect_expert_data(
     visualize      = True,
     num_cameras    = 2,
     image_on_cuda  = True,
-    split_ratios   = (0.8, 0.1, 0.1) # Train, Val, Test ratios
+    split_ratios   = (0.8, 0.1, 0.1),
 ):
-    # Ensure all required directories exist
     os.makedirs(os.path.join(save_dir, "train"), exist_ok=True)
-    os.makedirs(os.path.join(save_dir, "val"), exist_ok=True)
-    os.makedirs(os.path.join(save_dir, "test"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "val"),   exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "test"),  exist_ok=True)
 
     angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(num_cameras)
 
-    # Calculate split sizes
     train_count = int(num_episodes * split_ratios[0])
-    val_count = int(num_episodes * split_ratios[1])
-    
+    val_count   = int(num_episodes * split_ratios[1])
+
     mode_str = "GPU (CUDA)" if image_on_cuda else "CPU (NumPy)"
     print(f"\n{'='*55}")
     print(f"  Processing Mode : {mode_str}")
     print(f"  Saving to       : '{save_dir}' (Split into train/val/test)")
     print(f"  Camera Count    : {num_cameras}  ->  Angles: {angles} degrees")
+    print(f"  Ego-state dim   : {EGO_DIM}  -> model sees [total_speed, last_steer]")
+    print(f"  Ego logged (full): total_speed, last_steer, forward_speed, lateral_speed, heading_delta, timestamp")
     print(f"{'='*55}\n")
 
     config = {
@@ -268,7 +273,7 @@ def collect_expert_data(
         "sensors":           sensors,
         "vehicle_config":    dict(image_source=rgb_cam_names[0]),
         "start_seed":        seed,
-        "num_scenarios":     num_episodes,
+        "num_scenarios":     num_episodes * 2, # Buffer in case many episodes are skipped
         "random_lane_width": True,
         "random_lane_num":   True,
         "traffic_density":   0.15,
@@ -285,53 +290,75 @@ def collect_expert_data(
     process_fn     = process_gpu if image_on_cuda else process_cpu
     quit_requested = False
 
-    for ep in range(num_episodes):
+    ep = 0
+    while ep < num_episodes:
         if quit_requested:
             break
-
-        # Determine the split for current episode
-        if ep < train_count:
-            current_split = "train"
-        elif ep < train_count + val_count:
-            current_split = "val"
-        else:
-            current_split = "test"
+        
+        current_split = (
+            "train" if ep < train_count
+            else "val" if ep < train_count + val_count
+            else "test"
+        )
 
         obs, info = env.reset()
-        # +++ Add *_rgb lists alongside the existing *_combined lists +++
+
+        # Storage buffers
         combined_observations = {
             key: []
             for rgb_name in rgb_cam_names
             for key in (rgb_name, f"{rgb_name}_rgb")
         }
-        actions = []
-        done    = False
+        actions         = []
+        ego_states      = []   # ← model-facing slice: (T, EGO_DIM) = [total_speed, last_steer]
+        ego_states_full = []   # ← full EgoReading fields for offline analysis
+        frame_timestamps = []  # ← wall-clock time of each ego/frame reading
+        last_steer      = 0.0  # ← track previous steer for ego state
 
+        done = False
+        ep_steps = 0
         while not done:
             fps_counter.tick()
-
+            ep_steps+=1
             # Expert action + noise
             expert_action  = expert(env.agent, deterministic=True)
             applied_action = expert_action.copy()
-            if fps_counter.total_steps % 10 == 0:
-                applied_action[0] += random.uniform(-0.3, 0.3)
+            # if fps_counter.total_steps % 10 == 0:
+            #     applied_action[0] += random.uniform(-0.05, 0.05)
 
-            # Process cameras (GPU or CPU)
+            # --- Ego state (before step, reflects current state) ---
+            reading = extract_ego_state(env.agent, last_steer=last_steer)
+            ego_states.append(reading.ego_model)           # 2-dim model input
+            ego_states_full.append([                       # full snapshot for logging
+                reading.total_speed,
+                reading.last_steer,
+                reading.forward_speed,
+                reading.lateral_speed,
+                reading.heading_delta,
+            ])
+            frame_timestamps.append(reading.timestamp)     # wall-clock seconds
+
+            # Process cameras
             raw_frames = {}
             for rgb_name, depth_name in zip(rgb_cam_names, depth_cam_names):
                 rgb_raw, depth_raw = process_fn(env, rgb_name, depth_name, combined_observations)
                 raw_frames[rgb_name] = (rgb_raw, depth_raw)
 
             actions.append(expert_action.copy())
+            last_steer = float(expert_action[0])   # update for next step
+
             obs, reward, terminated, truncated, info = env.step(applied_action)
             done = terminated or truncated
-
-            # Terminal output (every 50 steps)
+            if ep_steps >= 1000:
+                done = True
             if fps_counter.total_steps % 50 == 0:
                 print(f"  [Ep {ep+1}/{num_episodes}] "
                       f"Step: {fps_counter.total_steps:5d}  |  "
                       f"Inst FPS: {fps_counter.instant_fps:5.1f}  |  "
-                      f"Avg FPS: {fps_counter.average_fps:5.1f}",
+                      f"Avg FPS: {fps_counter.average_fps:5.1f}  |  "
+                      f"Ego: spd={reading.total_speed:+.2f} fwd={reading.forward_speed:+.2f} "
+                      f"lat={reading.lateral_speed:+.2f} hdg={reading.heading_delta:+.2f} "
+                      f"str={reading.last_steer:+.2f}",
                       flush=True)
 
             if visualize:
@@ -341,8 +368,17 @@ def collect_expert_data(
                 if quit_requested:
                     done = True
 
-        # Save dictionary
-        save_dict = {"action": np.array(actions)}
+        # Build save dict
+        save_dict = {
+            "action":          np.array(actions),
+            # Model input: (T, EGO_DIM) = [total_speed, last_steer]
+            "ego_state":       np.array(ego_states,      dtype=np.float32),
+            # Full snapshot: (T, 5) = [total_speed, last_steer, forward_speed, lateral_speed, heading_delta]
+            # Column order matches the list above; use ego_states_full[:, 2] for forward_speed, etc.
+            "ego_state_full":  np.array(ego_states_full, dtype=np.float32),
+            # Wall-clock timestamp (seconds since epoch) for each step — use np.diff() to get dt
+            "frame_timestamps": np.array(frame_timestamps, dtype=np.float64),
+        }
         for rgb_name in rgb_cam_names:
             obs_list = combined_observations[rgb_name]
             if image_on_cuda and isinstance(obs_list[0], torch.Tensor):
@@ -354,30 +390,31 @@ def collect_expert_data(
             rgb_list = combined_observations[f"{rgb_name}_rgb"]
             save_dict[f"{rgb_name}_rgb"] = np.array(rgb_list, dtype=np.uint8)
 
-        # Save to the respective split folder
         save_path = os.path.join(save_dir, current_split, f"episode_{ep}.npz")
-        ep_steps  = len(actions)
 
         def _save(p, d):
             np.savez_compressed(p, **d)
 
         t = threading.Thread(target=_save, args=(save_path, save_dict), daemon=True)
         t.start()
-        print(f"\n  --> Saving Episode {ep+1}/{num_episodes} to '{current_split}' folder (Background). "
-              f"(Steps: {ep_steps})")
+        print(f"\n  --> Saving Episode {ep+1}/{num_episodes} to '{current_split}' "
+              f"(Steps: {ep_steps}, Ego-states: {len(ego_states)})")
+        
+        # Increment episode counter only upon a successful run <= 1000 steps
+        ep += 1
 
     cv2.destroyAllWindows()
     env.close()
 
-    # ---- Summary Report ----
     print(f"\n{'='*55}")
     print(f"  DATA COLLECTION COMPLETED")
     print(f"  Mode: {mode_str}")
     print(fps_counter.summary())
     print(f"{'='*55}\n")
 
+
 # ==========================================
-# MAIN EXECUTION BLOCK
+# MAIN
 # ==========================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -386,12 +423,9 @@ if __name__ == "__main__":
     parser.add_argument("--episodes",       type=int,  default=10)
     parser.add_argument("--save_dir",       type=str,  default="dataset")
     parser.add_argument("--start_seed",     type=int,  default=42)
-    parser.add_argument("--num_cameras",    type=int,  default=1,
-                        help="Number of cameras distributed evenly around the vehicle")
-    parser.add_argument("--no_vis",         action="store_true",
-                        help="Disable visualization (faster)")
-    parser.add_argument("--image_on_cuda",  action="store_true", default=False,
-                        help="Enable GPU (CUDA) processing pipeline.")
+    parser.add_argument("--num_cameras",    type=int,  default=1)
+    parser.add_argument("--no_vis",         action="store_true")
+    parser.add_argument("--image_on_cuda",  action="store_true", default=False)
 
     args = parser.parse_args()
 

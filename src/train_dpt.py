@@ -10,112 +10,28 @@ import sys
 from pathlib import Path
 from tqdm import tqdm
 
-target_folder = Path(__file__).resolve().parent.parent / 'Depth-Anything-V2'
-sys.path.append(str(target_folder))
-from depth_anything_v2.dpt import DepthAnythingV2
+# Import the centralized models
+from models import DepthEstimationModel
 
-# ==========================================
-# 1. DEPTH MODEL
-# ==========================================
-class DepthEstimationModel:
-    def __init__(self, encoder='vits', trainable=True):
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.trainable = trainable
-
-        model_configs = {
-            'vits': {'encoder': 'vits', 'features': 64,  'out_channels': [48, 96, 192, 384]},
-            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-        }
-        self.model = DepthAnythingV2(**model_configs[encoder])
-        ckpt_path = f'{target_folder}/checkpoints/depth_anything_v2_{encoder}.pth'
-        if os.path.exists(ckpt_path):
-            self.model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
-            print(f"[INFO] DepthAnythingV2 loaded: {ckpt_path}")
-        else:
-            print(f"[WARNING] Checkpoint not found: {ckpt_path}")
-
-        self.model = self.model.to(self.device)
-        self.use_fp16 = (self.device == 'cuda')
-
-        if self.trainable:
-            self.set_train_mode()
-        else:
-            self.set_eval_mode()
-
-    def set_train_mode(self):
-        self.model.train()
-        for p in self.model.parameters():
-            p.requires_grad = True
-
-    def set_eval_mode(self):
-        self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad = False
-
-    def predict_batch(self, rgb_images: np.ndarray) -> torch.Tensor:
-        results = []
-        for rgb in rgb_images:
-            if rgb.dtype != np.uint8:
-                rgb = (rgb * 255).astype(np.uint8) if rgb.max() <= 1.0 else rgb.astype(np.uint8)
-            rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            depth_raw = self.model.infer_image(rgb_bgr)
-            d_tensor = torch.from_numpy(depth_raw).to(self.device).unsqueeze(0).unsqueeze(0)
-
-            import torch.nn.functional as F
-            depth_resized = F.interpolate(d_tensor, size=(84, 84), mode='bilinear', align_corners=False)
-            d_min, d_max = depth_resized.min(), depth_resized.max()
-            depth_norm = (depth_resized - d_min) / (d_max - d_min + 1e-6)
-            results.append(depth_norm.float())
-
-        return torch.cat(results, dim=0)
-
-    def predict_batch_with_grad(self, rgb_images: np.ndarray) -> torch.Tensor:
-        results = []
-        import torch.nn.functional as F
-        for rgb in rgb_images:
-            if rgb.dtype != np.uint8:
-                rgb = (rgb * 255).astype(np.uint8) if rgb.max() <= 1.0 else rgb.astype(np.uint8)
-
-            h, w = rgb.shape[:2]
-            new_h = int(np.round(h / 14.0)) * 14
-            new_w = int(np.round(w / 14.0)) * 14
-            rgb_resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-
-            rgb_bgr = cv2.cvtColor(rgb_resized, cv2.COLOR_RGB2BGR)
-
-            img = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB) / 255.0
-            img = torch.from_numpy(img).permute(2, 0, 1).float().unsqueeze(0).to(self.device)
-
-            mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-            std  = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
-            img = (img - mean) / std
-
-            if self.use_fp16:
-                with torch.amp.autocast('cuda'):
-                    depth = self.model(img)
-            else:
-                depth = self.model(img)
-
-            if depth.dim() == 3: depth = depth.unsqueeze(1)
-            elif depth.dim() == 2: depth = depth.unsqueeze(0).unsqueeze(0)
-
-            depth_resized = F.interpolate(depth, size=(84, 84), mode='bilinear', align_corners=False)
-            d_min = depth_resized.amin(dim=(-2, -1), keepdim=True)
-            d_max = depth_resized.amax(dim=(-2, -1), keepdim=True)
-            depth_norm = (depth_resized - d_min) / (d_max - d_min + 1e-6)
-            results.append(depth_norm.float())
-
-        return torch.cat(results, dim=0)
 
 
 # ==========================================
 # 2. DATASET & LOSS
 # ==========================================
 class MetaDriveDepthDataset(Dataset):
-    def __init__(self, data_dir, split="train"):
+    def __init__(self, data_dir, split="train", subset_fraction=1.0, augment=False):
+        self.augment = augment
         split_dir = os.path.join(data_dir, split)
-        self.files      = glob.glob(os.path.join(split_dir, "*.npz"))
+        self.files      = sorted(glob.glob(os.path.join(split_dir, "*.npz")))
+        
+        # --- SUBSET LOGIC ---
+        if split == "train" and subset_fraction < 1.0:
+            import random
+            random.seed(42)  # Fixed seed so we grab the same subset across runs
+            num_files = max(1, int(len(self.files) * subset_fraction))
+            self.files = random.sample(self.files, num_files)
+            print(f"[INFO] Training on {subset_fraction*100:.1f}% of data: {num_files} files.")
+
         self.rgb_frames = []
         self.gt_depths  = []
 
@@ -133,35 +49,122 @@ class MetaDriveDepthDataset(Dataset):
         print(f"[INFO] DepthDataset ({split}): {len(self.gt_depths)} samples loaded from {split_dir}.")
 
     def __len__(self): return len(self.gt_depths)
+    
     def __getitem__(self, idx):
-        return self.rgb_frames[idx], np.array(self.gt_depths[idx], dtype=np.float32)
+        rgb = self.rgb_frames[idx].copy()
+        depth = np.array(self.gt_depths[idx], dtype=np.float32).copy()
 
+        # --- FIX: Resize to a multiple of 14 (196x196 is closest to 200x200) ---
+        target_size = (196, 196) # (Width, Height)
+        
+        # Resize RGB (Interpolation: Linear is good for RGB)
+        rgb = cv2.resize(rgb, target_size, interpolation=cv2.INTER_LINEAR)
+        
+        # Resize Depth (Interpolation: Nearest avoids averaging artifacts on depth boundaries)
+        # Depth is currently (1, H, W), so we extract the 2D plane, resize, and re-expand
+        depth_sq = depth[0]
+        depth_sq = cv2.resize(depth_sq, target_size, interpolation=cv2.INTER_NEAREST)
+        depth = np.expand_dims(depth_sq, axis=0)
+        # -----------------------------------------------------------------------
 
-def silog_loss(pred: torch.Tensor, target: torch.Tensor, variance_focus: float = 0.85) -> torch.Tensor:
-    eps = 1e-6
-    if pred.shape != target.shape:
+        if self.augment:
+            rgb, depth = self._apply_augmentations(rgb, depth)
+
+        return rgb, depth
+
+    def _apply_augmentations(self, rgb, depth):
+        import random
+        
+        # 1. Random Horizontal Flip (50% chance)
+        if random.random() > 0.5:
+            rgb = cv2.flip(rgb, 1)
+            # Depth is shape (1, H, W). cv2.flip expects (H, W) for 2D.
+            depth_sq = cv2.flip(depth[0], 1)
+            depth = np.expand_dims(depth_sq, axis=0)
+
+        # 2. Random Color Jitter (80% chance)
+        if random.random() > 0.2:
+            # Convert to HSV for robust brightness/saturation/hue shifts
+            hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+            
+            # Hue shift (-10 to +10)
+            hsv[:, :, 0] = (hsv[:, :, 0] + random.uniform(-10, 10)) % 180
+            # Saturation scale (0.7 to 1.3)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * random.uniform(0.7, 1.3), 0, 255)
+            # Brightness/Value scale (0.7 to 1.3)
+            hsv[:, :, 2] = np.clip(hsv[:, :, 2] * random.uniform(0.7, 1.3), 0, 255)
+            
+            rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+        # 3. Random Gaussian Blur (30% chance)
+        if random.random() > 0.7:
+            ksize = random.choice([3, 5])
+            rgb = cv2.GaussianBlur(rgb, (ksize, ksize), 0)
+
+        # 4. Random Additive Gaussian Noise (30% chance)
+        if random.random() > 0.7:
+            noise = np.random.normal(0, random.uniform(5, 15), rgb.shape).astype(np.float32)
+            rgb = np.clip(rgb.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+        # 5. Random Cutout / Erasing (20% chance) - simulates occlusion
+        if random.random() > 0.8:
+            h, w = rgb.shape[:2]
+            y = random.randint(0, h // 2)
+            x = random.randint(0, w // 2)
+            cut_h, cut_w = random.randint(10, h // 4), random.randint(10, w // 4)
+            # Add black box to RGB (does NOT modify depth map, encouraging model to infer through occlusion)
+            rgb[y:y+cut_h, x:x+cut_w, :] = 0 
+
+        return rgb, depth
+
+def scale_shift_invariant_loss(prediction, target, mask=None):
+    """
+    Scale and Shift Invariant Loss (SSIL).
+    Aligns the prediction to the target dynamically solving for scale and shift (Prediction = s * GT + t)
+    """
+    if prediction.shape != target.shape:
         import torch.nn.functional as F
-        target = F.interpolate(target, size=pred.shape[-2:], mode='bilinear', align_corners=False)
+        target = F.interpolate(target, size=prediction.shape[-2:], mode='bilinear', align_corners=False)
 
-    pred   = pred.clamp(min=eps)
-    target = target.clamp(min=eps)
+    if mask is None:
+        mask = target > 0 # Ignore zero-depth background pixels
 
-    d = torch.log(pred) - torch.log(target)
-    loss = d.pow(2).mean() - variance_focus * d.mean().pow(2)
+    # Flatten tensors
+    prediction = prediction[mask]
+    target = target[mask]
+
+    if prediction.numel() < 10:
+        return torch.tensor(0.0, device=prediction.device, requires_grad=True)
+
+    # Calculate optimal scale and shift using least squares
+    # This prevents the model from being punished for being "inverted" or having a different base scale
+    target_mean = target.mean()
+    pred_mean = prediction.mean()
+
+    target_var = target - target_mean
+    pred_var = prediction - pred_mean
+
+    scale = (target_var * pred_var).sum() / (pred_var.pow(2).sum() + 1e-6)
+    shift = target_mean - scale * pred_mean
+
+    # Align prediction
+    aligned_prediction = scale * prediction + shift
+
+    # Compute standard L1 or L2 loss on the aligned maps
+    loss = torch.nn.functional.l1_loss(aligned_prediction, target)
     return loss
 
-
-# ==========================================
-# 3. DPT TRAINING LOOP
-# ==========================================
-def train_dpt(epochs=20, batch_size=64, model_path="dpt_finetuned.pth", data_dir="dataset", lr=1e-5):
+# --- ADDED: patience parameter ---
+# --- ADDED: patience parameter ---
+def train_dpt(epochs=20, batch_size=64, model_path="dpt_finetuned.pth", data_dir="dataset", lr=1e-5, train_subset=1.0, patience=5):
     print("--- Phase 1: Training Depth Model (DPT) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    depth_estimator = DepthEstimationModel(trainable=True)
-
-    train_ds = MetaDriveDepthDataset(data_dir=data_dir, split="train")
-    val_ds   = MetaDriveDepthDataset(data_dir=data_dir, split="val")
+    # Use the centralized model, explicitly passing trainable=True
+    depth_estimator = DepthEstimationModel(finetuned_path=None, trainable=True)
+    
+    train_ds = MetaDriveDepthDataset(data_dir=data_dir, split="train", subset_fraction=train_subset, augment=True)
+    val_ds   = MetaDriveDepthDataset(data_dir=data_dir, split="val", subset_fraction=1.0, augment=False)
 
     def collate_fn(batch):
         rgbs, depths = zip(*batch)
@@ -170,10 +173,25 @@ def train_dpt(epochs=20, batch_size=64, model_path="dpt_finetuned.pth", data_dir
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  collate_fn=collate_fn)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
+    # --- Setup Visualization Batch ---
+    vis_dir = "epoch_visualizations"
+    os.makedirs(vis_dir, exist_ok=True)
+    print(f"[INFO] Visualizations will be saved to ./{vis_dir}/")
+    
+    fixed_vis_rgbs, fixed_vis_depths = next(iter(val_loader))
+    fixed_vis_rgbs = fixed_vis_rgbs[:4]
+    fixed_vis_depths = fixed_vis_depths[:4]
+    # --------------------------------------
+
     optimizer = optim.AdamW(depth_estimator.model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-8)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-7)
+    scaler = torch.amp.GradScaler('cuda')
     import math
     min_val_loss = math.inf
+    patience_counter = 0
+    
+    # --- NEW: Track the specific epoch file to delete later ---
+    last_best_epoch_path = None
 
     for epoch in range(epochs):
         depth_estimator.set_train_mode()
@@ -181,12 +199,17 @@ def train_dpt(epochs=20, batch_size=64, model_path="dpt_finetuned.pth", data_dir
 
         for rgb_np, gt_depth in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
             gt_depth = gt_depth.to(device)
+
             optimizer.zero_grad()
-            pred_depth = depth_estimator.predict_batch_with_grad(rgb_np)
-            loss = silog_loss(pred_depth, gt_depth)
-            loss.backward()
+            with torch.amp.autocast('cuda'):
+                pred_depth = depth_estimator.predict_batch_with_grad(rgb_np)
+                loss = scale_shift_invariant_loss(pred_depth, gt_depth)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(depth_estimator.model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             train_loss += loss.item()
 
         depth_estimator.set_eval_mode()
@@ -194,8 +217,8 @@ def train_dpt(epochs=20, batch_size=64, model_path="dpt_finetuned.pth", data_dir
         with torch.no_grad():
             for rgb_np, gt_depth in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
                 gt_depth = gt_depth.to(device)
-                pred_depth = depth_estimator.predict_batch(rgb_np)
-                val_loss += silog_loss(pred_depth, gt_depth).item()
+                pred_depth = depth_estimator.predict_batch_with_grad(rgb_np) 
+                val_loss += scale_shift_invariant_loss(pred_depth, gt_depth).item()
 
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss   = val_loss   / len(val_loader)
@@ -203,10 +226,68 @@ def train_dpt(epochs=20, batch_size=64, model_path="dpt_finetuned.pth", data_dir
         print(f"Epoch [{epoch+1:02d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6e}")
         scheduler.step()
 
+        # --- UPDATED: Early stopping & Strict Best-Model Keeping ---
         if avg_val_loss < min_val_loss:
             min_val_loss = avg_val_loss
+            patience_counter = 0  # Reset counter
+            
+            # 1. Create a dynamic filename tracking the epoch
+            base_dir = os.path.dirname(model_path) or "."
+            name, ext = os.path.splitext(os.path.basename(model_path))
+            epoch_specific_path = os.path.join(base_dir, f"{name}_ep{epoch+1:02d}{ext}")
+            
+            # 2. Save the new best model with the epoch name
+            torch.save(depth_estimator.model.state_dict(), epoch_specific_path)
+            
+            # 3. Also overwrite the static model_path so downstream scripts don't break
             torch.save(depth_estimator.model.state_dict(), model_path)
-            print(f"*** Saved new best DPT checkpoint: {model_path} (Val Loss: {min_val_loss:.4f}) ***")
+            
+            print(f"*** Saved new best DPT checkpoint: {epoch_specific_path} (Val Loss: {min_val_loss:.4f}) ***")
+            
+            # 4. Delete the previous best epoch file to save storage!
+            if last_best_epoch_path and os.path.exists(last_best_epoch_path):
+                os.remove(last_best_epoch_path)
+                print(f"    -> Removed older checkpoint: {last_best_epoch_path}")
+            
+            # 5. Update the tracker
+            last_best_epoch_path = epoch_specific_path
+            
+        else:
+            patience_counter += 1
+            print(f"--- Early Stopping Counter: {patience_counter}/{patience} ---")
+            if patience_counter >= patience:
+                print(f"[INFO] Early stopping triggered! Validation loss hasn't improved for {patience} epochs.")
+                break
+
+        with torch.no_grad():
+            pred_vis_depths = depth_estimator.predict_batch_with_grad(fixed_vis_rgbs)
+        
+        vis_rows = []
+        for i in range(len(fixed_vis_rgbs)):
+            rgb_img = fixed_vis_rgbs[i].copy()
+            if rgb_img.max() <= 1.0:
+                rgb_img = (rgb_img * 255).astype(np.uint8)
+            
+            rgb_img = cv2.resize(rgb_img, (196, 196)) 
+            rgb_bgr = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+
+            gt_d = fixed_vis_depths[i, 0].cpu().numpy()
+            gt_d = cv2.resize(gt_d, (196, 196), interpolation=cv2.INTER_NEAREST)
+            gt_d = (gt_d - gt_d.min()) / (gt_d.max() - gt_d.min() + 1e-6)
+            gt_d_color = cv2.applyColorMap((gt_d * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+
+            pred_d = pred_vis_depths[i, 0].cpu().numpy()
+            pred_d = cv2.resize(pred_d, (196, 196), interpolation=cv2.INTER_NEAREST)
+            pred_d = (pred_d - pred_d.min()) / (pred_d.max() - pred_d.min() + 1e-6)
+            pred_d = 1.0 - pred_d 
+            pred_d_color = cv2.applyColorMap((pred_d * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+
+            row_img = np.hstack((rgb_bgr, gt_d_color, pred_d_color))
+            vis_rows.append(row_img)
+            
+        grid_img = np.vstack(vis_rows)
+        out_file = os.path.join(vis_dir, f"epoch_{epoch+1:03d}.jpg")
+        cv2.imwrite(out_file, grid_img)
 
 
 # ==========================================
@@ -219,71 +300,12 @@ def precompute_dpt_predictions(
     batch_size:  int  = 32,
     splits:      tuple = ("train", "val"),
 ):
-    """
-    Run the (optionally fine-tuned) DPT model over all RGB frames in the
-    requested splits and cache the resulting depth + lane-mask tensors to
-    disk.  The policy trainer can then load these directly, skipping
-    per-step inference completely.
-
-    Output layout
-    --------------
-    <out_dir>/
-      train/
-        episode_0.npz   # keys: depth_pred [N,1,84,84], lane_mask [N,1,84,84], action [N,2]
-        episode_1.npz
-        ...
-      val/
-        episode_0.npz
-        ...
-
-    Each .npz mirrors the episode-level structure of the raw dataset so
-    the policy DataLoader can index them the same way.
-    """
-    import torch.nn.functional as F
-
     print("--- Precomputing DPT Predictions ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---- Load depth model (frozen) ----
-    from depth_anything_v2.dpt import DepthAnythingV2
-    model_configs = {
-        'vits': {'encoder': 'vits', 'features': 64,  'out_channels': [48, 96, 192, 384]},
-    }
-    dpt_model = DepthAnythingV2(**model_configs['vits'])
-    if dpt_path and os.path.exists(dpt_path):
-        dpt_model.load_state_dict(torch.load(dpt_path, map_location='cpu'))
-        print(f"[INFO] Fine-tuned DPT loaded from: {dpt_path}")
-    else:
-        # Fall back to base checkpoint
-        base_ckpt = str(target_folder / 'checkpoints' / 'depth_anything_v2_vits.pth')
-        if os.path.exists(base_ckpt):
-            dpt_model.load_state_dict(torch.load(base_ckpt, map_location='cpu'))
-            print(f"[INFO] Base DPT checkpoint loaded from: {base_ckpt}")
-        else:
-            print("[WARNING] No DPT checkpoint found – using random weights.")
-    dpt_model = dpt_model.to(device).eval()
-    for p in dpt_model.parameters():
-        p.requires_grad = False
-    use_fp16 = (device.type == 'cuda')
-
-    # ---- Helper: run DPT on a numpy RGB image ----
-    def _infer_depth(rgb_np: np.ndarray) -> np.ndarray:
-        """Returns a float32 array of shape (1, 84, 84), values in [0, 1]."""
-        if rgb_np.dtype != np.uint8:
-            rgb_np = (rgb_np * 255).astype(np.uint8) if rgb_np.max() <= 1.0 else rgb_np.astype(np.uint8)
-        rgb_bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
-
-        if use_fp16:
-            with torch.amp.autocast('cuda'):
-                depth_raw = dpt_model.infer_image(rgb_bgr)
-        else:
-            depth_raw = dpt_model.infer_image(rgb_bgr)
-
-        d = torch.from_numpy(depth_raw).to(device).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-        d = F.interpolate(d, size=(84, 84), mode='bilinear', align_corners=False)
-        d_min, d_max = d.min(), d.max()
-        d = (d - d_min) / (d_max - d_min + 1e-6)
-        return d.squeeze(0).cpu().numpy().astype(np.float32)  # (1, 84, 84)
+    # Use the centralized model wrapper just like in training
+    depth_estimator = DepthEstimationModel(finetuned_path=dpt_path, trainable=False)
+    depth_estimator.set_eval_mode()
 
     # ---- Helper: compute lane mask from RGB ----
     def _lane_mask(rgb_np: np.ndarray, threshold: int = 180) -> np.ndarray:
@@ -339,18 +361,40 @@ def precompute_dpt_predictions(
             depth_preds = np.empty((N, 1, 84, 84), dtype=np.float32)
             lane_masks  = np.empty((N, 1, 84, 84), dtype=np.float32)
 
-            # Run inference in mini-batches for tqdm granularity
+            # Run inference in mini-batches
             for start in tqdm(range(0, N, batch_size), desc=f"  {ep_name}", leave=False):
                 end   = min(start + batch_size, N)
-                batch = rgb_frames[start:end]
-                for i, rgb in enumerate(batch):
-                    depth_preds[start + i] = _infer_depth(rgb)
-                    lane_masks[start + i]  = _lane_mask(rgb)
+                batch_rgb = rgb_frames[start:end]
+                batch_rescaled = np.array([
+                    cv2.resize(frame, (196, 196), interpolation=cv2.INTER_LINEAR) 
+                    for frame in batch_rgb
+                ])
+                # 1. Batched inference matching the training loop
+                with torch.no_grad():
+                    pred_batch_tensor = depth_estimator.predict_batch_with_grad(batch_rescaled)
+                
+                # 2. Process each frame identically to the epoch visualization logic
+                for i in range(len(batch_rgb)):
+                    pred_d = pred_batch_tensor[i, 0].cpu().numpy()
+                    
+                    # Resize to the required 84x84 policy shape using NEAREST
+                    pred_d = cv2.resize(pred_d, (84, 84), interpolation=cv2.INTER_NEAREST)
+                    
+                    # Normalize to 0-1
+                    pred_d = (pred_d - pred_d.min()) / (pred_d.max() - pred_d.min() + 1e-6)
+                    
+                    # INVERT IT SO IT LOOKS LIKE METADRIVE DEPTH
+                    pred_d = 1.0 - pred_d 
+                    
+                    depth_preds[start + i, 0] = pred_d
+                    lane_masks[start + i]  = _lane_mask(batch_rgb[i])
 
             save_dict = {
                 "depth_pred": depth_preds,   # (N, 1, 84, 84) float32
                 "lane_mask":  lane_masks,    # (N, 1, 84, 84) float32
             }
+            if 'ego_state' in data.files:
+               save_dict["ego_state"] = data['ego_state']
             if actions is not None:
                 save_dict["action"] = actions
 
@@ -358,7 +402,6 @@ def precompute_dpt_predictions(
             print(f"  Saved {ep_name}  [{N} frames]  ->  {out_path}")
 
     print(f"\n[INFO] Precomputation complete. Cached predictions are in: {out_dir}")
-
 
 # ==========================================
 # 5. MAIN
@@ -372,16 +415,24 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int,   default=32)
     parser.add_argument("--data_dir",   type=str,   default="dataset")
     parser.add_argument("--model_path", type=str,   default="models/dpt_finetuned.pth")
-    parser.add_argument("--lr",         type=float, default=5e-5)
+    parser.add_argument("--lr",         type=float, default=1e-5)
+    parser.add_argument("--train_subset", type=float, default=1.0,
+                        help="Fraction of training data to use (e.g. 0.2 for 20%)")
+    
+    # --- ADDED: Patience argument ---
+    parser.add_argument("--patience",   type=int,   default=5,
+                        help="Number of epochs to wait for val loss improvement before stopping")
+                        
     # Precompute-only args
     parser.add_argument("--out_dir",    type=str,   default="data/processed/dpt_pred",
                         help="Where to write cached DPT predictions (used with --mode precompute)")
-    parser.add_argument("--splits",     type=str,   nargs="+", default=["train", "val"],
+    parser.add_argument("--splits",     type=str,   nargs="+", default=["train", "val","test"],
                         help="Which dataset splits to precompute (default: train val)")
     args = parser.parse_args()
 
     if args.mode == "train":
-        train_dpt(args.epochs, args.batch_size, args.model_path, args.data_dir, args.lr)
+        # --- ADDED: Pass patience argument to train function ---
+        train_dpt(args.epochs, args.batch_size, args.model_path, args.data_dir, args.lr, args.train_subset, args.patience)
 
     elif args.mode == "precompute":
         precompute_dpt_predictions(
