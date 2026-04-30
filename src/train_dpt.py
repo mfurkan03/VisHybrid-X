@@ -302,7 +302,7 @@ def _process_episode(ep_path: str, out_path: str, dpt_path: str, batch_size: int
     rgb_frames  = data[rgb_keys[0]]
     actions     = data.get("action")  # may be None
     N           = len(rgb_frames)
-    depth_preds = np.empty((N, 1, 84, 84), dtype=np.float32)
+    depth_preds = np.empty((N, 1, 196, 196), dtype=np.float32)
 
     for start in range(0, N, batch_size):
         end   = min(start + batch_size, N)
@@ -315,19 +315,11 @@ def _process_episode(ep_path: str, out_path: str, dpt_path: str, batch_size: int
 
         for i in range(len(batch)):
             pred_d = pred_batch[i, 0].cpu().numpy()
-            pred_d = cv2.resize(pred_d, (84, 84), interpolation=cv2.INTER_NEAREST)
             pred_d = (pred_d - pred_d.min()) / (pred_d.max() - pred_d.min() + 1e-6)
             pred_d = 1.0 - pred_d
             depth_preds[start + i, 0] = pred_d
 
-    # Downsize RGB to 84×84 to match depth resolution — needed for lane-mask
-    # computation at training time without keeping full-res frames on disk.
-    rgb_small = np.stack([
-        cv2.resize(f, (84, 84), interpolation=cv2.INTER_LINEAR)
-        for f in rgb_frames
-    ]).astype(np.uint8)  # (N, 84, 84, 3)
-
-    save_dict = {"depth_pred": depth_preds, "rgb": rgb_small}
+    save_dict = {"depth_pred": depth_preds, "rgb": rgb_frames}
     if "ego_state" in data.files:
         save_dict["ego_state"] = data["ego_state"]
     if actions is not None:

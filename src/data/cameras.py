@@ -50,7 +50,7 @@ def build_cameras(num_cameras: int):
         rgb_name   = f"cam_{angle}"
         depth_name = f"depth_{angle}"
         sensors[rgb_name]   = (create_surround_camera(f"Cam_{angle}",   angle, RGBCamera),   200, 200)
-        sensors[depth_name] = (create_surround_camera(f"Depth_{angle}", angle, DepthCamera),  84,  84)
+        sensors[depth_name] = (create_surround_camera(f"Depth_{angle}", angle, DepthCamera),  112,  112)
         rgb_cam_names.append(rgb_name)
         depth_cam_names.append(depth_name)
 
@@ -72,7 +72,7 @@ def process_gpu(env, rgb_name: str, depth_name: str, combined_observations: dict
                 0.5870 * rgb_tensor[:, 1:2] +
                 0.1140 * rgb_tensor[:, 2:3])
     mask     = (gray > 180).float()
-    lane_map = F.interpolate(mask, size=(84, 84), mode="area").squeeze(0)
+    lane_map = F.interpolate(mask, size=(112, 112), mode="area").squeeze(0)
 
     d_cupy   = env.engine.get_sensor(depth_name).perceive(
         to_float=True, new_parent_node=env.agent.origin
@@ -104,7 +104,7 @@ def process_cpu(env, rgb_name: str, depth_name: str, combined_observations: dict
                 0.5870 * rgb_np[:, :, 1] +
                 0.1140 * rgb_np[:, :, 2])
     mask     = (gray > 180).astype(np.float32)
-    lane_map = cv2.resize(mask, (84, 84), interpolation=cv2.INTER_AREA)[np.newaxis]
+    lane_map = cv2.resize(mask, (112, 112), interpolation=cv2.INTER_AREA)[np.newaxis]
 
     d_img = env.engine.get_sensor(depth_name).perceive(
         to_float=True, new_parent_node=env.agent.origin

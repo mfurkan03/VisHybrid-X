@@ -59,8 +59,8 @@ class PrecomputedDepthDataset(Dataset):
 
     Expected file layout:
         <pred_dir>/<split>/episode_N.npz
-            depth_pred : float32  (N, 1, 84, 84)
-            rgb        : uint8    (N, 84, 84, 3)
+            depth_pred : float32  (N, 1, 196, 196)
+            rgb        : uint8    (N, H, W, 3)
             action     : float32  (N, 2)
             ego_state  : float32  (N, EGO_DIM)  ← zeros if missing
 
@@ -96,8 +96,8 @@ class PrecomputedDepthDataset(Dataset):
                 print(f"[WARNING] Missing required keys in {f}, skipping.")
                 continue
 
-            depths  = data["depth_pred"]               # (N, 1, 84, 84)
-            rgbs    = data["rgb"]                      # (N, 84, 84, 3)
+            depths  = data["depth_pred"]               # (N, 1, 112, 112)
+            rgbs    = data["rgb"]                      # (N, 112, 112, 3)
             actions = data["action"]
             n       = min(len(depths), len(rgbs), len(actions))
             ego     = (data["ego_state"][:n] if "ego_state" in data.files
@@ -121,8 +121,8 @@ class PrecomputedDepthDataset(Dataset):
 
     def __getitem__(self, idx):
         return (
-            self.depth_frames[idx],                        # float32 (1, 84, 84)
-            self.rgb_frames[idx],                          # uint8   (84, 84, 3)
+            self.depth_frames[idx],                        # float32 (1, 112, 112)
+            self.rgb_frames[idx],                          # uint8   (112, 112, 3)
             np.array(self.actions[idx],    dtype=np.float32),
             np.array(self.ego_states[idx], dtype=np.float32),
         )

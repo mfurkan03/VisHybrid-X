@@ -57,20 +57,23 @@ def train_policy(
     data_dir:   str   = "data/raw",
     lr:         float = 1e-4,
     pred_dir:   str   = None,
+    curriculum_epochs: int = 10,
+    fully_masked_epochs: int = 3,
+    image_size: int = 112,
 ):
     print("--- Phase 2: Training Driving Policy (from scratch) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     use_precomputed = pred_dir is not None and os.path.isdir(os.path.join(pred_dir, "train"))
-    depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path)
+    depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path, image_size=image_size)
 
     print(f"[INFO] {'Using PRECOMPUTED DPT from: ' + pred_dir if use_precomputed else 'Live DPT inference.'}")
 
     train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator)
 
-    policy_model = DrivingPolicyNet().to(device)
+    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
     optimizer    = optim.AdamW(policy_model.parameters(), lr=lr)
-    scheduler    = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr*10**-2)
+    scheduler    = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-fully_masked_epochs, eta_min=lr*10**-2) # 3 epochs less steps for scheduler 
 
     train_loop(
         policy_model, device, train_loader, val_loader,
@@ -78,6 +81,9 @@ def train_policy(
         epochs=epochs, start_epoch=0, best_val_loss=float("inf"),
         model_path=model_path, use_precomputed=use_precomputed,
         depth_estimator=depth_estimator, tag="Train",
+        curriculum_epochs=curriculum_epochs,
+        fully_masked_epochs=fully_masked_epochs,
+        image_size=image_size,
     )
 
 
@@ -96,6 +102,9 @@ def finetune_policy(
     freeze_bb:       bool  = False,
     reset_optimizer: bool  = False,
     resume:          bool  = False,
+    curriculum_epochs: int = 10,
+    fully_masked_epochs: int = 3,
+    image_size: int = 112,
 ):
     """
     Fine-tune (or resume) a previously saved policy model.
@@ -112,11 +121,11 @@ def finetune_policy(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     use_precomputed = pred_dir is not None and os.path.isdir(os.path.join(pred_dir, "train"))
-    depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path)
+    depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path, image_size=image_size)
 
     train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator)
 
-    policy_model = DrivingPolicyNet().to(device)
+    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
     if freeze_bb:
         freeze_backbone(policy_model)
 
@@ -146,6 +155,9 @@ def finetune_policy(
         epochs=epochs, start_epoch=start_epoch, best_val_loss=best_val,
         model_path=model_path, use_precomputed=use_precomputed,
         depth_estimator=depth_estimator, tag="Finetune",
+        curriculum_epochs=curriculum_epochs,
+        fully_masked_epochs=fully_masked_epochs,
+        image_size=image_size,
     )
 
 
@@ -159,11 +171,12 @@ def test_policy(
     num_episodes: int,
     pred_dir:     str  = None,
     test_mode:    str  = "all",
+    image_size:   int  = 112,
 ):
     print("--- Phase 3: Testing Driving Policy ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    policy_model = DrivingPolicyNet().to(device)
+    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
         
     ckpt         = torch.load(model_path, map_location=device)
     if isinstance(ckpt, dict):
@@ -193,7 +206,7 @@ def test_policy(
                     np.stack(egos),
                 )
         else:
-            depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
+            depth_estimator = DepthEstimationModel(finetuned_path=dpt_path, image_size=image_size)
             test_ds = MetaDriveRGBDataset(data_dir=data_dir, split="test")
             def collate_fn(batch):
                 rgbs, actions, egos = zip(*batch)
@@ -211,11 +224,11 @@ def test_policy(
                         depth_t   = depth_t.to(device)
                         actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
                         ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
-                        combined  = apply_lane_mask(depth_t, rgb_np, device)
+                        combined  = apply_lane_mask(depth_t, rgb_np, device, image_size=image_size)
                     else:
                         rgb_np, actions_np, ego_np = batch
                         actions_t   = torch.tensor(actions_np, dtype=torch.float32, device=device)
-                        combined, _ = extract_features_frozen(rgb_np, depth_estimator, device)
+                        combined, _ = extract_features_frozen(rgb_np, depth_estimator, device, image_size=image_size)
                         ego_t       = torch.tensor(ego_np, dtype=torch.float32, device=device)
  
                     pred       = policy_model(combined, ego_t)
@@ -227,7 +240,7 @@ def test_policy(
     if test_mode in ("simulation", "all"):
         print("\n=> Online Evaluation (Simulation)...")
         if depth_estimator is None:
-            depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
+            depth_estimator = DepthEstimationModel(finetuned_path=dpt_path, image_size=image_size)
 
         angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(1)
         rgb_name = rgb_cam_names[0]
@@ -261,7 +274,7 @@ def test_policy(
                     rgb_img = rgb_img.get()
                 rgb_img = np.array(rgb_img, dtype=np.uint8)
 
-                combined_tensor, _ = extract_features_frozen(rgb_img[np.newaxis], depth_estimator, device)
+                combined_tensor, _ = extract_features_frozen(rgb_img[np.newaxis], depth_estimator, device, image_size=image_size)
 
                 ego_reading = extract_ego_state(env.agent, last_steer=last_steer)
                 ego_t       = torch.tensor(ego_reading.ego_model, dtype=torch.float32, device=device).unsqueeze(0)
@@ -272,9 +285,17 @@ def test_policy(
 
                 # HUD visualisation
                 depth_uint8   = (combined_tensor[0, 0].cpu().numpy() * 255).astype(np.uint8)
-                lane_uint8    = (combined_tensor[0, 1].cpu().numpy() * 255).astype(np.uint8)
+                
+                # combined_tensor channels 1,2,3 are blended RGB
+                blended_rgb   = combined_tensor[0, 1:4].cpu().numpy() # (3, 112, 112)
+                blended_rgb   = np.transpose(blended_rgb, (1, 2, 0))  # (112, 112, 3)
+                blended_uint8 = (blended_rgb * 255).astype(np.uint8)
+                # Convert RGB to BGR for OpenCV
+                blended_bgr   = cv2.cvtColor(blended_uint8, cv2.COLOR_RGB2BGR)
+                
                 depth_color   = cv2.resize(cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO), (400, 400))
-                lane_color    = cv2.resize(cv2.cvtColor(lane_uint8, cv2.COLOR_GRAY2BGR), (400, 400))
+                rgb_color     = cv2.resize(blended_bgr, (400, 400))
+                
                 hud           = np.zeros((40, 800, 3), dtype=np.uint8)
                 cv2.putText(
                     hud,
@@ -284,8 +305,8 @@ def test_policy(
                     f"->  steer:{pred_action[0]:+.2f}  throt:{pred_action[1]:+.2f}",
                     (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 200), 1,
                 )
-                cv2.imshow("Depth | Lane  (with Ego HUD)",
-                           np.vstack((hud, np.hstack((depth_color, lane_color)))))
+                cv2.imshow("Depth | RGB  (with Ego HUD)",
+                           np.vstack((hud, np.hstack((depth_color, rgb_color)))))
                 cv2.waitKey(1)
                 obs, reward, terminated, truncated, info = env.step(pred_action)
                 done = terminated or truncated
@@ -332,11 +353,17 @@ if __name__ == "__main__":
     parser.add_argument("--freeze_backbone", action="store_true")
     parser.add_argument("--reset_optimizer", action="store_true")
     parser.add_argument("--resume",          action="store_true")
+    parser.add_argument("--curriculum_epochs", type=int, default=10)
+    parser.add_argument("--fully_masked_epochs", type=int, default=3)
+    parser.add_argument("--image_size", type=int, default=84)
     args = parser.parse_args()
 
     if args.mode in ("train", "all"):
         train_policy(args.epochs, 32, args.model_path,
-                     args.dpt_path, args.data_dir, args.lr, pred_dir=args.pred_dir)
+                     args.dpt_path, args.data_dir, args.lr, pred_dir=args.pred_dir,
+                     curriculum_epochs=args.curriculum_epochs,
+                     fully_masked_epochs=args.fully_masked_epochs,
+                     image_size=args.image_size)
 
     if args.mode == "finetune":
         if args.finetune_from is None:
@@ -353,8 +380,12 @@ if __name__ == "__main__":
             freeze_bb       = args.freeze_backbone,
             reset_optimizer = args.reset_optimizer,
             resume          = args.resume,
+            curriculum_epochs=args.curriculum_epochs,
+            fully_masked_epochs=args.fully_masked_epochs,
+            image_size=args.image_size,
         )
 
     if args.mode in ("test", "all"):
         test_policy(args.model_path, args.dpt_path, args.data_dir,
-                    args.episodes, pred_dir=args.pred_dir, test_mode=args.test_mode)
+                    args.episodes, pred_dir=args.pred_dir, test_mode=args.test_mode,
+                    image_size=args.image_size)

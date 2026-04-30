@@ -29,27 +29,61 @@ def get_lane_mask_visual(rgb_image: np.ndarray, threshold_value: int = 180) -> n
     return mask
 
 
-def apply_lane_mask(depth_tensor: torch.Tensor, rgb_batch: np.ndarray, device: torch.device) -> torch.Tensor:
+def apply_lane_mask(
+    depth_tensor: torch.Tensor,
+    rgb_batch: np.ndarray,
+    device: torch.device,
+    current_epoch: int = 999,
+    curriculum_epochs: int = 10,
+    fully_masked_epochs: int = 3,
+    image_size: int = 112
+) -> torch.Tensor:
     """
-    Compute lane masks from rgb_batch and concatenate onto depth_tensor.
+    Compute lane masks and blend with RGB based on curriculum.
 
     Args:
-        depth_tensor: (B, 1, 84, 84) precomputed depth on device.
+        depth_tensor: (B, 1, H, W) precomputed depth on device.
         rgb_batch:    (B, H, W, 3) uint8 or float32 numpy RGB frames.
         device:       target torch device.
 
     Returns:
-        combined: (B, 2, 84, 84) tensor — channel 0: depth, channel 1: lane mask.
+        combined: (B, 4, image_size, image_size) tensor — channel 0: depth, channel 1-3: blended RGB.
     """
-    lane_list = []
+    if current_epoch < fully_masked_epochs:
+        alpha = 0.0
+    elif current_epoch >= curriculum_epochs:
+        alpha = 1.0
+    else:
+        alpha = (current_epoch - fully_masked_epochs) / max(1, curriculum_epochs - fully_masked_epochs)
+
+    blended_list = []
     for rgb in rgb_batch:
         mask = get_lane_mask_visual(rgb)
-        lane_list.append((cv2.resize(mask, (84, 84)) / 255.0).astype(np.float32))
-    lane_tensor = torch.tensor(np.stack(lane_list), device=device).unsqueeze(1)  # (B, 1, 84, 84)
-    return torch.cat([depth_tensor, lane_tensor], dim=1)                          # (B, 2, 84, 84)
+        mask_resized = cv2.resize(mask, (image_size, image_size)) / 255.0
+        mask_3d = np.expand_dims(mask_resized, axis=-1)
+
+        rgb_float = rgb.astype(np.float32) if rgb.dtype != np.uint8 else rgb.astype(np.float32) / 255.0
+        rgb_resized = cv2.resize(rgb_float, (image_size, image_size))
+
+        blended = rgb_resized * mask_3d + rgb_resized * (1.0 - mask_3d) * alpha
+        blended = np.transpose(blended, (2, 0, 1))
+        blended_list.append(blended)
+
+    blended_tensor = torch.tensor(np.stack(blended_list), dtype=torch.float32, device=device)
+    if depth_tensor.shape[-1] != image_size:
+        depth_tensor = torch.nn.functional.interpolate(depth_tensor, size=(image_size, image_size), mode="bilinear", align_corners=False)
+    return torch.cat([depth_tensor, blended_tensor], dim=1)
 
 
-def extract_features_frozen(rgb_batch, depth_estimator, device):
+def extract_features_frozen(
+    rgb_batch,
+    depth_estimator,
+    device,
+    current_epoch: int = 999,
+    curriculum_epochs: int = 10,
+    fully_masked_epochs: int = 3,
+    image_size: int = 112
+):
     rescaled = cv2.resize(rgb_batch[0], (196, 196), interpolation=cv2.INTER_LINEAR)
     with torch.no_grad():
         depth_tensors = depth_estimator.predict_batch_with_grad(np.expand_dims(rescaled, 0))
@@ -58,7 +92,13 @@ def extract_features_frozen(rgb_batch, depth_estimator, device):
         d = depth_tensors[i, 0]
         depth_tensors[i, 0] = 1.0 - (d - d.min()) / (d.max() - d.min() + 1e-6)
 
-    combined  = apply_lane_mask(depth_tensors, rgb_batch, device)
+    combined  = apply_lane_mask(
+        depth_tensors, rgb_batch, device,
+        current_epoch=current_epoch,
+        curriculum_epochs=curriculum_epochs,
+        fully_masked_epochs=fully_masked_epochs,
+        image_size=image_size
+    )
     ego_zeros = torch.zeros(combined.shape[0], EGO_DIM, device=device)
     return combined, ego_zeros
 
@@ -99,7 +139,9 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
 # SINGLE EPOCH
 # ============================================================
 def run_epoch(policy_model, loader, optimizer, device,
-              use_precomputed, depth_estimator, is_train, desc):
+              use_precomputed, depth_estimator, is_train, desc,
+              current_epoch: int = 999, curriculum_epochs: int = 10, fully_masked_epochs: int = 3,
+              image_size: int = 112):
     """Run one training or validation epoch. Returns (avg_loss, preds, trues)."""
     policy_model.train() if is_train else policy_model.eval()
     total_loss          = 0.0
@@ -109,16 +151,28 @@ def run_epoch(policy_model, loader, optimizer, device,
     with ctx:
         for batch in tqdm(loader, desc=desc, leave=False):
             if use_precomputed:
-                # depth_t: (B, 1, 84, 84) — lane mask added here at training time
+                # depth_t: (B, 1, H, W) — lane mask added here at training time
                 depth_t, rgb_np, actions_np, ego_np = batch
                 depth_t   = depth_t.to(device)
                 actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
                 ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
-                combined  = apply_lane_mask(depth_t, rgb_np, device)  # (B, 2, 84, 84)
+                combined  = apply_lane_mask(
+                    depth_t, rgb_np, device,
+                    current_epoch=current_epoch,
+                    curriculum_epochs=curriculum_epochs,
+                    fully_masked_epochs=fully_masked_epochs,
+                    image_size=image_size
+                )  # (B, 4, image_size, image_size)
             else:
                 rgb_np, actions_np, ego_np = batch
                 actions_t   = torch.tensor(actions_np, dtype=torch.float32, device=device)
-                combined, _ = extract_features_frozen(rgb_np, depth_estimator, device)
+                combined, _ = extract_features_frozen(
+                    rgb_np, depth_estimator, device,
+                    current_epoch=current_epoch,
+                    curriculum_epochs=curriculum_epochs,
+                    fully_masked_epochs=fully_masked_epochs,
+                    image_size=image_size
+                )
                 ego_t       = torch.tensor(ego_np, dtype=torch.float32, device=device)
 
             if is_train:
@@ -156,6 +210,9 @@ def train_loop(
     use_precomputed: bool,
     depth_estimator,
     tag:             str = "Train",
+    curriculum_epochs: int = 10,
+    fully_masked_epochs: int = 3,
+    image_size: int = 112,
 ) -> float:
     """Shared epoch loop used by train_policy and finetune_policy."""
     file_root, file_ext = os.path.splitext(model_path)
@@ -166,11 +223,19 @@ def train_loop(
             policy_model, train_loader, optimizer, device,
             use_precomputed, depth_estimator, is_train=True,
             desc=f"[{tag}] Epoch {epoch+1}/{start_epoch+epochs} [Train]",
+            current_epoch=epoch,
+            curriculum_epochs=curriculum_epochs,
+            fully_masked_epochs=fully_masked_epochs,
+            image_size=image_size
         )
         avg_val, val_pred, val_true = run_epoch(
             policy_model, val_loader, optimizer, device,
             use_precomputed, depth_estimator, is_train=False,
             desc=f"[{tag}] Epoch {epoch+1}/{start_epoch+epochs} [Val]",
+            current_epoch=epoch,
+            curriculum_epochs=curriculum_epochs,
+            fully_masked_epochs=fully_masked_epochs,
+            image_size=image_size
         )
 
         tr_m  = compute_offline_metrics(tr_pred,  tr_true)
@@ -182,7 +247,8 @@ def train_loop(
             f"Dir Acc: {val_m['direction_acc']:.3f} | "
             f"LR: {scheduler.get_last_lr()[0]:.2e}"
         )
-        scheduler.step()
+        if epoch>fully_masked_epochs:
+            scheduler.step()
 
         save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, model_path)
         if avg_val < best_val_loss:

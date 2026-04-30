@@ -17,7 +17,7 @@ def custom_driving_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tenso
     
     brake_mask = (target[:, 1] < -0.1).float()
     
-    penalty = 1.0 + brake_mask * 1.0
+    penalty = 1.0 + brake_mask * 3.0
     weighted_loss = smooth_l1.clone()
     weighted_loss[:, 1] = smooth_l1[:, 1] * penalty
     return weighted_loss.mean()
