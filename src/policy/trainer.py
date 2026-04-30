@@ -243,8 +243,9 @@ def train_loop(
         print(
             f"[{tag}] Epoch [{epoch+1:02d}] "
             f"Loss Tr/Val: {avg_train:.4f}/{avg_val:.4f} | "
-            f"Steer MSE Tr/Val: {tr_m['steering_mse']:.4f}/{val_m['steering_mse']:.4f} | "
-            f"Dir Acc: {val_m['direction_acc']:.3f} | "
+            f"Str MAE Tr/Val: {tr_m['steering_mae']:.4f}/{val_m['steering_mae']:.4f} | "
+            f"Str Dir Acc: {val_m['steering_dir_acc']:.3f} | "
+            f"Brake Acc: {val_m['brake_acc']:.3f} | "
             f"LR: {scheduler.get_last_lr()[0]:.2e}"
         )
         if epoch>fully_masked_epochs:

@@ -12,6 +12,12 @@ In Behavioral Cloning (Imitation Learning), over 90% of the dataset consists of 
 
 Solution: Instead of forcing the system with hardcoded if/else blocks, a mathematical intelligence was integrated into the Loss Function. Thanks to the custom_driving_loss, if the AI makes a mistake on an empty road, it receives a standard 1x penalty. However, if it misses a required braking action, it faces a penalty multiplier 3 times (x3) larger. Thanks to this "Asymmetric Penalty" system, the AI has learned to brake on its own initiative when it detects obstacles, without any rule-based intervention.
 
+Curriculum Learning
+To ease the training burden, the network uses Curriculum Learning. For the first few epochs, the network relies entirely on clear lane masks. Then, over a series of epochs, the raw RGB environment is gradually blended back into the image. This prevents the model from overfitting to pure Lane Masks and ensures robust real-world environment awareness.
+
+Enhanced Validation & Simulation Metrics
+Instead of basic MSE, the evaluation suite now provides interpretable offline metrics like Steering MAE, Acceleration MAE, Steering Direction Accuracy, and Braking Accuracy. In simulation testing, expert-agnostic metrics are tracked (Success Rate, Out-of-Road Rate, Crash Rates, Avg Speed) to give a holistic view of the agent's actual driving abilities.
+
 Installation Setup
 To run this project, you need to set up the main environment and integrate the Depth Anything V2 repository.
 
@@ -56,7 +62,13 @@ Policy Training & Testing (train_test_policy.py)
 
 --pred_dir: The directory containing your precomputed DPT predictions. Passing this drastically speeds up training.
 
---test_mode: Choose between offline (evaluates on the test dataset split), simulation (runs the live MetaDrive environment), or all.
+--test_mode: Choose between offline (evaluates on the test dataset split), simulation (runs the live MetaDrive environment), or all (default).
+
+--image_size: The resolution the policy network expects (e.g., 84 or 112). Default is 84.
+
+--curriculum_epochs: Number of epochs to transition from fully masked lane images to full RGB.
+
+--fully_masked_epochs: Number of initial epochs where the input is strictly lane masked (no RGB).
 
 How to Run the Project
 The pipeline consists of 4 distinct steps: Data Collection, Depth Fine-tuning, Precomputing (for speed), and Policy Training/Testing.
@@ -87,8 +99,18 @@ python src/train_test_policy.py --mode train \
     --epochs 30 \
     --pred_dir data/processed/dpt_pred \
     --model_path models/policy_model.pth
+
+4.5. Fine-tuning an Existing Policy (Optional)
+You can resume training or fine-tune an existing model using the `--mode finetune` argument. You can also freeze the backbone layers to only train the action head.
+
+Bash
+python src/train_test_policy.py --mode finetune \
+    --finetune_from models/policy_model.pth \
+    --model_path models/policy_finetuned.pth \
+    --epochs 10 --lr 2e-5 --freeze_backbone
+
 5. Autonomous Testing
-Test the fully trained policy. Using --test_mode all will first evaluate the model against the offline test dataset (checking MSE and Direction Accuracy) and then launch the live MetaDrive simulation so you can watch the AI drive.
+Test the fully trained policy. The default `--test_mode` is `all`, which evaluates the model against the offline test dataset (calculating detailed offline metrics like MAE and Braking Accuracy) and then launches the live MetaDrive simulation so you can watch the AI drive and capture expert-agnostic metrics. To run only offline testing, use `--test_mode offline`. To run only simulation, use `--test_mode simulation`.
 
 Bash
 python src/train_test_policy.py --mode test \
@@ -96,4 +118,4 @@ python src/train_test_policy.py --mode test \
     --dpt_path models/dpt_finetuned.pth \
     --data_dir dataset \
     --pred_dir data/processed/dpt_pred \
-    --test_mode all (use --test_mode simulation for only online testing)
+    --test_mode all

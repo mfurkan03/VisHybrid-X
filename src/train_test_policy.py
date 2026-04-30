@@ -236,6 +236,23 @@ def test_policy(
                     test_pred.append(pred.cpu().numpy())
                     test_true.append(actions_np)
 
+            # Compute and print offline metrics
+            test_pred_np = np.concatenate(test_pred, axis=0)
+            test_true_np = np.concatenate(test_true, axis=0)
+            test_metrics = compute_offline_metrics(test_pred_np, test_true_np)
+            avg_test_loss = test_loss / len(test_loader)
+            
+            print(f"\n=== OFFLINE SUMMARY ===")
+            print(f"Test Loss:        {avg_test_loss:.4f}")
+            print(f"Steer MSE:        {test_metrics['steering_mse']:.4f}")
+            print(f"Accel MSE:        {test_metrics['accel_mse']:.4f}")
+            print(f"Steer MAE:        {test_metrics['steering_mae']:.4f}")
+            print(f"Accel MAE:        {test_metrics['accel_mae']:.4f}")
+            print(f"Steer Dir Acc:    {test_metrics['steering_dir_acc']*100:.1f}%")
+            print(f"Accel Dir Acc:    {test_metrics['direction_acc']*100:.1f}%")
+            print(f"Braking Acc:      {test_metrics['brake_acc']*100:.1f}%")
+            print(f"Steering Corr:    {test_metrics['steering_corr']:.4f}")
+
     # ── SIMULATION ──────────────────────────────────────────────────────────
     if test_mode in ("simulation", "all"):
         print("\n=> Online Evaluation (Simulation)...")
@@ -256,6 +273,8 @@ def test_policy(
         }
         env = MetaDriveEnv(config)
         success_flags, route_completions = [], []
+        out_of_roads, crash_vehicles, crash_objects = [], [], []
+        survival_times, average_speeds = [], []
 
         for ep in range(num_episodes):
             obs, info  = env.reset()
@@ -264,6 +283,7 @@ def test_policy(
             anlik_fps  = 0.0
             last_time  = time.time()
             last_steer = 0.0
+            speeds     = []
 
             while not done:
                 step_count += 1
@@ -310,6 +330,9 @@ def test_policy(
                 cv2.waitKey(1)
                 obs, reward, terminated, truncated, info = env.step(pred_action)
                 done = terminated or truncated
+                
+                if not done:
+                    speeds.append(ego_reading.total_speed)
 
                 cur_time  = time.time()
                 elapsed   = cur_time - last_time
@@ -323,11 +346,29 @@ def test_policy(
 
             success_flags.append(bool(info.get("arrive_dest", False)))
             route_completions.append(info.get("route_completion", 0.0))
-            print(f"\nEpisode {ep+1} done. Success: {success_flags[-1]}")
+            out_of_roads.append(bool(info.get("out_of_road", False)))
+            crash_vehicles.append(bool(info.get("crash_vehicle", False)))
+            crash_objects.append(bool(info.get("crash_object", False)))
+            survival_times.append(step_count)
+            average_speeds.append(float(np.mean(speeds)) if len(speeds) > 0 else 0.0)
+            
+            reason = "success" if success_flags[-1] else (
+                "out_of_road" if out_of_roads[-1] else (
+                    "crash_vehicle" if crash_vehicles[-1] else (
+                        "crash_object" if crash_objects[-1] else "timeout/other"
+                    )
+                )
+            )
+            print(f"\nEpisode {ep+1} done. Reason: {reason} | Route: {route_completions[-1]*100:.1f}% | Avg Spd: {average_speeds[-1]:.2f}")
 
         print(f"\n=== ONLINE SUMMARY ===\n"
-              f"Success: {np.mean(success_flags)*100:.1f}%  "
-              f"Route: {np.mean(route_completions)*100:.1f}%")
+              f"Success Rate:         {np.mean(success_flags)*100:.1f}%\n"
+              f"Route Completion:     {np.mean(route_completions)*100:.1f}%\n"
+              f"Out of Road Rate:     {np.mean(out_of_roads)*100:.1f}%\n"
+              f"Crash Vehicle Rate:   {np.mean(crash_vehicles)*100:.1f}%\n"
+              f"Crash Object Rate:    {np.mean(crash_objects)*100:.1f}%\n"
+              f"Avg Survival Time:    {np.mean(survival_times):.1f} steps\n"
+              f"Avg Driving Speed:    {np.mean(average_speeds):.2f}")
         env.close()
         cv2.destroyAllWindows()
 
