@@ -35,8 +35,9 @@ from models import DepthEstimationModel
 # ============================================================
 class MetaDriveDepthDataset(Dataset):
     def __init__(self, data_dir: str, split: str = "train",
-                 subset_fraction: float = 1.0, augment: bool = False):
+                 subset_fraction: float = 1.0, augment: bool = False, image_size: int = None):
         self.augment  = augment
+        self.target_size = (image_size, image_size)
         split_dir     = os.path.join(data_dir, split)
         files         = sorted(glob.glob(os.path.join(split_dir, "*.npz")))
 
@@ -63,15 +64,13 @@ class MetaDriveDepthDataset(Dataset):
 
         print(f"[INFO] DepthDataset ({split}): {len(self.gt_depths)} samples from {split_dir}.")
 
-    TARGET_SIZE = (196, 196)  # must be a multiple of 14
-
     def __len__(self):
         return len(self.gt_depths)
 
     def __getitem__(self, idx):
-        rgb   = cv2.resize(self.rgb_frames[idx].copy(), self.TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
+        rgb   = cv2.resize(self.rgb_frames[idx].copy(), self.target_size, interpolation=cv2.INTER_LINEAR)
         depth = np.array(self.gt_depths[idx], dtype=np.float32).copy()
-        depth = cv2.resize(depth[0], self.TARGET_SIZE, interpolation=cv2.INTER_NEAREST)
+        depth = cv2.resize(depth[0], self.target_size, interpolation=cv2.INTER_NEAREST)
         depth = np.expand_dims(depth, axis=0)
 
         if self.augment:
@@ -158,14 +157,15 @@ def train_dpt(
     lr:             float = 1e-5,
     train_subset:   float = 1.0,
     patience:       int   = 5,
+    image_size:     int   = None,
 ):
     print("--- Phase 1: Training Depth Model (DPT) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    depth_estimator = DepthEstimationModel(finetuned_path=None, trainable=True)
+    depth_estimator = DepthEstimationModel(finetuned_path=None, trainable=True, image_size=image_size)
 
-    train_ds = MetaDriveDepthDataset(data_dir, split="train", subset_fraction=train_subset, augment=True)
-    val_ds   = MetaDriveDepthDataset(data_dir, split="val",   subset_fraction=1.0,          augment=False)
+    train_ds = MetaDriveDepthDataset(data_dir, split="train", subset_fraction=train_subset, augment=True, image_size=image_size)
+    val_ds   = MetaDriveDepthDataset(data_dir, split="val",   subset_fraction=1.0,          augment=False, image_size=image_size)
 
     def collate_fn(batch):
         rgbs, depths = zip(*batch)
@@ -248,24 +248,24 @@ def train_dpt(
         with torch.no_grad():
             pred_vis = depth_estimator.predict_batch_with_grad(fixed_vis_rgbs)
         _save_vis_grid(fixed_vis_rgbs, fixed_vis_depths, pred_vis,
-                       os.path.join(vis_dir, f"epoch_{epoch+1:03d}.jpg"))
+                       os.path.join(vis_dir, f"epoch_{epoch+1:03d}.jpg"), image_size)
 
 
-def _save_vis_grid(fixed_vis_rgbs, fixed_vis_depths, pred_vis, out_file):
+def _save_vis_grid(fixed_vis_rgbs, fixed_vis_depths, pred_vis, out_file, image_size):
     vis_rows = []
     for i in range(len(fixed_vis_rgbs)):
         rgb_img = fixed_vis_rgbs[i].copy()
         if rgb_img.max() <= 1.0:
             rgb_img = (rgb_img * 255).astype(np.uint8)
-        rgb_bgr = cv2.cvtColor(cv2.resize(rgb_img, (196, 196)), cv2.COLOR_RGB2BGR)
+        rgb_bgr = cv2.cvtColor(cv2.resize(rgb_img, (image_size, image_size)), cv2.COLOR_RGB2BGR)
 
         gt_d = fixed_vis_depths[i, 0].cpu().numpy()
-        gt_d = cv2.resize(gt_d, (196, 196), interpolation=cv2.INTER_NEAREST)
+        gt_d = cv2.resize(gt_d, (image_size, image_size), interpolation=cv2.INTER_NEAREST)
         gt_d = (gt_d - gt_d.min()) / (gt_d.max() - gt_d.min() + 1e-6)
         gt_d_color = cv2.applyColorMap((gt_d * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
 
         pred_d = pred_vis[i, 0].cpu().numpy()
-        pred_d = cv2.resize(pred_d, (196, 196), interpolation=cv2.INTER_NEAREST)
+        pred_d = cv2.resize(pred_d, (image_size, image_size), interpolation=cv2.INTER_NEAREST)
         pred_d = (pred_d - pred_d.min()) / (pred_d.max() - pred_d.min() + 1e-6)
         pred_d = 1.0 - pred_d
         pred_d_color = cv2.applyColorMap((pred_d * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
@@ -278,7 +278,7 @@ def _save_vis_grid(fixed_vis_rgbs, fixed_vis_depths, pred_vis, out_file):
 # ============================================================
 # 4. PRECOMPUTE DPT PREDICTIONS
 # ============================================================
-def _process_episode(ep_path: str, out_path: str, dpt_path: str, batch_size: int) -> str:
+def _process_episode(ep_path: str, out_path: str, dpt_path: str, batch_size: int, image_size: int) -> str:
     """
     Worker function: loads its own model instance and processes a single episode file.
     Returns a status string for logging.
@@ -296,18 +296,22 @@ def _process_episode(ep_path: str, out_path: str, dpt_path: str, batch_size: int
     if not rgb_keys:
         return f"  [SKIP] No RGB key in {ep_name}."
 
-    depth_estimator = DepthEstimationModel(finetuned_path=dpt_path, trainable=False)
+    depth_estimator = DepthEstimationModel(finetuned_path=dpt_path, trainable=False, image_size=image_size)
     depth_estimator.set_eval_mode()
 
     rgb_frames  = data[rgb_keys[0]]
     actions     = data.get("action")  # may be None
     N           = len(rgb_frames)
-    depth_preds = np.empty((N, 1, 196, 196), dtype=np.float32)
+    if N == 0:
+        return f"  [SKIP] Empty RGB array in {ep_name}."
+        
+    orig_H, orig_W = rgb_frames.shape[1:3]
+    depth_preds = np.empty((N, 1, orig_H, orig_W), dtype=np.float32)
 
     for start in range(0, N, batch_size):
         end   = min(start + batch_size, N)
         batch = np.array([
-            cv2.resize(f, (196, 196), interpolation=cv2.INTER_LINEAR)
+            cv2.resize(f, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
             for f in rgb_frames[start:end]
         ])
         with torch.no_grad():
@@ -315,6 +319,7 @@ def _process_episode(ep_path: str, out_path: str, dpt_path: str, batch_size: int
 
         for i in range(len(batch)):
             pred_d = pred_batch[i, 0].cpu().numpy()
+            pred_d = cv2.resize(pred_d, (orig_W, orig_H), interpolation=cv2.INTER_NEAREST)
             pred_d = (pred_d - pred_d.min()) / (pred_d.max() - pred_d.min() + 1e-6)
             pred_d = 1.0 - pred_d
             depth_preds[start + i, 0] = pred_d
@@ -336,6 +341,7 @@ def precompute_dpt_predictions(
     batch_size:  int   = 32,
     splits:      tuple = ("train", "val"),
     num_workers: int   = 4,
+    image_size:  int   = None,
 ):
     print("--- Precomputing DPT Predictions ---")
 
@@ -365,7 +371,7 @@ def precompute_dpt_predictions(
 
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = {
-                executor.submit(_process_episode, ep_path, out_path, dpt_path, batch_size): ep_path
+                executor.submit(_process_episode, ep_path, out_path, dpt_path, batch_size, image_size): ep_path
                 for ep_path, out_path in work
             }
             for future in tqdm(as_completed(futures), total=len(futures),
@@ -396,11 +402,13 @@ if __name__ == "__main__":
     parser.add_argument("--splits",       type=str,   nargs="+", default=["train", "val", "test"])
     parser.add_argument("--num_workers",  type=int,   default=4,
                         help="Number of parallel worker processes for precomputation")
+    parser.add_argument("--image_size",   type=int,   default=196,
+                        help="Target image size for resizing (both width and height)")
     args = parser.parse_args()
 
     if args.mode == "train":
         train_dpt(args.epochs, args.batch_size, args.model_path,
-                  args.data_dir, args.lr, args.train_subset, args.patience)
+                  args.data_dir, args.lr, args.train_subset, args.patience, args.image_size)
     elif args.mode == "precompute":
         precompute_dpt_predictions(
             dpt_path    = args.model_path,
@@ -409,4 +417,5 @@ if __name__ == "__main__":
             batch_size  = args.batch_size,
             splits      = tuple(args.splits),
             num_workers = args.num_workers,
+            image_size  = args.image_size,
         )

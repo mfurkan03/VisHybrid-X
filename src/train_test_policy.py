@@ -59,7 +59,7 @@ def train_policy(
     pred_dir:   str   = None,
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
-    image_size: int = 112,
+    image_size: int = None,
 ):
     print("--- Phase 2: Training Driving Policy (from scratch) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -104,7 +104,7 @@ def finetune_policy(
     resume:          bool  = False,
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
-    image_size: int = 112,
+    image_size: int = None,
 ):
     """
     Fine-tune (or resume) a previously saved policy model.
@@ -121,11 +121,11 @@ def finetune_policy(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     use_precomputed = pred_dir is not None and os.path.isdir(os.path.join(pred_dir, "train"))
-    depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path, image_size=image_size)
+    depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path, image_size=image_size) #112
 
     train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator)
 
-    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
+    policy_model = DrivingPolicyNet(image_size=image_size).to(device) #112
     if freeze_bb:
         freeze_backbone(policy_model)
 
@@ -171,7 +171,7 @@ def test_policy(
     num_episodes: int,
     pred_dir:     str  = None,
     test_mode:    str  = "all",
-    image_size:   int  = 112,
+    image_size:   int  = None,
 ):
     print("--- Phase 3: Testing Driving Policy ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -293,6 +293,8 @@ def test_policy(
                 if hasattr(rgb_img, "get"):
                     rgb_img = rgb_img.get()
                 rgb_img = np.array(rgb_img, dtype=np.uint8)
+                # MetaDrive RGBCamera natively returns BGR, so we convert it to RGB
+                rgb_img = rgb_img[..., ::-1].copy()
 
                 combined_tensor, _ = extract_features_frozen(rgb_img[np.newaxis], depth_estimator, device, image_size=image_size)
 

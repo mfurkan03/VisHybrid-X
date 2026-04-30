@@ -46,7 +46,7 @@ class DepthEstimationModel:
         "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
     }
 
-    def __init__(self, encoder: str = "vits", finetuned_path: str = None, trainable: bool = False, image_size: int = 112):
+    def __init__(self, encoder: str = "vits", finetuned_path: str = None, trainable: bool = False, image_size: int = None):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.image_size = image_size
         self.model  = DepthAnythingV2(**self._CONFIGS[encoder])

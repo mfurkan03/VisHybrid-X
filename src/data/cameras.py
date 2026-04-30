@@ -49,8 +49,8 @@ def build_cameras(num_cameras: int):
     for angle in angles:
         rgb_name   = f"cam_{angle}"
         depth_name = f"depth_{angle}"
-        sensors[rgb_name]   = (create_surround_camera(f"Cam_{angle}",   angle, RGBCamera),   200, 200)
-        sensors[depth_name] = (create_surround_camera(f"Depth_{angle}", angle, DepthCamera),  112,  112)
+        sensors[rgb_name]   = (create_surround_camera(f"Cam_{angle}",   angle, RGBCamera),   196, 196)
+        sensors[depth_name] = (create_surround_camera(f"Depth_{angle}", angle, DepthCamera), 196, 196)
         rgb_cam_names.append(rgb_name)
         depth_cam_names.append(depth_name)
 
@@ -65,6 +65,12 @@ def process_gpu(env, rgb_name: str, depth_name: str, combined_observations: dict
     rgb_cupy = env.engine.get_sensor(rgb_name).perceive(
         to_float=False, new_parent_node=env.agent.origin
     )
+    # MetaDrive returns BGR, we convert it to RGB right away
+    if hasattr(rgb_cupy, "copy"):
+        rgb_cupy = rgb_cupy[..., ::-1].copy()
+    else:
+        rgb_cupy = rgb_cupy[..., ::-1]
+
     rgb_tensor = torch.as_tensor(rgb_cupy, device="cuda").float()
     rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0)
 
@@ -72,7 +78,7 @@ def process_gpu(env, rgb_name: str, depth_name: str, combined_observations: dict
                 0.5870 * rgb_tensor[:, 1:2] +
                 0.1140 * rgb_tensor[:, 2:3])
     mask     = (gray > 180).float()
-    lane_map = F.interpolate(mask, size=(112, 112), mode="area").squeeze(0)
+    lane_map = F.interpolate(mask, size=(196, 196), mode="area").squeeze(0)
 
     d_cupy   = env.engine.get_sensor(depth_name).perceive(
         to_float=True, new_parent_node=env.agent.origin
@@ -98,13 +104,16 @@ def process_cpu(env, rgb_name: str, depth_name: str, combined_observations: dict
     )
     if hasattr(rgb_img, "get"):
         rgb_img = rgb_img.get()
+    
+    # MetaDrive returns BGR, we convert to RGB
+    rgb_img = rgb_img[..., ::-1].copy()
     rgb_np = np.array(rgb_img, dtype=np.float32)
 
     gray     = (0.2989 * rgb_np[:, :, 0] +
                 0.5870 * rgb_np[:, :, 1] +
                 0.1140 * rgb_np[:, :, 2])
     mask     = (gray > 180).astype(np.float32)
-    lane_map = cv2.resize(mask, (112, 112), interpolation=cv2.INTER_AREA)[np.newaxis]
+    lane_map = cv2.resize(mask, (196, 196), interpolation=cv2.INTER_AREA)[np.newaxis]
 
     d_img = env.engine.get_sensor(depth_name).perceive(
         to_float=True, new_parent_node=env.agent.origin

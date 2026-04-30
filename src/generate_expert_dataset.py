@@ -51,7 +51,8 @@ def _worker_collect(
     # Calculate global splits
     train_count = int(total_episodes * split_ratios[0])
     val_count   = int(total_episodes * split_ratios[1])
-
+    rng = np.random.default_rng(seed)
+    traffic_density = float(rng.uniform(0.1, 0.7))
     config = {
         "use_render":        False,
         "image_observation": True,
@@ -64,11 +65,11 @@ def _worker_collect(
         "num_scenarios":     num_episodes * 2,
         "random_lane_width": True,
         "random_lane_num":   True,
-        "traffic_density":   0.15,
+        "traffic_density":   traffic_density,
         "random_traffic":    True,
         "map_config": {
             BaseMap.GENERATE_TYPE:   MapGenerateMethod.BIG_BLOCK_NUM,
-            BaseMap.GENERATE_CONFIG: 7,
+            BaseMap.GENERATE_CONFIG: 3,
         },
         "image_on_cuda": image_on_cuda,
     }
@@ -138,7 +139,7 @@ def _worker_collect(
 
             obs, reward, terminated, truncated, info = env.step(applied_action)
             done = terminated or truncated
-            if ep_steps >= 1000:
+            if ep_steps >= 2500:
                 done = True
 
             if fps_counter.total_steps % 100 == 0:

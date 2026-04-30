@@ -36,7 +36,7 @@ def apply_lane_mask(
     current_epoch: int = 999,
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
-    image_size: int = 112
+    image_size: int = None
 ) -> torch.Tensor:
     """
     Compute lane masks and blend with RGB based on curriculum.
@@ -82,18 +82,35 @@ def extract_features_frozen(
     current_epoch: int = 999,
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
-    image_size: int = 112
+    image_size: int = None
 ):
-    rescaled = cv2.resize(rgb_batch[0], (196, 196), interpolation=cv2.INTER_LINEAR)
+    # Align DPT input resolution with train_dpt.py precomputation (image_size x image_size)
+    batch_rescaled = np.array([
+        cv2.resize(rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+        for rgb in rgb_batch
+    ])
+    
     with torch.no_grad():
-        depth_tensors = depth_estimator.predict_batch_with_grad(np.expand_dims(rescaled, 0))
+        depth_tensors = depth_estimator.predict_batch_with_grad(batch_rescaled)
 
+    orig_W, orig_H = 196, 196
+    final_depths = []
+    
     for i in range(depth_tensors.shape[0]):
-        d = depth_tensors[i, 0]
-        depth_tensors[i, 0] = 1.0 - (d - d.min()) / (d.max() - d.min() + 1e-6)
+        d = depth_tensors[i, 0].cpu().numpy()
+        
+        # Mimic the train_dpt.py precompute loop: nearest neighbor upscale + normalize
+        d = cv2.resize(d, (orig_W, orig_H), interpolation=cv2.INTER_NEAREST)
+        d = (d - d.min()) / (d.max() - d.min() + 1e-6)
+        d = 1.0 - d
+        final_depths.append(d)
+
+    # Convert back to tensor of shape (B, 1, 196, 196) so apply_lane_mask can apply
+    # the exact same bilinear downscaling to image_size that it does during training!
+    depth_tensors_196 = torch.tensor(np.stack(final_depths), dtype=torch.float32, device=device).unsqueeze(1)
 
     combined  = apply_lane_mask(
-        depth_tensors, rgb_batch, device,
+        depth_tensors_196, rgb_batch, device,
         current_epoch=current_epoch,
         curriculum_epochs=curriculum_epochs,
         fully_masked_epochs=fully_masked_epochs,
@@ -141,7 +158,7 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
 def run_epoch(policy_model, loader, optimizer, device,
               use_precomputed, depth_estimator, is_train, desc,
               current_epoch: int = 999, curriculum_epochs: int = 10, fully_masked_epochs: int = 3,
-              image_size: int = 112):
+              image_size: int = None):
     """Run one training or validation epoch. Returns (avg_loss, preds, trues)."""
     policy_model.train() if is_train else policy_model.eval()
     total_loss          = 0.0
@@ -212,7 +229,7 @@ def train_loop(
     tag:             str = "Train",
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
-    image_size: int = 112,
+    image_size: int = None,
 ) -> float:
     """Shared epoch loop used by train_policy and finetune_policy."""
     file_root, file_ext = os.path.splitext(model_path)
