@@ -96,8 +96,8 @@ class PrecomputedDepthDataset(Dataset):
                 print(f"[WARNING] Missing required keys in {f}, skipping.")
                 continue
 
-            depths  = data["depth_pred"]               # (N, 1, 112, 112)
-            rgbs    = data["rgb"]                      # (N, 112, 112, 3)
+            depths  = data["depth_pred"]         
+            rgbs    = data["rgb"]                     
             actions = data["action"]
             n       = min(len(depths), len(rgbs), len(actions))
             ego     = (data["ego_state"][:n] if "ego_state" in data.files
@@ -121,8 +121,8 @@ class PrecomputedDepthDataset(Dataset):
 
     def __getitem__(self, idx):
         return (
-            self.depth_frames[idx],                        # float32 (1, 112, 112)
-            self.rgb_frames[idx],                          # uint8   (112, 112, 3)
+            self.depth_frames[idx],                       
+            self.rgb_frames[idx],                         
             np.array(self.actions[idx],    dtype=np.float32),
             np.array(self.ego_states[idx], dtype=np.float32),
         )

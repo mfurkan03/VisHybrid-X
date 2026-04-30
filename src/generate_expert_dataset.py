@@ -95,10 +95,10 @@ def _worker_collect(
 
         obs, info = env.reset()
 
-        combined_observations = {
+        observations = {
             key: []
             for rgb_name in rgb_cam_names
-            for key in (rgb_name, f"{rgb_name}_rgb")
+            for key in (f"{rgb_name}_depth", f"{rgb_name}_rgb")
         }
         actions          = []
         ego_states       = []
@@ -131,7 +131,7 @@ def _worker_collect(
 
             raw_frames = {}
             for rgb_name, depth_name in zip(rgb_cam_names, depth_cam_names):
-                rgb_raw, depth_raw = process_fn(env, rgb_name, depth_name, combined_observations)
+                rgb_raw, depth_raw = process_fn(env, rgb_name, depth_name, observations)
                 raw_frames[rgb_name] = (rgb_raw, depth_raw)
 
             actions.append(expert_action.copy())
@@ -162,14 +162,11 @@ def _worker_collect(
             "frame_timestamps": np.array(frame_timestamps, dtype=np.float64),
         }
         for rgb_name in rgb_cam_names:
-            obs_list = combined_observations[rgb_name]
-            if image_on_cuda and hasattr(obs_list[0], "cpu"):
-                import torch
-                stacked = torch.stack(obs_list).cpu().numpy()
-            else:
-                stacked = np.array(obs_list)
-            save_dict[f"{rgb_name}_combined"] = stacked
-            save_dict[f"{rgb_name}_rgb"] = np.array(combined_observations[f"{rgb_name}_rgb"], dtype=np.uint8)
+            depth_list = observations[f"{rgb_name}_depth"]
+            rgb_list = observations[f"{rgb_name}_rgb"]
+            
+            save_dict[f"{rgb_name}_depth"] = np.array(depth_list, dtype=np.float32)
+            save_dict[f"{rgb_name}_rgb"] = np.array(rgb_list, dtype=np.uint8)
 
         save_path = os.path.join(save_dir, current_split, f"episode_{global_ep_id}.npz")
         

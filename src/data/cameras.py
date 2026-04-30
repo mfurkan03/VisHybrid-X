@@ -6,8 +6,6 @@ import math
 
 import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
 from metadrive.component.sensors.rgb_camera import RGBCamera
 from metadrive.component.sensors.depth_camera import DepthCamera
 
@@ -60,7 +58,7 @@ def build_cameras(num_cameras: int):
 # ============================================================
 # PER-FRAME PROCESSING  (GPU / CPU)
 # ============================================================
-def process_gpu(env, rgb_name: str, depth_name: str, combined_observations: dict):
+def process_gpu(env, rgb_name: str, depth_name: str, observations: dict):
     """Process one camera pair using CUDA tensors."""
     rgb_cupy = env.engine.get_sensor(rgb_name).perceive(
         to_float=False, new_parent_node=env.agent.origin
@@ -71,33 +69,20 @@ def process_gpu(env, rgb_name: str, depth_name: str, combined_observations: dict
     else:
         rgb_cupy = rgb_cupy[..., ::-1]
 
-    rgb_tensor = torch.as_tensor(rgb_cupy, device="cuda").float()
-    rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0)
-
-    gray     = (0.2989 * rgb_tensor[:, 0:1] +
-                0.5870 * rgb_tensor[:, 1:2] +
-                0.1140 * rgb_tensor[:, 2:3])
-    mask     = (gray > 180).float()
-    lane_map = F.interpolate(mask, size=(196, 196), mode="area").squeeze(0)
-
     d_cupy   = env.engine.get_sensor(depth_name).perceive(
         to_float=True, new_parent_node=env.agent.origin
     )
-    d_tensor  = torch.as_tensor(d_cupy, device="cuda").float()
-    if d_tensor.dim() == 3:
-        d_tensor = d_tensor[:, :, 0]
-    depth_map = d_tensor.unsqueeze(0)
-
-    combined_obs = torch.cat([depth_map, lane_map], dim=0)
-    combined_observations[rgb_name].append(combined_obs)
 
     rgb_np_uint8 = rgb_cupy.get() if hasattr(rgb_cupy, "get") else np.array(rgb_cupy)
-    combined_observations[f"{rgb_name}_rgb"].append(rgb_np_uint8.astype(np.uint8))
+    observations[f"{rgb_name}_rgb"].append(rgb_np_uint8.astype(np.uint8))
+
+    d_np_float32 = d_cupy.get() if hasattr(d_cupy, "get") else np.array(d_cupy)
+    observations[f"{rgb_name}_depth"].append(d_np_float32.astype(np.float32))
 
     return rgb_cupy, d_cupy
 
 
-def process_cpu(env, rgb_name: str, depth_name: str, combined_observations: dict):
+def process_cpu(env, rgb_name: str, depth_name: str, observations: dict):
     """Process one camera pair using NumPy on CPU."""
     rgb_img = env.engine.get_sensor(rgb_name).perceive(
         to_float=False, new_parent_node=env.agent.origin
@@ -107,26 +92,14 @@ def process_cpu(env, rgb_name: str, depth_name: str, combined_observations: dict
     
     # MetaDrive returns BGR, we convert to RGB
     rgb_img = rgb_img[..., ::-1].copy()
-    rgb_np = np.array(rgb_img, dtype=np.float32)
-
-    gray     = (0.2989 * rgb_np[:, :, 0] +
-                0.5870 * rgb_np[:, :, 1] +
-                0.1140 * rgb_np[:, :, 2])
-    mask     = (gray > 180).astype(np.float32)
-    lane_map = cv2.resize(mask, (196, 196), interpolation=cv2.INTER_AREA)[np.newaxis]
 
     d_img = env.engine.get_sensor(depth_name).perceive(
         to_float=True, new_parent_node=env.agent.origin
     )
     if hasattr(d_img, "get"):
         d_img = d_img.get()
-    d_np = np.array(d_img, dtype=np.float32)
-    if d_np.ndim == 3:
-        d_np = d_np[:, :, 0]
-    depth_map = d_np[np.newaxis]
 
-    combined_obs = np.concatenate([depth_map, lane_map], axis=0)
-    combined_observations[rgb_name].append(combined_obs)
-    combined_observations[f"{rgb_name}_rgb"].append(np.array(rgb_img, dtype=np.uint8))
+    observations[f"{rgb_name}_depth"].append(np.array(d_img, dtype=np.float32))
+    observations[f"{rgb_name}_rgb"].append(np.array(rgb_img, dtype=np.uint8))
 
     return rgb_img, d_img

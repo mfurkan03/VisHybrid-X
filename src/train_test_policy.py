@@ -65,7 +65,7 @@ def train_policy(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     use_precomputed = pred_dir is not None and os.path.isdir(os.path.join(pred_dir, "train"))
-    depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path, image_size=image_size)
+    depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path)
 
     print(f"[INFO] {'Using PRECOMPUTED DPT from: ' + pred_dir if use_precomputed else 'Live DPT inference.'}")
 
@@ -121,11 +121,11 @@ def finetune_policy(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     use_precomputed = pred_dir is not None and os.path.isdir(os.path.join(pred_dir, "train"))
-    depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path, image_size=image_size) #112
+    depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path)
 
     train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator)
 
-    policy_model = DrivingPolicyNet(image_size=image_size).to(device) #112
+    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
     if freeze_bb:
         freeze_backbone(policy_model)
 
@@ -206,7 +206,7 @@ def test_policy(
                     np.stack(egos),
                 )
         else:
-            depth_estimator = DepthEstimationModel(finetuned_path=dpt_path, image_size=image_size)
+            depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
             test_ds = MetaDriveRGBDataset(data_dir=data_dir, split="test")
             def collate_fn(batch):
                 rgbs, actions, egos = zip(*batch)
@@ -224,11 +224,11 @@ def test_policy(
                         depth_t   = depth_t.to(device)
                         actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
                         ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
-                        combined  = apply_lane_mask(depth_t, rgb_np, device, image_size=image_size)
+                        combined  = apply_lane_mask(depth_t, rgb_np, device)
                     else:
                         rgb_np, actions_np, ego_np = batch
                         actions_t   = torch.tensor(actions_np, dtype=torch.float32, device=device)
-                        combined, _ = extract_features_frozen(rgb_np, depth_estimator, device, image_size=image_size)
+                        combined, _ = extract_features_frozen(rgb_np, depth_estimator, device)
                         ego_t       = torch.tensor(ego_np, dtype=torch.float32, device=device)
  
                     pred       = policy_model(combined, ego_t)
@@ -257,7 +257,7 @@ def test_policy(
     if test_mode in ("simulation", "all"):
         print("\n=> Online Evaluation (Simulation)...")
         if depth_estimator is None:
-            depth_estimator = DepthEstimationModel(finetuned_path=dpt_path, image_size=image_size)
+            depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
 
         angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(1)
         rgb_name = rgb_cam_names[0]
@@ -296,7 +296,7 @@ def test_policy(
                 # MetaDrive RGBCamera natively returns BGR, so we convert it to RGB
                 rgb_img = rgb_img[..., ::-1].copy()
 
-                combined_tensor, _ = extract_features_frozen(rgb_img[np.newaxis], depth_estimator, device, image_size=image_size)
+                combined_tensor, _ = extract_features_frozen(rgb_img[np.newaxis], depth_estimator, device)
 
                 ego_reading = extract_ego_state(env.agent, last_steer=last_steer)
                 ego_t       = torch.tensor(ego_reading.ego_model, dtype=torch.float32, device=device).unsqueeze(0)
@@ -309,8 +309,8 @@ def test_policy(
                 depth_uint8   = (combined_tensor[0, 0].cpu().numpy() * 255).astype(np.uint8)
                 
                 # combined_tensor channels 1,2,3 are blended RGB
-                blended_rgb   = combined_tensor[0, 1:4].cpu().numpy() # (3, 112, 112)
-                blended_rgb   = np.transpose(blended_rgb, (1, 2, 0))  # (112, 112, 3)
+                blended_rgb   = combined_tensor[0, 1:4].cpu().numpy() 
+                blended_rgb   = np.transpose(blended_rgb, (1, 2, 0))  
                 blended_uint8 = (blended_rgb * 255).astype(np.uint8)
                 # Convert RGB to BGR for OpenCV
                 blended_bgr   = cv2.cvtColor(blended_uint8, cv2.COLOR_RGB2BGR)

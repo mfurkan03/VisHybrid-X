@@ -35,9 +35,8 @@ from models import DepthEstimationModel
 # ============================================================
 class MetaDriveDepthDataset(Dataset):
     def __init__(self, data_dir: str, split: str = "train",
-                 subset_fraction: float = 1.0, augment: bool = False, image_size: int = None):
+                 subset_fraction: float = 1.0, augment: bool = False):
         self.augment  = augment
-        self.target_size = (image_size, image_size)
         split_dir     = os.path.join(data_dir, split)
         files         = sorted(glob.glob(os.path.join(split_dir, "*.npz")))
 
@@ -56,11 +55,18 @@ class MetaDriveDepthDataset(Dataset):
             except Exception:
                 continue
             rgb_keys      = [k for k in data.files if k.endswith("_rgb")]
-            combined_keys = [k for k in data.files if k.endswith("_combined")]
-            if not rgb_keys or not combined_keys:
+            depth_keys    = [k for k in data.files if k.endswith("_depth")]
+            if not rgb_keys or not depth_keys:
                 continue
             self.rgb_frames.extend(data[rgb_keys[0]])
-            self.gt_depths.extend(data[combined_keys[0]][:, 0:1, :, :])
+            
+            depth_data = data[depth_keys[0]]
+            if depth_data.ndim == 3: # (N, H, W)
+                depth_data = np.expand_dims(depth_data, axis=1)
+            elif depth_data.ndim == 4 and depth_data.shape[-1] == 1: # (N, H, W, 1)
+                depth_data = np.transpose(depth_data, (0, 3, 1, 2))
+            
+            self.gt_depths.extend(depth_data)
 
         print(f"[INFO] DepthDataset ({split}): {len(self.gt_depths)} samples from {split_dir}.")
 
@@ -68,9 +74,7 @@ class MetaDriveDepthDataset(Dataset):
         return len(self.gt_depths)
 
     def __getitem__(self, idx):
-        rgb   = cv2.resize(self.rgb_frames[idx].copy(), self.target_size, interpolation=cv2.INTER_LINEAR)
         depth = np.array(self.gt_depths[idx], dtype=np.float32).copy()
-        depth = cv2.resize(depth[0], self.target_size, interpolation=cv2.INTER_NEAREST)
         depth = np.expand_dims(depth, axis=0)
 
         if self.augment:
@@ -121,9 +125,6 @@ def scale_shift_invariant_loss(prediction, target, mask=None):
     Scale and Shift Invariant Loss (SSIL).
     Aligns prediction to target via least-squares scale/shift before computing L1.
     """
-    if prediction.shape != target.shape:
-        import torch.nn.functional as F
-        target = F.interpolate(target, size=prediction.shape[-2:], mode="bilinear", align_corners=False)
 
     if mask is None:
         mask = target > 0
@@ -157,15 +158,14 @@ def train_dpt(
     lr:             float = 1e-5,
     train_subset:   float = 1.0,
     patience:       int   = 5,
-    image_size:     int   = None,
 ):
     print("--- Phase 1: Training Depth Model (DPT) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    depth_estimator = DepthEstimationModel(finetuned_path=None, trainable=True, image_size=image_size)
+    depth_estimator = DepthEstimationModel(finetuned_path=None, trainable=True)
 
-    train_ds = MetaDriveDepthDataset(data_dir, split="train", subset_fraction=train_subset, augment=True, image_size=image_size)
-    val_ds   = MetaDriveDepthDataset(data_dir, split="val",   subset_fraction=1.0,          augment=False, image_size=image_size)
+    train_ds = MetaDriveDepthDataset(data_dir, split="train", subset_fraction=train_subset, augment=True)
+    val_ds   = MetaDriveDepthDataset(data_dir, split="val",   subset_fraction=1.0,          augment=False)
 
     def collate_fn(batch):
         rgbs, depths = zip(*batch)
@@ -248,10 +248,11 @@ def train_dpt(
         with torch.no_grad():
             pred_vis = depth_estimator.predict_batch_with_grad(fixed_vis_rgbs)
         _save_vis_grid(fixed_vis_rgbs, fixed_vis_depths, pred_vis,
-                       os.path.join(vis_dir, f"epoch_{epoch+1:03d}.jpg"), image_size)
+                       os.path.join(vis_dir, f"epoch_{epoch+1:03d}.jpg"))
 
 
-def _save_vis_grid(fixed_vis_rgbs, fixed_vis_depths, pred_vis, out_file, image_size):
+def _save_vis_grid(fixed_vis_rgbs, fixed_vis_depths, pred_vis, out_file):
+    image_size = 196
     vis_rows = []
     for i in range(len(fixed_vis_rgbs)):
         rgb_img = fixed_vis_rgbs[i].copy()
@@ -278,7 +279,7 @@ def _save_vis_grid(fixed_vis_rgbs, fixed_vis_depths, pred_vis, out_file, image_s
 # ============================================================
 # 4. PRECOMPUTE DPT PREDICTIONS
 # ============================================================
-def _process_episode(ep_path: str, out_path: str, dpt_path: str, batch_size: int, image_size: int) -> str:
+def _process_episode(ep_path: str, out_path: str, dpt_path: str, batch_size: int) -> str:
     """
     Worker function: loads its own model instance and processes a single episode file.
     Returns a status string for logging.
@@ -296,7 +297,7 @@ def _process_episode(ep_path: str, out_path: str, dpt_path: str, batch_size: int
     if not rgb_keys:
         return f"  [SKIP] No RGB key in {ep_name}."
 
-    depth_estimator = DepthEstimationModel(finetuned_path=dpt_path, trainable=False, image_size=image_size)
+    depth_estimator = DepthEstimationModel(finetuned_path=dpt_path, trainable=False)
     depth_estimator.set_eval_mode()
 
     rgb_frames  = data[rgb_keys[0]]
@@ -310,16 +311,12 @@ def _process_episode(ep_path: str, out_path: str, dpt_path: str, batch_size: int
 
     for start in range(0, N, batch_size):
         end   = min(start + batch_size, N)
-        batch = np.array([
-            cv2.resize(f, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
-            for f in rgb_frames[start:end]
-        ])
+        batch = rgb_frames[start:end]
         with torch.no_grad():
             pred_batch = depth_estimator.predict_batch_with_grad(batch)
 
         for i in range(len(batch)):
             pred_d = pred_batch[i, 0].cpu().numpy()
-            pred_d = cv2.resize(pred_d, (orig_W, orig_H), interpolation=cv2.INTER_NEAREST)
             pred_d = (pred_d - pred_d.min()) / (pred_d.max() - pred_d.min() + 1e-6)
             pred_d = 1.0 - pred_d
             depth_preds[start + i, 0] = pred_d
@@ -341,7 +338,6 @@ def precompute_dpt_predictions(
     batch_size:  int   = 32,
     splits:      tuple = ("train", "val"),
     num_workers: int   = 4,
-    image_size:  int   = None,
 ):
     print("--- Precomputing DPT Predictions ---")
 
@@ -371,7 +367,7 @@ def precompute_dpt_predictions(
 
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = {
-                executor.submit(_process_episode, ep_path, out_path, dpt_path, batch_size, image_size): ep_path
+                executor.submit(_process_episode, ep_path, out_path, dpt_path, batch_size): ep_path
                 for ep_path, out_path in work
             }
             for future in tqdm(as_completed(futures), total=len(futures),
@@ -402,13 +398,11 @@ if __name__ == "__main__":
     parser.add_argument("--splits",       type=str,   nargs="+", default=["train", "val", "test"])
     parser.add_argument("--num_workers",  type=int,   default=4,
                         help="Number of parallel worker processes for precomputation")
-    parser.add_argument("--image_size",   type=int,   default=196,
-                        help="Target image size for resizing (both width and height)")
     args = parser.parse_args()
 
     if args.mode == "train":
         train_dpt(args.epochs, args.batch_size, args.model_path,
-                  args.data_dir, args.lr, args.train_subset, args.patience, args.image_size)
+                  args.data_dir, args.lr, args.train_subset, args.patience)
     elif args.mode == "precompute":
         precompute_dpt_predictions(
             dpt_path    = args.model_path,
@@ -417,5 +411,4 @@ if __name__ == "__main__":
             batch_size  = args.batch_size,
             splits      = tuple(args.splits),
             num_workers = args.num_workers,
-            image_size  = args.image_size,
         )

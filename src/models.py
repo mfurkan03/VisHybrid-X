@@ -46,9 +46,8 @@ class DepthEstimationModel:
         "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
     }
 
-    def __init__(self, encoder: str = "vits", finetuned_path: str = None, trainable: bool = False, image_size: int = None):
+    def __init__(self, encoder: str = "vits", finetuned_path: str = None, trainable: bool = False):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.image_size = image_size
         self.model  = DepthAnythingV2(**self._CONFIGS[encoder])
 
         if finetuned_path and os.path.exists(finetuned_path):
@@ -93,7 +92,7 @@ class DepthEstimationModel:
 
         x         = torch.stack(batch_tensors).to(self.device)
         depth_raw = self.model(x).unsqueeze(1)
-        return F.interpolate(depth_raw, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+        return depth_raw
 
 
 # ============================================================
@@ -171,14 +170,14 @@ class DrivingPolicyNet(nn.Module):
     """
     Two-stream policy network.
 
-    Visual stream  : CNN on (4, 112, 112) observation  → 512-d feature
+    Visual stream  : CNN on (4, H, W) observation  → 512-d feature
     Ego stream     : MLP on EGO_DIM ego-state vector →  32-d feature
     Fusion head    : Linear(544 → 2)  →  [steer, accel]
 
     Ego input: [total_speed, last_steer]
     """
 
-    def __init__(self, in_channels: int = 4, out_dim: int = 2, ego_dim: int = EGO_DIM, p: float = 0.5, image_size: int = 112):
+    def __init__(self, in_channels: int = 4, out_dim: int = 2, ego_dim: int = EGO_DIM, p: float = 0.5, image_size: int = None):
         super().__init__()
 
         self.conv1   = nn.Conv2d(in_channels, 32, kernel_size=8, stride=4)

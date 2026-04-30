@@ -29,6 +29,10 @@ def get_lane_mask_visual(rgb_image: np.ndarray, threshold_value: int = 180) -> n
     return mask
 
 
+import torch
+import torch.nn.functional as F
+import numpy as np
+
 def apply_lane_mask(
     depth_tensor: torch.Tensor,
     rgb_batch: np.ndarray,
@@ -39,16 +43,10 @@ def apply_lane_mask(
     image_size: int = None
 ) -> torch.Tensor:
     """
-    Compute lane masks and blend with RGB based on curriculum.
-
-    Args:
-        depth_tensor: (B, 1, H, W) precomputed depth on device.
-        rgb_batch:    (B, H, W, 3) uint8 or float32 numpy RGB frames.
-        device:       target torch device.
-
-    Returns:
-        combined: (B, 4, image_size, image_size) tensor — channel 0: depth, channel 1-3: blended RGB.
+    Refactored version with optimized interpolations and tensor handling.
     """
+    
+    # 1. Calculate Alpha for Curriculum Learning
     if current_epoch < fully_masked_epochs:
         alpha = 0.0
     elif current_epoch >= curriculum_epochs:
@@ -56,23 +54,45 @@ def apply_lane_mask(
     else:
         alpha = (current_epoch - fully_masked_epochs) / max(1, curriculum_epochs - fully_masked_epochs)
 
+    # 2. Pre-process RGB Batch
+    # Convert NumPy (B, H, W, C) to Torch Tensor (B, C, H, W)
+    rgb_tensor = torch.from_numpy(rgb_batch).float().to(device)
+    
+    # Normalize if input is in uint8 (0-255)
+    if rgb_tensor.max() > 1.0:
+        rgb_tensor /= 255.0
+        
+    rgb_tensor = rgb_tensor.permute(0, 3, 1, 2) 
+
+    # 3. Optimized Batch Interpolation
+    # Resize both RGB and Depth tensors to the target image_size simultaneously
+    if image_size:
+        rgb_tensor = F.interpolate(rgb_tensor, size=(image_size, image_size), mode='bilinear', align_corners=False)
+        depth_tensor = F.interpolate(depth_tensor, size=(image_size, image_size), mode='bilinear', align_corners=False)
+
+    # 4. Lane Masking and Blending
     blended_list = []
-    for rgb in rgb_batch:
-        mask = get_lane_mask_visual(rgb)
-        mask_resized = cv2.resize(mask, (image_size, image_size)) / 255.0
-        mask_3d = np.expand_dims(mask_resized, axis=-1)
-
-        rgb_float = rgb.astype(np.float32) if rgb.dtype != np.uint8 else rgb.astype(np.float32) / 255.0
-        rgb_resized = cv2.resize(rgb_float, (image_size, image_size))
-
-        blended = rgb_resized * mask_3d + rgb_resized * (1.0 - mask_3d) * alpha
-        blended = np.transpose(blended, (2, 0, 1))
+    
+    for i in range(rgb_tensor.shape[0]):
+        # Extract single image for mask generation
+        # If get_lane_mask_visual requires NumPy, we convert it back temporarily
+        img_torch = rgb_tensor[i]
+        img_np = img_torch.permute(1, 2, 0).cpu().numpy()
+        
+        # Generate mask
+        mask = get_lane_mask_visual(img_np) 
+        mask_tensor = torch.from_numpy(mask).float().to(device).unsqueeze(0) / 255.0
+        
+        # Apply blending logic:
+        # Final = (Original * Mask) + (Original * (1 - Mask) * Alpha)
+        blended = img_torch * mask_tensor + img_torch * (1.0 - mask_tensor) * alpha
         blended_list.append(blended)
 
-    blended_tensor = torch.tensor(np.stack(blended_list), dtype=torch.float32, device=device)
-    if depth_tensor.shape[-1] != image_size:
-        depth_tensor = torch.nn.functional.interpolate(depth_tensor, size=(image_size, image_size), mode="bilinear", align_corners=False)
-    return torch.cat([depth_tensor, blended_tensor], dim=1)
+    # Stack processed images back into a batch
+    blended_batch = torch.stack(blended_list)
+
+    # 5. Concatenate Depth (C=1) and Blended RGB (C=3) -> (B, 4, H, W)
+    return torch.cat([depth_tensor, blended_batch], dim=1)
 
 
 def extract_features_frozen(
@@ -84,38 +104,21 @@ def extract_features_frozen(
     fully_masked_epochs: int = 3,
     image_size: int = None
 ):
-    # Align DPT input resolution with train_dpt.py precomputation (image_size x image_size)
-    batch_rescaled = np.array([
-        cv2.resize(rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
-        for rgb in rgb_batch
-    ])
-    
     with torch.no_grad():
-        depth_tensors = depth_estimator.predict_batch_with_grad(batch_rescaled)
+        depth_tensors = depth_estimator.predict_batch_with_grad(np.expand_dims(rgb_batch[0], 0))
 
-    orig_W, orig_H = 196, 196
-    final_depths = []
-    
     for i in range(depth_tensors.shape[0]):
-        d = depth_tensors[i, 0].cpu().numpy()
-        
-        # Mimic the train_dpt.py precompute loop: nearest neighbor upscale + normalize
-        d = cv2.resize(d, (orig_W, orig_H), interpolation=cv2.INTER_NEAREST)
-        d = (d - d.min()) / (d.max() - d.min() + 1e-6)
-        d = 1.0 - d
-        final_depths.append(d)
-
-    # Convert back to tensor of shape (B, 1, 196, 196) so apply_lane_mask can apply
-    # the exact same bilinear downscaling to image_size that it does during training!
-    depth_tensors_196 = torch.tensor(np.stack(final_depths), dtype=torch.float32, device=device).unsqueeze(1)
+        d = depth_tensors[i, 0]
+        depth_tensors[i, 0] = 1.0 - (d - d.min()) / (d.max() - d.min() + 1e-6)
 
     combined  = apply_lane_mask(
-        depth_tensors_196, rgb_batch, device,
+        depth_tensors, rgb_batch, device,
         current_epoch=current_epoch,
         curriculum_epochs=curriculum_epochs,
         fully_masked_epochs=fully_masked_epochs,
-        image_size=image_size
+        image_size = image_size
     )
+
     ego_zeros = torch.zeros(combined.shape[0], EGO_DIM, device=device)
     return combined, ego_zeros
 
@@ -126,7 +129,7 @@ def extract_features_frozen(
 def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_estimator):
     if use_precomputed:
         train_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="train")
-        val_ds   = PrecomputedDepthDataset(pred_dir=pred_dir, split="val")
+        val_ds   = PrecomputedDepthDataset(prined_dir=pred_dir, split="val")
 
         def collate_fn(batch):
             # Dataset now yields (depth, rgb, actions, egos) so lane mask can be
