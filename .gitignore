@@ -9,3 +9,4 @@ Depth-Anything-V2
 Depth-Anything-V2/checkpoints/*
 dataset
 epoch_visualizations/*
+*/__pycache__

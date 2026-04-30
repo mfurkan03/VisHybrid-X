@@ -53,42 +53,65 @@ class MetaDriveRGBDataset(Dataset):
 
 class PrecomputedDepthDataset(Dataset):
     """
-    Fast dataset using pre-cached DPT depth + lane + ego_state.
+    Fast dataset using pre-cached DPT depth + raw RGB + ego_state.
+    Lane masks are computed at training time (in trainer.py) rather than
+    stored on disk, so the dataset returns the raw RGB frames needed for that.
 
     Expected file layout:
         <pred_dir>/<split>/episode_N.npz
             depth_pred : float32  (N, 1, 84, 84)
-            lane_mask  : float32  (N, 1, 84, 84)
+            rgb        : uint8    (N, 84, 84, 3)
             action     : float32  (N, 2)
-            ego_state  : float32  (N, EGO_DIM)   ← zeros if missing
+            ego_state  : float32  (N, EGO_DIM)  ← zeros if missing
+
+    Note: older files that contain a `lane_mask` key instead of `rgb` are
+    skipped with a warning — re-run train_dpt.py --mode precompute to
+    regenerate them.
     """
 
     def __init__(self, pred_dir: str, split: str = "train"):
-        split_dir          = os.path.join(pred_dir, split)
-        files              = sorted(glob.glob(os.path.join(split_dir, "*.npz")))
+        split_dir         = os.path.join(pred_dir, split)
+        files             = sorted(glob.glob(os.path.join(split_dir, "*.npz")))
         self.depth_frames: list = []
-        self.lane_frames:  list = []
+        self.rgb_frames:   list = []
         self.actions:      list = []
         self.ego_states:   list = []
 
+        skipped = 0
         for f in files:
             try:
                 data = np.load(f, allow_pickle=True)
             except Exception as e:
                 print(f"[WARNING] Could not load {f}: {e}")
                 continue
-            if not {"depth_pred", "lane_mask", "action"}.issubset(data.files):
-                print(f"[WARNING] Missing keys in {f}, skipping.")
+
+            # Guard: reject old files that have lane_mask but no rgb
+            if "rgb" not in data.files:
+                print(f"[WARNING] {os.path.basename(f)} has no 'rgb' key "
+                      f"(old precomputed format). Skipping — re-run precompute.")
+                skipped += 1
                 continue
-            depths  = data["depth_pred"]
-            lanes   = data["lane_mask"]
+
+            if not {"depth_pred", "action"}.issubset(data.files):
+                print(f"[WARNING] Missing required keys in {f}, skipping.")
+                continue
+
+            depths  = data["depth_pred"]               # (N, 1, 84, 84)
+            rgbs    = data["rgb"]                      # (N, 84, 84, 3)
             actions = data["action"]
-            n       = min(len(depths), len(lanes), len(actions))
-            ego     = data["ego_state"][:n] if "ego_state" in data.files else np.zeros((n, EGO_DIM), dtype=np.float32)
+            n       = min(len(depths), len(rgbs), len(actions))
+            ego     = (data["ego_state"][:n] if "ego_state" in data.files
+                       else np.zeros((n, EGO_DIM), dtype=np.float32))
+
             self.depth_frames.extend(depths[:n])
-            self.lane_frames.extend(lanes[:n])
+            self.rgb_frames.extend(rgbs[:n])
             self.actions.extend(actions[:n])
             self.ego_states.extend(ego)
+
+        if skipped:
+            print(f"[WARNING] Skipped {skipped} file(s) with old format. "
+                  f"Delete data/processed/dpt_pred and re-run: "
+                  f"python src/train_dpt.py --mode precompute")
 
         print(f"[INFO] PrecomputedDepthDataset ({split}): "
               f"{len(self.actions)} samples from {split_dir}.")
@@ -97,9 +120,9 @@ class PrecomputedDepthDataset(Dataset):
         return len(self.actions)
 
     def __getitem__(self, idx):
-        combined = np.concatenate([self.depth_frames[idx], self.lane_frames[idx]], axis=0)
         return (
-            combined,
+            self.depth_frames[idx],                        # float32 (1, 84, 84)
+            self.rgb_frames[idx],                          # uint8   (84, 84, 3)
             np.array(self.actions[idx],    dtype=np.float32),
             np.array(self.ego_states[idx], dtype=np.float32),
         )

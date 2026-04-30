@@ -1,15 +1,16 @@
 """
-generate_expert_dataset.py – collect expert demonstrations from MetaDrive.
+generate_expert_dataset.py – collect expert demonstrations from MetaDrive in parallel.
 
 Usage
 -----
-python src/generate_expert_dataset.py --episodes 10 --save_dir dataset
+python generate_expert_dataset.py --episodes 100 --num_workers 4 --save_dir dataset
 """
 
 import argparse
 import os
 import random
 import threading
+import multiprocessing as mp
 
 import numpy as np
 from panda3d.core import loadPrcFileData
@@ -28,44 +29,38 @@ from utils.fps import FPSCounter
 
 
 # ============================================================
-# DATA COLLECTION
+# WORKER FUNCTION
 # ============================================================
-def collect_expert_data(
+def _worker_collect(
+    worker_id, 
+    start_ep_idx, 
+    num_episodes, 
+    total_episodes,
     seed,
-    num_episodes   = 10,
-    save_dir       = "dataset",
-    visualize      = True,
-    num_cameras    = 2,
-    image_on_cuda  = True,
-    split_ratios   = (0.8, 0.1, 0.1),
+    save_dir,
+    action_noise,
+    visualize,
+    num_cameras,
+    image_on_cuda,
+    split_ratios
 ):
-    os.makedirs(os.path.join(save_dir, "train"), exist_ok=True)
-    os.makedirs(os.path.join(save_dir, "val"),   exist_ok=True)
-    os.makedirs(os.path.join(save_dir, "test"),  exist_ok=True)
-
+    """Worker process that handles a subset of the total episodes."""
+    
     angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(num_cameras)
 
-    train_count = int(num_episodes * split_ratios[0])
-    val_count   = int(num_episodes * split_ratios[1])
-    mode_str    = "GPU (CUDA)" if image_on_cuda else "CPU (NumPy)"
-
-    print(f"\n{'='*55}")
-    print(f"  Processing Mode : {mode_str}")
-    print(f"  Saving to       : '{save_dir}' (Split into train/val/test)")
-    print(f"  Camera Count    : {num_cameras}  ->  Angles: {angles} degrees")
-    print(f"  Ego-state dim   : {EGO_DIM}  -> model sees [total_speed, last_steer]")
-    print(f"  Ego logged (full): total_speed, last_steer, forward_speed, lateral_speed, heading_delta, timestamp")
-    print(f"{'='*55}\n")
+    # Calculate global splits
+    train_count = int(total_episodes * split_ratios[0])
+    val_count   = int(total_episodes * split_ratios[1])
 
     config = {
         "use_render":        False,
         "image_observation": True,
         "show_interface":    False,
         "preload_models":    True,
-        "decision_repeat":   5,
+        "decision_repeat":   1,
         "sensors":           sensors,
         "vehicle_config":    dict(image_source=rgb_cam_names[0]),
-        "start_seed":        seed,
+        "start_seed":        seed, # Unique start seed per worker to avoid duplicate maps
         "num_scenarios":     num_episodes * 2,
         "random_lane_width": True,
         "random_lane_num":   True,
@@ -78,9 +73,9 @@ def collect_expert_data(
         "image_on_cuda": image_on_cuda,
     }
 
-    env            = MetaDriveEnv(config)
-    fps_counter    = FPSCounter(window=60)
-    process_fn     = process_gpu if image_on_cuda else process_cpu
+    env = MetaDriveEnv(config)
+    fps_counter = FPSCounter(window=60)
+    process_fn = process_gpu if image_on_cuda else process_cpu
     quit_requested = False
 
     ep = 0
@@ -88,9 +83,12 @@ def collect_expert_data(
         if quit_requested:
             break
 
+        global_ep_id = start_ep_idx + ep
+
+        # Determine which folder this specific episode belongs to
         current_split = (
-            "train" if ep < train_count
-            else "val" if ep < train_count + val_count
+            "train" if global_ep_id < train_count
+            else "val" if global_ep_id < train_count + val_count
             else "test"
         )
 
@@ -116,8 +114,8 @@ def collect_expert_data(
 
             expert_action  = expert(env.agent, deterministic=True)
             applied_action = expert_action.copy()
-            if fps_counter.total_steps % 10 == 0:
-                applied_action[0] += random.uniform(-0.3, 0.3)
+            if fps_counter.total_steps % 50 == 0 and current_split =="train": # This disables the augmentation in validaiton and test processes
+                applied_action[0] += random.uniform(-action_noise, action_noise)
 
             reading = extract_ego_state(env.agent, last_steer=last_steer)
             ego_states.append(reading.ego_model)
@@ -143,14 +141,11 @@ def collect_expert_data(
             if ep_steps >= 1000:
                 done = True
 
-            if fps_counter.total_steps % 50 == 0:
-                print(f"  [Ep {ep+1}/{num_episodes}] "
+            if fps_counter.total_steps % 100 == 0:
+                print(f"  [Worker {worker_id} | Ep {ep+1}/{num_episodes}] "
                       f"Step: {fps_counter.total_steps:5d}  |  "
-                      f"Inst FPS: {fps_counter.instant_fps:5.1f}  |  "
                       f"Avg FPS: {fps_counter.average_fps:5.1f}  |  "
-                      f"Ego: spd={reading.total_speed:+.2f} fwd={reading.forward_speed:+.2f} "
-                      f"lat={reading.lateral_speed:+.2f} hdg={reading.heading_delta:+.2f} "
-                      f"str={reading.last_steer:+.2f}",
+                      f"Ego: spd={reading.total_speed:+.2f} str={reading.last_steer:+.2f}",
                       flush=True)
 
             if visualize:
@@ -175,26 +170,99 @@ def collect_expert_data(
             save_dict[f"{rgb_name}_combined"] = stacked
             save_dict[f"{rgb_name}_rgb"] = np.array(combined_observations[f"{rgb_name}_rgb"], dtype=np.uint8)
 
-        save_path = os.path.join(save_dir, current_split, f"episode_{ep}.npz")
+        save_path = os.path.join(save_dir, current_split, f"episode_{global_ep_id}.npz")
+        
+        # We can just save sequentially inside the worker, or keep the thread approach
         t = threading.Thread(
             target=lambda p, d: np.savez_compressed(p, **d),
             args=(save_path, save_dict),
             daemon=True,
         )
         t.start()
-        print(f"\n  --> Saving Episode {ep+1}/{num_episodes} to '{current_split}' "
-              f"(Steps: {ep_steps}, Ego-states: {len(ego_states)})")
+        print(f"\n  --> [Worker {worker_id}] Saving Global Episode {global_ep_id} to '{current_split}'")
 
         ep += 1
+        t.join() # Good practice to wait for save to finish before moving onto next heavy render
 
-    import cv2
-    cv2.destroyAllWindows()
+    if visualize:
+        import cv2
+        cv2.destroyAllWindows()
+        
     env.close()
+    return worker_id, fps_counter.total_steps
+
+
+# ============================================================
+# PARALLEL ORCHESTRATOR
+# ============================================================
+def collect_expert_data_parallel(
+    seed,
+    num_episodes   = 10,
+    num_workers    = 1,
+    save_dir       = "dataset",
+    visualize      = True,
+    num_cameras    = 2,
+    action_noise = 0.3,
+    image_on_cuda  = True,
+    split_ratios   = (0.8, 0.1, 0.1),
+):
+    os.makedirs(os.path.join(save_dir, "train"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "val"),   exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "test"),  exist_ok=True)
+
+    mode_str = "GPU (CUDA)" if image_on_cuda else "CPU (NumPy)"
+    
+    # Auto-disable visualization if running multiple workers
+    if num_workers > 1 and visualize:
+        print("\n[WARNING] Visualization is disabled because multiple workers are running.")
+        visualize = False
 
     print(f"\n{'='*55}")
-    print(f"  DATA COLLECTION COMPLETED")
-    print(f"  Mode: {mode_str}")
-    print(fps_counter.summary())
+    print(f"  Parallel Processing : {num_workers} Workers")
+    print(f"  Total Episodes  : {num_episodes}")
+    print(f"  Processing Mode : {mode_str}")
+    print(f"  Saving to       : '{save_dir}' (Split into train/val/test)")
+    print(f"  Camera Count    : {num_cameras}")
+    print(f"{'='*55}\n")
+
+    # Chunk the episodes for each worker
+    episodes_per_worker = [num_episodes // num_workers] * num_workers
+    for i in range(num_episodes % num_workers):
+        episodes_per_worker[i] += 1
+
+    worker_args = []
+    current_idx = 0
+    
+    for i in range(num_workers):
+        worker_eps = episodes_per_worker[i]
+        if worker_eps == 0:
+            continue
+            
+        worker_args.append((
+            i,                          # worker_id
+            current_idx,                # start_ep_idx
+            worker_eps,                 # num_episodes
+            num_episodes,               # total_episodes
+            seed + (i * 1000),          # seed (offset so workers generate distinct maps)
+            save_dir,                   # save_dir
+            action_noise,
+            visualize,                  # visualize
+            num_cameras,                # num_cameras
+            image_on_cuda,              # image_on_cuda
+            split_ratios                # split_ratios
+        ))
+        current_idx += worker_eps
+
+    # Run processes
+    if num_workers == 1:
+        # Run sequentially if only 1 worker is requested (helpful for debugging)
+        _worker_collect(*worker_args[0])
+    else:
+        with mp.Pool(num_workers) as pool:
+            pool.starmap(_worker_collect, worker_args)
+
+    print(f"\n{'='*55}")
+    print(f"  DATA COLLECTION COMPLETED ACROSS {num_workers} WORKERS")
     print(f"{'='*55}\n")
 
 
@@ -202,19 +270,26 @@ def collect_expert_data(
 # MAIN
 # ============================================================
 if __name__ == "__main__":
+    # Required for multiprocessing with PyTorch/CUDA and heavy visual contexts
+    mp.set_start_method('spawn', force=True)
+
     parser = argparse.ArgumentParser(description="MetaDrive Multi-Cam Imitation Learning")
     parser.add_argument("--episodes",      type=int,  default=10)
+    parser.add_argument("--num_workers",   type=int,  default=1, help="Number of parallel processes")
     parser.add_argument("--save_dir",      type=str,  default="dataset")
     parser.add_argument("--start_seed",    type=int,  default=42)
     parser.add_argument("--num_cameras",   type=int,  default=1)
+    parser.add_argument("--act_noise",   type=float,  default=0.3)
     parser.add_argument("--no_vis",        action="store_true")
     parser.add_argument("--image_on_cuda", action="store_true", default=False)
     args = parser.parse_args()
 
-    collect_expert_data(
+    collect_expert_data_parallel(
         seed          = args.start_seed,
         num_episodes  = args.episodes,
+        num_workers   = args.num_workers,
         save_dir      = args.save_dir,
+        action_noise  = args.act_noise,
         visualize     = not args.no_vis,
         num_cameras   = args.num_cameras,
         image_on_cuda = args.image_on_cuda,

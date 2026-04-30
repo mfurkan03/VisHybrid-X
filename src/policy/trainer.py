@@ -2,6 +2,8 @@
 policy/trainer.py – shared epoch loop, data loader builder, and feature extractor.
 """
 
+import os
+
 import cv2
 import numpy as np
 import torch
@@ -27,6 +29,26 @@ def get_lane_mask_visual(rgb_image: np.ndarray, threshold_value: int = 180) -> n
     return mask
 
 
+def apply_lane_mask(depth_tensor: torch.Tensor, rgb_batch: np.ndarray, device: torch.device) -> torch.Tensor:
+    """
+    Compute lane masks from rgb_batch and concatenate onto depth_tensor.
+
+    Args:
+        depth_tensor: (B, 1, 84, 84) precomputed depth on device.
+        rgb_batch:    (B, H, W, 3) uint8 or float32 numpy RGB frames.
+        device:       target torch device.
+
+    Returns:
+        combined: (B, 2, 84, 84) tensor — channel 0: depth, channel 1: lane mask.
+    """
+    lane_list = []
+    for rgb in rgb_batch:
+        mask = get_lane_mask_visual(rgb)
+        lane_list.append((cv2.resize(mask, (84, 84)) / 255.0).astype(np.float32))
+    lane_tensor = torch.tensor(np.stack(lane_list), device=device).unsqueeze(1)  # (B, 1, 84, 84)
+    return torch.cat([depth_tensor, lane_tensor], dim=1)                          # (B, 2, 84, 84)
+
+
 def extract_features_frozen(rgb_batch, depth_estimator, device):
     rescaled = cv2.resize(rgb_batch[0], (196, 196), interpolation=cv2.INTER_LINEAR)
     with torch.no_grad():
@@ -36,14 +58,8 @@ def extract_features_frozen(rgb_batch, depth_estimator, device):
         d = depth_tensors[i, 0]
         depth_tensors[i, 0] = 1.0 - (d - d.min()) / (d.max() - d.min() + 1e-6)
 
-    lane_list = []
-    for rgb in rgb_batch:
-        mask = get_lane_mask_visual(rgb)
-        lane_list.append((cv2.resize(mask, (84, 84)) / 255.0).astype(np.float32))
-    lane_tensor = torch.tensor(np.stack(lane_list), device=device).unsqueeze(1)
-
-    combined    = torch.cat([depth_tensors, lane_tensor], dim=1)
-    ego_zeros   = torch.zeros(combined.shape[0], EGO_DIM, device=device)
+    combined  = apply_lane_mask(depth_tensors, rgb_batch, device)
+    ego_zeros = torch.zeros(combined.shape[0], EGO_DIM, device=device)
     return combined, ego_zeros
 
 
@@ -56,9 +72,13 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
         val_ds   = PrecomputedDepthDataset(pred_dir=pred_dir, split="val")
 
         def collate_fn(batch):
-            combined, actions, egos = zip(*batch)
+            # Dataset now yields (depth, rgb, actions, egos) so lane mask can be
+            # applied at training time.  rgb is kept as numpy to avoid GPU pressure
+            # in the DataLoader workers.
+            depths, rgbs, actions, egos = zip(*batch)
             return (
-                torch.tensor(np.stack(combined), dtype=torch.float32),
+                torch.tensor(np.stack(depths), dtype=torch.float32),
+                np.stack(rgbs),
                 np.stack(actions),
                 np.stack(egos),
             )
@@ -89,10 +109,12 @@ def run_epoch(policy_model, loader, optimizer, device,
     with ctx:
         for batch in tqdm(loader, desc=desc, leave=False):
             if use_precomputed:
-                combined_t, actions_np, ego_np = batch
-                combined  = combined_t.to(device)
+                # depth_t: (B, 1, 84, 84) — lane mask added here at training time
+                depth_t, rgb_np, actions_np, ego_np = batch
+                depth_t   = depth_t.to(device)
                 actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
                 ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
+                combined  = apply_lane_mask(depth_t, rgb_np, device)  # (B, 2, 84, 84)
             else:
                 rgb_np, actions_np, ego_np = batch
                 actions_t   = torch.tensor(actions_np, dtype=torch.float32, device=device)
@@ -169,7 +191,3 @@ def train_loop(
             print(f"*** Best model saved → {best_path}  (Val Loss: {best_val_loss:.4f}) ***")
 
     return best_val_loss
-
-
-# late import to avoid circular dep
-import os  # noqa: E402

@@ -33,7 +33,6 @@ def create_surround_camera(name: str, angle_degree: float, camera_class):
                 self.cam.reparentTo(new_parent_node)
                 self.cam.setPos(x, y, z)
                 self.cam.lookAt(-math.sin(rad) * 10, math.cos(rad) * 10, z)
-                self.engine.taskMgr.step()
             return super().perceive(to_float=to_float, new_parent_node=None)
 
     CustomCam.__name__ = name

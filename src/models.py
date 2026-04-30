@@ -162,7 +162,7 @@ def extract_ego_state(agent, last_steer: float = 0.0) -> EgoReading:
         timestamp     = timestamp,
     )
 
-
+import random
 # ============================================================
 # 3. DRIVING POLICY NETWORKS
 # ============================================================
@@ -177,17 +177,20 @@ class DrivingPolicyNet(nn.Module):
     Ego input: [total_speed, last_steer]
     """
 
-    def __init__(self, in_channels: int = 2, out_dim: int = 2, ego_dim: int = EGO_DIM):
+    def __init__(self, in_channels: int = 2, out_dim: int = 2, ego_dim: int = EGO_DIM, p: float = 0.5):
         super().__init__()
 
         self.conv1   = nn.Conv2d(in_channels, 32, kernel_size=8, stride=4)
         self.conv2   = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3   = nn.Conv2d(64, 64, kernel_size=3, stride=1)
         self.flatten = nn.Flatten()
+        
         self.fc_vis  = nn.Linear(64 * 7 * 7, 512)
+        self.dropout_vis = nn.Dropout(p) # Görsel feature dropout
 
         self.ego_fc = nn.Sequential(
             nn.Linear(ego_dim, 64), nn.ReLU(),
+            nn.Dropout(p), # Ego state dropout
             nn.Linear(64, 32),      nn.ReLU(),
         )
 
@@ -197,42 +200,12 @@ class DrivingPolicyNet(nn.Module):
         v = F.relu(self.conv1(x))
         v = F.relu(self.conv2(v))
         v = F.relu(self.conv3(v))
-        v = F.relu(self.fc_vis(self.flatten(v)))
+        
+        v = self.flatten(v)
+        v = F.relu(self.fc_vis(v))
+        v = self.dropout_vis(v) # Feature seviyesinde dropout
+        
         e = self.ego_fc(ego)
+        
         return self.fc_out(torch.cat([v, e], dim=1))
 
-
-class DrivingPolicyNet2(nn.Module):
-    """
-    Enhanced two-stream policy network with BatchNorm and a deeper fusion head.
-    """
-
-    def __init__(self, in_channels: int = 2, out_dim: int = 2, ego_dim: int = EGO_DIM):
-        super().__init__()
-
-        self.conv1   = nn.Conv2d(in_channels, 32, kernel_size=8, stride=4)
-        self.conv2   = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3   = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        self.flatten = nn.Flatten()
-        self.fc_vis  = nn.Linear(64 * 7 * 7, 512)
-        self.vis_bn  = nn.BatchNorm1d(512)
-
-        self.ego_fc = nn.Sequential(
-            nn.Linear(ego_dim, 64), nn.ReLU(inplace=True),
-            nn.Linear(64, 64),      nn.ReLU(inplace=True),
-        )
-
-        self.decision_layer = nn.Sequential(
-            nn.Linear(512 + 64, 256), nn.BatchNorm1d(256), nn.ReLU(inplace=True),
-            nn.Linear(256, 128),      nn.ReLU(inplace=True),
-            nn.Linear(128, 64),       nn.ReLU(inplace=True),
-            nn.Linear(64, out_dim),
-        )
-
-    def forward(self, x: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
-        v = F.relu(self.conv1(x))
-        v = F.relu(self.conv2(v))
-        v = F.relu(self.conv3(v))
-        v = F.relu(self.vis_bn(self.fc_vis(self.flatten(v))))
-        e = self.ego_fc(ego)
-        return self.decision_layer(torch.cat([v, e], dim=1))

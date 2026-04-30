@@ -40,6 +40,7 @@ from models import DepthEstimationModel, DrivingPolicyNet, extract_ego_state, EG
 from policy.datasets import PrecomputedDepthDataset, MetaDriveRGBDataset
 from policy.losses import custom_driving_loss, compute_offline_metrics
 from policy.trainer import build_loaders, train_loop, extract_features_frozen
+from data.cameras import build_cameras
 from utils.checkpoints import (
     save_checkpoint, load_checkpoint, freeze_backbone, print_trainable_params
 )
@@ -69,7 +70,7 @@ def train_policy(
 
     policy_model = DrivingPolicyNet().to(device)
     optimizer    = optim.AdamW(policy_model.parameters(), lr=lr)
-    scheduler    = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-7)
+    scheduler    = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr*10**-2)
 
     train_loop(
         policy_model, device, train_loader, val_loader,
@@ -163,6 +164,7 @@ def test_policy(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     policy_model = DrivingPolicyNet().to(device)
+        
     ckpt         = torch.load(model_path, map_location=device)
     if isinstance(ckpt, dict):
         key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
@@ -176,54 +178,50 @@ def test_policy(
     # ── OFFLINE ─────────────────────────────────────────────────────────────
     if test_mode in ("offline", "all"):
         print("\n=> Offline Evaluation on Test Split...")
-
+ 
         use_precomputed = pred_dir is not None and os.path.isdir(os.path.join(pred_dir, "test"))
-
+ 
         if use_precomputed:
+            from policy.trainer import apply_lane_mask
             test_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="test")
             def collate_fn(batch):
-                combined, actions, egos = zip(*batch)
-                return (torch.tensor(np.stack(combined), dtype=torch.float32),
-                        np.stack(actions), np.stack(egos))
+                depths, rgbs, actions, egos = zip(*batch)
+                return (
+                    torch.tensor(np.stack(depths), dtype=torch.float32),
+                    np.stack(rgbs),
+                    np.stack(actions),
+                    np.stack(egos),
+                )
         else:
             depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
             test_ds = MetaDriveRGBDataset(data_dir=data_dir, split="test")
             def collate_fn(batch):
                 rgbs, actions, egos = zip(*batch)
                 return np.stack(rgbs), np.stack(actions), np.stack(egos)
-
+ 
         if len(test_ds) > 0:
             test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, collate_fn=collate_fn)
             test_loss   = 0.0
             test_pred, test_true = [], []
-
+ 
             with torch.no_grad():
                 for batch in tqdm(test_loader, desc="Testing"):
                     if use_precomputed:
-                        combined_t, actions_np, ego_np = batch
-                        combined  = combined_t.to(device)
+                        depth_t, rgb_np, actions_np, ego_np = batch
+                        depth_t   = depth_t.to(device)
                         actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
                         ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
+                        combined  = apply_lane_mask(depth_t, rgb_np, device)
                     else:
                         rgb_np, actions_np, ego_np = batch
                         actions_t   = torch.tensor(actions_np, dtype=torch.float32, device=device)
                         combined, _ = extract_features_frozen(rgb_np, depth_estimator, device)
                         ego_t       = torch.tensor(ego_np, dtype=torch.float32, device=device)
-
+ 
                     pred       = policy_model(combined, ego_t)
                     test_loss += custom_driving_loss(pred, actions_t).item()
                     test_pred.append(pred.cpu().numpy())
                     test_true.append(actions_np)
-
-            avg_test = test_loss / len(test_loader)
-            test_m   = compute_offline_metrics(np.concatenate(test_pred), np.concatenate(test_true))
-            print("\n=== OFFLINE TEST RESULTS ===")
-            print(f"Test Loss    : {avg_test:.4f}")
-            print(f"Steering MSE : {test_m['steering_mse']:.4f}")
-            print(f"Accel MSE    : {test_m['accel_mse']:.4f}")
-            print(f"Direction Acc: {test_m['direction_acc']:.3f}")
-        else:
-            print("[WARNING] No test data found. Skipping offline evaluation.")
 
     # ── SIMULATION ──────────────────────────────────────────────────────────
     if test_mode in ("simulation", "all"):
@@ -231,11 +229,14 @@ def test_policy(
         if depth_estimator is None:
             depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
 
+        angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(1)
+        rgb_name = rgb_cam_names[0]
+
         config = {
             "use_render":        True,
             "image_observation": True,
-            "sensors":           {"rgb": (RGBCamera, 200, 200)},
-            "vehicle_config":    {"image_source": "rgb"},
+            "sensors":           {rgb_name: sensors[rgb_name]},
+            "vehicle_config":    {"image_source": rgb_name},
             "show_interface":    False,
             "image_on_cuda":     False,
             "start_seed":        316181,
@@ -253,7 +254,13 @@ def test_policy(
 
             while not done:
                 step_count += 1
-                rgb_img = env.engine.get_sensor("rgb").perceive(env.agent)
+                rgb_img = env.engine.get_sensor(rgb_name).perceive(
+                    to_float=False, new_parent_node=env.agent.origin
+                )
+                if hasattr(rgb_img, "get"):
+                    rgb_img = rgb_img.get()
+                rgb_img = np.array(rgb_img, dtype=np.uint8)
+
                 combined_tensor, _ = extract_features_frozen(rgb_img[np.newaxis], depth_estimator, device)
 
                 ego_reading = extract_ego_state(env.agent, last_steer=last_steer)
@@ -280,7 +287,6 @@ def test_policy(
                 cv2.imshow("Depth | Lane  (with Ego HUD)",
                            np.vstack((hud, np.hstack((depth_color, lane_color)))))
                 cv2.waitKey(1)
-
                 obs, reward, terminated, truncated, info = env.step(pred_action)
                 done = terminated or truncated
 
@@ -312,7 +318,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode",       type=str, required=True,
                         choices=["train", "finetune", "test", "all"])
-    parser.add_argument("--epochs",     type=int,   default=40)
+    parser.add_argument("--epochs",     type=int,   default=30)
     parser.add_argument("--episodes",   type=int,   default=1)
     parser.add_argument("--data_dir",   type=str,   default="dataset")
     parser.add_argument("--dpt_path",   type=str,   default="models/dpt_finetuned.pth")
