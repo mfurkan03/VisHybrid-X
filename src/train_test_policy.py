@@ -228,7 +228,7 @@ def test_policy(
                     else:
                         rgb_np, actions_np, ego_np = batch
                         actions_t   = torch.tensor(actions_np, dtype=torch.float32, device=device)
-                        combined, _ = extract_features_frozen(rgb_np, depth_estimator, device)
+                        combined, _ = extract_features_frozen(rgb_np, depth_estimator, device,image_size=image_size)
                         ego_t       = torch.tensor(ego_np, dtype=torch.float32, device=device)
  
                     pred       = policy_model(combined, ego_t)
@@ -296,7 +296,7 @@ def test_policy(
                 # MetaDrive RGBCamera natively returns BGR, so we convert it to RGB
                 rgb_img = rgb_img[..., ::-1].copy()
 
-                combined_tensor, _ = extract_features_frozen(rgb_img[np.newaxis], depth_estimator, device)
+                combined_tensor, _ = extract_features_frozen(rgb_img[np.newaxis], depth_estimator,image_size = image_size, device=device)
 
                 ego_reading = extract_ego_state(env.agent, last_steer=last_steer)
                 ego_t       = torch.tensor(ego_reading.ego_model, dtype=torch.float32, device=device).unsqueeze(0)

@@ -129,7 +129,7 @@ def extract_features_frozen(
 def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_estimator):
     if use_precomputed:
         train_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="train")
-        val_ds   = PrecomputedDepthDataset(prined_dir=pred_dir, split="val")
+        val_ds   = PrecomputedDepthDataset(pred_dir=pred_dir, split="val")
 
         def collate_fn(batch):
             # Dataset now yields (depth, rgb, actions, egos) so lane mask can be
