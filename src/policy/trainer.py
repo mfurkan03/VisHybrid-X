@@ -249,8 +249,9 @@ def train_loop(
             f"Str MAE Tr/Val: {tr_m['steering_mae']:.4f}/{val_m['steering_mae']:.4f} | "
             f"Str Dir Acc: {val_m['steering_dir_acc']:.3f} | "
             f"Brake Acc: {val_m['brake_acc']:.3f} | "
-            f"Turn MAE: {val_pred_m['active_turn_mae']:.4f} | "  # <-- Added
-            f"Jitter: {val_pred_m['jitter_ratio']:.2f}x | "      # <-- Added
+            f"Turn MAE: {val_pred_m['active_turn_mae']:.4f} | "  
+            f"Jitter: {val_pred_m['jitter_ratio']:.2f}x | "      
+            f"95th Pctl Error:  {val_pred_m['steer_95th_pctl_err']:.4f}"
             f"LR: {scheduler.get_last_lr()[0]:.2e}"
         )
 
@@ -262,14 +263,14 @@ def train_loop(
             best_val_loss = avg_val
             save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, best_path)
             print(f"*** Best model saved → {best_path}  (Val Loss: {best_val_loss:.4f}) ***")
-
-        if avg_val < es_best_val_loss:
-            es_best_val_loss = avg_val
-            no_improve_count = 0
-        else:
-            no_improve_count += 1
-            if no_improve_count >= patience:
-                print(f"Early stopping: no val loss improvement for {patience} epochs.")
-                break
+        if epoch >fully_masked_epochs+curriculum_epochs:
+            if avg_val < es_best_val_loss:
+                es_best_val_loss = avg_val
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+                if no_improve_count >= patience:
+                    print(f"Early stopping: no val loss improvement for {patience} epochs.")
+                    break
 
     return best_val_loss
