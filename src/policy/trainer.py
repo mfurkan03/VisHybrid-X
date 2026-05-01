@@ -255,8 +255,8 @@ def train_loop(
             f"LR: {scheduler.get_last_lr()[0]:.2e}"
         )
 
-        if epoch>fully_masked_epochs:
-            scheduler.step()
+        
+        scheduler.step()
 
         save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, model_path)
         if avg_val < best_val_loss and epoch>=fully_masked_epochs+curriculum_epochs:
