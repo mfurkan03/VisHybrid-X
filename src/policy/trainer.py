@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from models import EGO_DIM
 from policy.datasets import MetaDriveRGBDataset, PrecomputedDepthDataset
-from policy.losses import custom_driving_loss, compute_offline_metrics
+from policy.losses import custom_driving_loss, compute_offline_metrics,compute_predictive_metrics
 from utils.checkpoints import save_checkpoint
 
 
