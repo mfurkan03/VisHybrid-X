@@ -162,7 +162,6 @@ def extract_ego_state(agent, last_steer: float = 0.0) -> EgoReading:
         timestamp     = timestamp,
     )
 
-import random
 # ============================================================
 # 3. DRIVING POLICY NETWORKS
 # ============================================================
@@ -205,12 +204,87 @@ class DrivingPolicyNet(nn.Module):
         v = F.relu(self.conv1(x))
         v = F.relu(self.conv2(v))
         v = F.relu(self.conv3(v))
-        
         v = self.flatten(v)
         v = F.relu(self.fc_vis(v))
-        v = self.dropout_vis(v) # Feature seviyesinde dropout
-        
+        v = self.dropout_vis(v)
         e = self.ego_fc(ego)
-        
         return self.fc_out(torch.cat([v, e], dim=1))
+
+
+class _ImpalaResBlock(nn.Module):
+    """Pre-activation residual block used inside the IMPALA CNN."""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
+
+
+def _impala_stage(in_ch: int, out_ch: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+        nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+        _ImpalaResBlock(out_ch),
+        _ImpalaResBlock(out_ch),
+    )
+
+
+class DrivingPolicyNet2(nn.Module):
+    """
+    IMPALA-style residual CNN backbone — the standard choice for visual RL.
+
+    Why this architecture over a plain deep CNN:
+    - Residual connections → stable gradients through depth
+    - No BatchNorm → safe with batch_size=1 during RL rollouts (BatchNorm
+      is undefined at BS=1 and causes train/eval stat drift in RL)
+    - MaxPool stages → better spatial information retention than strided convs
+    - Pre-activation ReLU in residual blocks → smoother gradient flow
+
+    Visual stream  : 3 IMPALA stages (16→32→32 ch) → 512-d feature
+    Ego stream     : 2-layer MLP                    →  32-d feature
+    Fusion head    : 2-layer MLP                    →   2-d output [steer, accel]
+
+    RL note: call model.train() during gradient updates and model.eval()
+    during rollout collection — Dropout is the only stateful layer.
+    """
+
+    def __init__(self, in_channels: int = 4, out_dim: int = 2, ego_dim: int = EGO_DIM, p: float = 0.5, image_size: int = None):
+        super().__init__()
+
+        self.cnn = nn.Sequential(
+            _impala_stage(in_channels, 16),
+            _impala_stage(16, 32),
+            _impala_stage(32, 32),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        with torch.no_grad():
+            dummy         = torch.zeros(1, in_channels, image_size, image_size)
+            flattened_dim = self.cnn(dummy).shape[1]
+
+        self.vis_head = nn.Sequential(
+            nn.Linear(flattened_dim, 512), nn.ReLU(), nn.Dropout(p),
+        )
+
+        self.ego_fc = nn.Sequential(
+            nn.Linear(ego_dim, 64), nn.ReLU(),
+            nn.Linear(64, 32),      nn.ReLU(),
+        )
+
+        self.fusion = nn.Sequential(
+            nn.Linear(512 + 32, 256), nn.ReLU(), nn.Dropout(p),
+            nn.Linear(256, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
+        v = self.vis_head(self.cnn(x))
+        e = self.ego_fc(ego)
+        return self.fusion(torch.cat([v, e], dim=1))
 

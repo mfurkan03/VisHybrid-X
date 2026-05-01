@@ -7,7 +7,7 @@ Usage
 python src/train_test_policy.py --mode train \
     --pred_dir data/processed/dpt_pred \
     --model_path models/policy_model.pth
-
+    
 # Fine-tune a saved checkpoint
 python src/train_test_policy.py --mode finetune \
     --finetune_from models/policy_model_best.pth \
@@ -20,6 +20,7 @@ python src/train_test_policy.py --mode finetune \
 python src/train_test_policy.py --mode test \
     --model_path models/policy_model_best.pth \
     --pred_dir data/processed/dpt_pred
+    --dpt_path models\saved\dpt_finetuned_ep06.pth
 """
 
 import argparse
@@ -36,10 +37,10 @@ from tqdm import tqdm
 from metadrive import MetaDriveEnv
 from metadrive.component.sensors.rgb_camera import RGBCamera
 
-from models import DepthEstimationModel, DrivingPolicyNet, extract_ego_state, EGO_DIM
+from models import DepthEstimationModel, DrivingPolicyNet, DrivingPolicyNet2, extract_ego_state, EGO_DIM
 from policy.datasets import PrecomputedDepthDataset, MetaDriveRGBDataset
 from policy.losses import custom_driving_loss, compute_offline_metrics
-from policy.trainer import build_loaders, train_loop, extract_features_frozen
+from policy.trainer import build_loaders, train_loop, extract_features_frozen, _collate_precomputed, _collate_rgb
 from data.cameras import build_cameras
 from utils.checkpoints import (
     save_checkpoint, load_checkpoint, freeze_backbone, print_trainable_params
@@ -51,27 +52,30 @@ from utils.checkpoints import (
 # ============================================================
 def train_policy(
     epochs:     int   = 20,
-    batch_size: int   = 64,
+    batch_size: int   = 32,
     model_path: str   = "models/policy_model.pth",
     dpt_path:   str   = None,
     data_dir:   str   = "data/raw",
     lr:         float = 1e-4,
     pred_dir:   str   = None,
-    curriculum_epochs: int = 10,
+    curriculum_epochs: int = 7,
     fully_masked_epochs: int = 3,
     image_size: int = None,
+    policy:     str   = "standard",
 ):
     print("--- Phase 2: Training Driving Policy (from scratch) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    print(f"DEVICE: {device}")
     use_precomputed = pred_dir is not None and os.path.isdir(os.path.join(pred_dir, "train"))
     depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path)
 
     print(f"[INFO] {'Using PRECOMPUTED DPT from: ' + pred_dir if use_precomputed else 'Live DPT inference.'}")
 
-    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator)
+    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size)
 
-    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
+    model_cls    = DrivingPolicyNet2 if policy == "deep" else DrivingPolicyNet
+    policy_model = model_cls(image_size=image_size).to(device)
+    print(f"[INFO] Policy network: {model_cls.__name__}")
     optimizer    = optim.AdamW(policy_model.parameters(), lr=lr)
     scheduler    = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-fully_masked_epochs, eta_min=lr*10**-2) # 3 epochs less steps for scheduler 
 
@@ -105,6 +109,7 @@ def finetune_policy(
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
     image_size: int = None,
+    policy:     str   = "standard",
 ):
     """
     Fine-tune (or resume) a previously saved policy model.
@@ -123,9 +128,11 @@ def finetune_policy(
     use_precomputed = pred_dir is not None and os.path.isdir(os.path.join(pred_dir, "train"))
     depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path)
 
-    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator)
+    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size)
 
-    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
+    model_cls    = DrivingPolicyNet2 if policy == "deep" else DrivingPolicyNet
+    policy_model = model_cls(image_size=image_size).to(device)
+    print(f"[INFO] Policy network: {model_cls.__name__}")
     if freeze_bb:
         freeze_backbone(policy_model)
 
@@ -172,11 +179,14 @@ def test_policy(
     pred_dir:     str  = None,
     test_mode:    str  = "all",
     image_size:   int  = None,
+    policy:       str  = "standard",
 ):
     print("--- Phase 3: Testing Driving Policy ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
+    model_cls    = DrivingPolicyNet2 if policy == "deep" else DrivingPolicyNet
+    policy_model = model_cls(image_size=image_size).to(device)
+    print(f"[INFO] Policy network: {model_cls.__name__}")
         
     ckpt         = torch.load(model_path, map_location=device)
     if isinstance(ckpt, dict):
@@ -196,22 +206,13 @@ def test_policy(
  
         if use_precomputed:
             from policy.trainer import apply_lane_mask
-            test_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="test")
-            def collate_fn(batch):
-                depths, rgbs, actions, egos = zip(*batch)
-                return (
-                    torch.tensor(np.stack(depths), dtype=torch.float32),
-                    np.stack(rgbs),
-                    np.stack(actions),
-                    np.stack(egos),
-                )
+            test_ds    = PrecomputedDepthDataset(pred_dir=pred_dir, split="test")
+            collate_fn = _collate_precomputed
         else:
             depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
-            test_ds = MetaDriveRGBDataset(data_dir=data_dir, split="test")
-            def collate_fn(batch):
-                rgbs, actions, egos = zip(*batch)
-                return np.stack(rgbs), np.stack(actions), np.stack(egos)
- 
+            test_ds    = MetaDriveRGBDataset(data_dir=data_dir, split="test")
+            collate_fn = _collate_rgb
+
         if len(test_ds) > 0:
             test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, collate_fn=collate_fn)
             test_loss   = 0.0
@@ -269,7 +270,7 @@ def test_policy(
             "vehicle_config":    {"image_source": rgb_name},
             "show_interface":    False,
             "image_on_cuda":     False,
-            "start_seed":        316181,
+            "start_seed":        316182,
         }
         env = MetaDriveEnv(config)
         success_flags, route_completions = [], []
@@ -397,16 +398,21 @@ if __name__ == "__main__":
     parser.add_argument("--reset_optimizer", action="store_true")
     parser.add_argument("--resume",          action="store_true")
     parser.add_argument("--curriculum_epochs", type=int, default=10)
-    parser.add_argument("--fully_masked_epochs", type=int, default=3)
-    parser.add_argument("--image_size", type=int, default=84)
+    parser.add_argument("--fully_masked_epochs", type=int, default=30)
+    parser.add_argument("--image_size",   type=int, default=84)
+    parser.add_argument("--batch_size",   type=int, default=64)
+    parser.add_argument("--policy",       type=str, default="standard",
+                        choices=["standard", "deep"],
+                        help="Policy network architecture: standard (3-layer CNN) or deep (4-layer CNN + BN)")
     args = parser.parse_args()
 
     if args.mode in ("train", "all"):
-        train_policy(args.epochs, 32, args.model_path,
+        train_policy(args.epochs, args.batch_size, args.model_path,
                      args.dpt_path, args.data_dir, args.lr, pred_dir=args.pred_dir,
                      curriculum_epochs=args.curriculum_epochs,
                      fully_masked_epochs=args.fully_masked_epochs,
-                     image_size=args.image_size)
+                     image_size=args.image_size,
+                     policy=args.policy)
 
     if args.mode == "finetune":
         if args.finetune_from is None:
@@ -414,11 +420,11 @@ if __name__ == "__main__":
         finetune_policy(
             finetune_from   = args.finetune_from,
             epochs          = args.epochs,
-            batch_size      = 32,
+            batch_size      = args.batch_size,
             model_path      = args.model_path,
             dpt_path        = args.dpt_path,
             data_dir        = args.data_dir,
-            lr              = args.lr if args.lr != 1e-4 else 1e-6,
+            lr              = args.lr,
             pred_dir        = args.pred_dir,
             freeze_bb       = args.freeze_backbone,
             reset_optimizer = args.reset_optimizer,
@@ -426,9 +432,10 @@ if __name__ == "__main__":
             curriculum_epochs=args.curriculum_epochs,
             fully_masked_epochs=args.fully_masked_epochs,
             image_size=args.image_size,
+            policy=args.policy,
         )
 
     if args.mode in ("test", "all"):
         test_policy(args.model_path, args.dpt_path, args.data_dir,
                     args.episodes, pred_dir=args.pred_dir, test_mode=args.test_mode,
-                    image_size=args.image_size)
+                    image_size=args.image_size, policy=args.policy)
