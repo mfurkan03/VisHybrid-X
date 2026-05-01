@@ -214,6 +214,10 @@ def train_loop(
     use_amp             = device.type == "cuda"
     scaler              = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    patience            = 8
+    no_improve_count    = 0
+    es_best_val_loss    = float("inf")
+
     for epoch in range(start_epoch, start_epoch + epochs):
         avg_train, tr_pred, tr_true = run_epoch(
             policy_model, train_loader, optimizer, device,
@@ -249,9 +253,18 @@ def train_loop(
             scheduler.step()
 
         save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, model_path)
-        if avg_val < best_val_loss:
+        if avg_val < best_val_loss and epoch>=fully_masked_epochs+curriculum_epochs:
             best_val_loss = avg_val
             save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, best_path)
             print(f"*** Best model saved → {best_path}  (Val Loss: {best_val_loss:.4f}) ***")
+
+        if avg_val < es_best_val_loss:
+            es_best_val_loss = avg_val
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+            if no_improve_count >= patience:
+                print(f"Early stopping: no val loss improvement for {patience} epochs.")
+                break
 
     return best_val_loss

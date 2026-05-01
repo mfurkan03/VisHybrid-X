@@ -397,10 +397,10 @@ if __name__ == "__main__":
     parser.add_argument("--freeze_backbone", action="store_true")
     parser.add_argument("--reset_optimizer", action="store_true")
     parser.add_argument("--resume",          action="store_true")
-    parser.add_argument("--curriculum_epochs", type=int, default=10)
-    parser.add_argument("--fully_masked_epochs", type=int, default=30)
+    parser.add_argument("--curriculum_epochs", type=int, default=20)
+    parser.add_argument("--fully_masked_epochs", type=int, default=3)
     parser.add_argument("--image_size",   type=int, default=84)
-    parser.add_argument("--batch_size",   type=int, default=64)
+    parser.add_argument("--batch_size",   type=int, default=32)
     parser.add_argument("--policy",       type=str, default="standard",
                         choices=["standard", "deep"],
                         help="Policy network architecture: standard (3-layer CNN) or deep (4-layer CNN + BN)")
