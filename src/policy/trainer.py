@@ -241,14 +241,19 @@ def train_loop(
 
         tr_m  = compute_offline_metrics(tr_pred,  tr_true)
         val_m = compute_offline_metrics(val_pred, val_true)
+        val_pred_m = compute_predictive_metrics(val_pred, val_true) # NEW
+
         print(
             f"[{tag}] Epoch [{epoch+1:02d}] "
             f"Loss Tr/Val: {avg_train:.4f}/{avg_val:.4f} | "
             f"Str MAE Tr/Val: {tr_m['steering_mae']:.4f}/{val_m['steering_mae']:.4f} | "
             f"Str Dir Acc: {val_m['steering_dir_acc']:.3f} | "
             f"Brake Acc: {val_m['brake_acc']:.3f} | "
+            f"Turn MAE: {val_pred_m['active_turn_mae']:.4f} | "  # <-- Added
+            f"Jitter: {val_pred_m['jitter_ratio']:.2f}x | "      # <-- Added
             f"LR: {scheduler.get_last_lr()[0]:.2e}"
         )
+
         if epoch>fully_masked_epochs:
             scheduler.step()
 

@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from models import DepthEstimationModel, DrivingPolicyNet, DrivingPolicyNet2
 from policy.datasets import PrecomputedDepthDataset, MetaDriveRGBDataset
-from policy.losses import custom_driving_loss, compute_offline_metrics
+from policy.losses import custom_driving_loss, compute_offline_metrics,compute_predictive_metrics
 from policy.trainer import (
     build_loaders, train_loop, extract_features_frozen, 
     _collate_precomputed, _collate_rgb, apply_lane_mask
@@ -235,6 +235,7 @@ def test_offline_policy(
         test_pred_np = np.concatenate(test_pred, axis=0)
         test_true_np = np.concatenate(test_true, axis=0)
         test_metrics = compute_offline_metrics(test_pred_np, test_true_np)
+        predictive_metrics = compute_predictive_metrics(test_pred_np, test_true_np) # NEW
         avg_test_loss = test_loss / len(test_loader)
         
         print(f"\n=== OFFLINE SUMMARY ===")
@@ -247,7 +248,11 @@ def test_offline_policy(
         print(f"Accel Dir Acc:    {test_metrics['direction_acc']*100:.1f}%")
         print(f"Braking Acc:      {test_metrics['brake_acc']*100:.1f}%")
         print(f"Steering Corr:    {test_metrics['steering_corr']:.4f}")
-
+        print(f"\n=== SIMULATION PREDICTION METRICS ===")
+        print(f"95th Pctl Error:  {predictive_metrics['steer_95th_pctl_err']:.4f}")
+        print(f"Active Turn MAE:  {predictive_metrics['active_turn_mae']:.4f}")
+        print(f"Jitter Ratio:     {predictive_metrics['jitter_ratio']:.2f}x")
+        print(f"Out of Bounds %:  {predictive_metrics['out_of_bounds_rate']*100:.2f}%")
 
 # ============================================================
 # MAIN
