@@ -1,6 +1,7 @@
 """
 train_offline_policy.py – Train, fine-tune, and test the DrivingPolicyNet strictly offline.
 No MetaDrive or CV2 imports, safe for Colab.
+python src/train_offline_policy.py --mode train --pred_dir data/processed/dpt_pred --model_path models/policy_model_deep.pth --epochs 70 --policy deep --curriculum_epochs 40 --fully_masked_epochs 8
 """
 
 import argparse

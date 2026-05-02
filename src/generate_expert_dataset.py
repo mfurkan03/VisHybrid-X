@@ -51,8 +51,7 @@ def _worker_collect(
     # Calculate global splits
     train_count = int(total_episodes * split_ratios[0])
     val_count   = int(total_episodes * split_ratios[1])
-    rng = np.random.default_rng(seed)
-    traffic_density = float(rng.uniform(0.1, 0.7))
+    traffic_density = 0.15
     config = {
         "use_render":        False,
         "image_observation": True,
@@ -111,49 +110,58 @@ def _worker_collect(
 
         while not done:
             fps_counter.tick()
-            ep_steps += 1
-
+            ep_steps+=1
             expert_action  = expert(env.agent, deterministic=True)
             applied_action = expert_action.copy()
-            if fps_counter.total_steps % 50 == 0 and current_split =="train": # This disables the augmentation in validaiton and test processes
+
+            if fps_counter.total_steps % 200 == 0 and current_split =="train": # This disables the augmentation in validaiton and test processes
                 applied_action[0] += random.uniform(-action_noise, action_noise)
 
-            reading = extract_ego_state(env.agent, last_steer=last_steer)
-            ego_states.append(reading.ego_model)
-            ego_states_full.append([
-                reading.total_speed,
-                reading.last_steer,
-                reading.forward_speed,
-                reading.lateral_speed,
-                reading.heading_delta,
-            ])
-            frame_timestamps.append(reading.timestamp)
+            
+            if fps_counter.total_steps % 20 == 0:
+                reading = extract_ego_state(env.agent, last_steer=last_steer)
+                ego_states.append(reading.ego_model)
+                ego_states_full.append([
+                    reading.total_speed,
+                    reading.last_steer,
+                    reading.forward_speed,
+                    reading.lateral_speed,
+                    reading.heading_delta,
+                ])
+                frame_timestamps.append(reading.timestamp)
 
-            raw_frames = {}
-            for rgb_name, depth_name in zip(rgb_cam_names, depth_cam_names):
-                rgb_raw, depth_raw = process_fn(env, rgb_name, depth_name, observations)
-                raw_frames[rgb_name] = (rgb_raw, depth_raw)
+                raw_frames = {}
+                for rgb_name, depth_name in zip(rgb_cam_names, depth_cam_names):
+                    # process_fn appends to the `observations` dict internally
+                    rgb_raw, depth_raw = process_fn(env, rgb_name, depth_name, observations)
+                    raw_frames[rgb_name] = (rgb_raw, depth_raw)
 
-            actions.append(expert_action.copy())
+                actions.append(expert_action.copy())
+
+                # Visualize only on the collected frames to avoid UnboundLocalError
+                if visualize:
+                    quit_requested = show_cameras(raw_frames, rgb_cam_names, depth_cam_names, fps_counter)
+                    if quit_requested:
+                        done = True
+            # ====================================================
+
             last_steer = float(expert_action[0])
 
             obs, reward, terminated, truncated, info = env.step(applied_action)
             done = terminated or truncated
-            if ep_steps >= 2500:
+            if ep_steps >= 3000:
                 done = True
 
             if fps_counter.total_steps % 100 == 0:
                 print(f"  [Worker {worker_id} | Ep {ep+1}/{num_episodes}] "
                       f"Step: {fps_counter.total_steps:5d}  |  "
                       f"Avg FPS: {fps_counter.average_fps:5.1f}  |  "
-                      f"Ego: spd={reading.total_speed:+.2f} str={reading.last_steer:+.2f}",
+                      # Note: 'reading' might not be defined if step < 100, 
+                      # so we pull directly from the env.agent or default to 0 if needed.
+                      # To avoid a crash on the print statement, you can use the action/last_steer:
+                      f"Ego: str={last_steer:+.2f}",
                       flush=True)
-
-            if visualize:
-                quit_requested = show_cameras(raw_frames, rgb_cam_names, depth_cam_names, fps_counter)
-                if quit_requested:
-                    done = True
-
+            
         # Build and save episode
         save_dict = {
             "action":           np.array(actions),
@@ -168,7 +176,7 @@ def _worker_collect(
             save_dict[f"{rgb_name}_depth"] = np.array(depth_list, dtype=np.float32)
             save_dict[f"{rgb_name}_rgb"] = np.array(rgb_list, dtype=np.uint8)
 
-        save_path = os.path.join(save_dir, current_split, f"episode_{global_ep_id}.npz")
+        save_path = os.path.join(save_dir, current_split, f"episode_{global_ep_id+500}.npz")
         
         # We can just save sequentially inside the worker, or keep the thread approach
         t = threading.Thread(
