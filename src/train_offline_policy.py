@@ -60,6 +60,7 @@ def train_policy(
     fully_masked_epochs: int = 3,
     image_size: int = None,
     policy:     str   = "standard",
+    lane_mask_prob: float = 0.0,
 ):
     print("--- Phase 2: Training Driving Policy (from scratch) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -92,6 +93,7 @@ def train_policy(
         curriculum_epochs=curriculum_epochs,
         fully_masked_epochs=fully_masked_epochs,
         image_size=image_size,
+        lane_mask_prob=lane_mask_prob,
     )
 
 
@@ -114,6 +116,7 @@ def finetune_policy(
     fully_masked_epochs: int = 3,
     image_size: int = None,
     policy:     str   = "standard",
+    lane_mask_prob: float = 0.0,
 ):
     print("--- Fine-tuning Driving Policy ---")
     print(f"    Source : {finetune_from}  |  Output : {model_path}")
@@ -167,6 +170,7 @@ def finetune_policy(
         curriculum_epochs=curriculum_epochs,
         fully_masked_epochs=fully_masked_epochs,
         image_size=image_size,
+        lane_mask_prob=lane_mask_prob,
     )
 
 
@@ -277,6 +281,7 @@ if __name__ == "__main__":
     parser.add_argument("--image_size",   type=int, default=84)
     parser.add_argument("--batch_size",   type=int, default=32)
     parser.add_argument("--policy",       type=str, default="standard", choices=["standard", "deep"])
+    parser.add_argument("--lane_mask_prob", type=float, default=0.05)
     args = parser.parse_args()
 
     if args.mode == "train":
@@ -285,7 +290,8 @@ if __name__ == "__main__":
                      curriculum_epochs=args.curriculum_epochs,
                      fully_masked_epochs=args.fully_masked_epochs,
                      image_size=args.image_size,
-                     policy=args.policy)
+                     policy=args.policy,
+                     lane_mask_prob=args.lane_mask_prob)
 
     elif args.mode == "finetune":
         if args.finetune_from is None:
@@ -306,6 +312,7 @@ if __name__ == "__main__":
             fully_masked_epochs=args.fully_masked_epochs,
             image_size=args.image_size,
             policy=args.policy,
+            lane_mask_prob=args.lane_mask_prob,
         )
 
     elif args.mode == "test":

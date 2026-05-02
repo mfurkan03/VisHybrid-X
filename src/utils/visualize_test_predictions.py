@@ -15,6 +15,9 @@ python src/visualize_test_predictions.py \
 import argparse
 import os
 import random
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import cv2
 import matplotlib
