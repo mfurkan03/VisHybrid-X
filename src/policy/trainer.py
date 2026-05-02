@@ -22,9 +22,18 @@ from utils.checkpoints import save_checkpoint
 def _batch_lane_mask(rgb_tensor: torch.Tensor, threshold: float = 180 / 255.0) -> torch.Tensor:
     """Vectorized lane mask for a whole batch — no per-image loops, no OpenCV."""
     _, _, H, _ = rgb_tensor.shape
-    gray = 0.299 * rgb_tensor[:, 0] + 0.587 * rgb_tensor[:, 1] + 0.114 * rgb_tensor[:, 2]
+    r, g, b = rgb_tensor[:, 0], rgb_tensor[:, 1], rgb_tensor[:, 2]
+
+    gray = 0.299 * r + 0.587 * g + 0.114 * b
     gray[:, :int(H * 0.55), :] = 0.0
-    return (gray >= threshold).float().unsqueeze(1)  # (B, 1, H, W)
+    white_mask = gray >= threshold
+
+    # Yellow lines (center divider separating opposite directions):
+    # high R, high G, low B — and sufficiently bright overall
+    yellow_mask = (r > 0.55) & (g > 0.45) & (b < 0.35) & (r > b + 0.25) & (g > b + 0.15)
+    yellow_mask[:, :int(H * 0.55), :] = False
+
+    return (white_mask | yellow_mask).float().unsqueeze(1)  # (B, 1, H, W)
 
 
 def apply_lane_mask(
