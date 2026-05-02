@@ -32,9 +32,9 @@ from utils.fps import FPSCounter
 # WORKER FUNCTION
 # ============================================================
 def _worker_collect(
-    worker_id, 
-    start_ep_idx, 
-    num_episodes, 
+    worker_id,
+    start_ep_idx,
+    num_episodes,
     total_episodes,
     seed,
     save_dir,
@@ -42,7 +42,10 @@ def _worker_collect(
     visualize,
     num_cameras,
     image_on_cuda,
-    split_ratios
+    split_ratios,
+    repeat_action,
+    max_step,
+    traffic_density,
 ):
     """Worker process that handles a subset of the total episodes."""
     
@@ -51,13 +54,12 @@ def _worker_collect(
     # Calculate global splits
     train_count = int(total_episodes * split_ratios[0])
     val_count   = int(total_episodes * split_ratios[1])
-    traffic_density = 0.15
     config = {
         "use_render":        False,
         "image_observation": True,
         "show_interface":    False,
         "preload_models":    True,
-        "decision_repeat":   1,
+        "decision_repeat":   repeat_action,
         "sensors":           sensors,
         "vehicle_config":    dict(image_source=rgb_cam_names[0]),
         "start_seed":        seed, # Unique start seed per worker to avoid duplicate maps
@@ -149,7 +151,7 @@ def _worker_collect(
 
             obs, reward, terminated, truncated, info = env.step(applied_action)
             done = terminated or truncated
-            if ep_steps >= 3000:
+            if ep_steps >= max_step:
                 done = True
 
             if fps_counter.total_steps % 100 == 0:
@@ -176,7 +178,8 @@ def _worker_collect(
             save_dict[f"{rgb_name}_depth"] = np.array(depth_list, dtype=np.float32)
             save_dict[f"{rgb_name}_rgb"] = np.array(rgb_list, dtype=np.uint8)
 
-        save_path = os.path.join(save_dir, current_split, f"episode_{global_ep_id+500}.npz")
+        fname = f"{seed}_{action_noise}_{repeat_action}_{max_step}_{traffic_density:.2f}_{global_ep_id}.npz"
+        save_path = os.path.join(save_dir, current_split, fname)
         
         # We can just save sequentially inside the worker, or keep the thread approach
         t = threading.Thread(
@@ -208,9 +211,12 @@ def collect_expert_data_parallel(
     save_dir       = "dataset",
     visualize      = True,
     num_cameras    = 2,
-    action_noise = 0.3,
+    action_noise   = 0.3,
     image_on_cuda  = True,
     split_ratios   = (0.8, 0.1, 0.1),
+    repeat_action    = 1,
+    max_step         = 3000,
+    traffic_density  = 0.15,
 ):
     os.makedirs(os.path.join(save_dir, "train"), exist_ok=True)
     os.makedirs(os.path.join(save_dir, "val"),   exist_ok=True)
@@ -255,7 +261,10 @@ def collect_expert_data_parallel(
             visualize,                  # visualize
             num_cameras,                # num_cameras
             image_on_cuda,              # image_on_cuda
-            split_ratios                # split_ratios
+            split_ratios,               # split_ratios
+            repeat_action,              # repeat_action
+            max_step,                   # max_step
+            traffic_density,            # traffic_density
         ))
         current_idx += worker_eps
 
@@ -285,9 +294,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir",      type=str,  default="dataset")
     parser.add_argument("--start_seed",    type=int,  default=42)
     parser.add_argument("--num_cameras",   type=int,  default=1)
-    parser.add_argument("--act_noise",   type=float,  default=0.3)
-    parser.add_argument("--no_vis",        action="store_true")
-    parser.add_argument("--image_on_cuda", action="store_true", default=False)
+    parser.add_argument("--act_noise",      type=float, default=0.3)
+    parser.add_argument("--repeat_action",    type=int,   default=1,    help="decision_repeat: env steps per action")
+    parser.add_argument("--max_step",         type=int,   default=3000, help="Max steps before episode is truncated")
+    parser.add_argument("--traffic_density",  type=float, default=0.15, help="Fraction of road capacity filled by traffic")
+    parser.add_argument("--no_vis",         action="store_true")
+    parser.add_argument("--image_on_cuda",  action="store_true", default=False)
     args = parser.parse_args()
 
     collect_expert_data_parallel(
@@ -299,4 +311,7 @@ if __name__ == "__main__":
         visualize     = not args.no_vis,
         num_cameras   = args.num_cameras,
         image_on_cuda = args.image_on_cuda,
+        repeat_action    = args.repeat_action,
+        max_step         = args.max_step,
+        traffic_density  = args.traffic_density,
     )
