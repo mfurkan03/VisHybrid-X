@@ -336,7 +336,7 @@ def precompute_dpt_predictions(
     data_dir:    str   = "dataset",
     out_dir:     str   = "data/processed/dpt_pred",
     batch_size:  int   = 32,
-    splits:      tuple = ("train", "val"),
+    splits:      tuple = None,
     num_workers: int   = 4,
 ):
     print("--- Precomputing DPT Predictions ---")

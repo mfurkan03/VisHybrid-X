@@ -221,7 +221,7 @@ def test_offline_policy(
                     depth_t   = depth_t.to(device)
                     actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
                     ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
-                    combined  = apply_lane_mask(depth_t, rgb_np, device)
+                    combined  = apply_lane_mask(depth_t, rgb_np, device , image_size=image_size)
                 else:
                     rgb_np, actions_np, ego_np = batch
                     actions_t   = torch.tensor(actions_np, dtype=torch.float32, device=device)

@@ -1,5 +1,6 @@
 """
 test_simulation_policy.py – Simulation testing script utilizing MetaDrive and UI visualization.
+python src/test_simulation_policy.py --dpt_path .\models\saved\dpt_finetune.pth --model_path .\models\saved\policy_model_best.pth
 """
 
 import argparse
@@ -53,7 +54,7 @@ def test_simulation(
                             },
         "show_interface":    False,
         "image_on_cuda":     False,
-        "start_seed":        316181,
+        "start_seed":        316180,
     }
     
     env = MetaDriveEnv(config)
