@@ -1,7 +1,7 @@
 """
 train_offline_policy.py – Train, fine-tune, and test the DrivingPolicyNet strictly offline.
 No MetaDrive or CV2 imports, safe for Colab.
-python src/train_offline_policy.py --mode train --pred_dir data/processed/dpt_pred --model_path models/policy_model_deep.pth --epochs 70 --policy deep --curriculum_epochs 40 --fully_masked_epochs 8
+python src/train_offline_policy.py --mode train --pred_dir data/processed/dpt_pred --model_path models/policy_model.pth --epochs 70 --curriculum_epochs 40 --fully_masked_epochs 8
 """
 
 import argparse
@@ -14,7 +14,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models import DepthEstimationModel, DrivingPolicyNet, DrivingPolicyNet2
+from models import DepthEstimationModel, DrivingPolicyNet
 from policy.datasets import PrecomputedDepthDataset, MetaDriveRGBDataset
 from policy.losses import custom_driving_loss, compute_offline_metrics,compute_predictive_metrics
 from policy.trainer import (
@@ -59,7 +59,6 @@ def train_policy(
     curriculum_epochs: int = 7,
     fully_masked_epochs: int = 3,
     image_size: int = None,
-    policy:     str   = "standard",
     lane_mask_prob: float = 0.0,
 ):
     print("--- Phase 2: Training Driving Policy (from scratch) ---")
@@ -72,10 +71,8 @@ def train_policy(
 
     train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size)
 
-    model_cls    = DrivingPolicyNet2 if policy == "deep" else DrivingPolicyNet
-    policy_model = model_cls(image_size=image_size).to(device)
-    print(f"[INFO] Policy network: {model_cls.__name__}")
-    
+    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
+
     optimizer = optim.AdamW(policy_model.parameters(), lr=lr)
     
     # Applied Custom Scheduler
@@ -115,7 +112,6 @@ def finetune_policy(
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
     image_size: int = None,
-    policy:     str   = "standard",
     lane_mask_prob: float = 0.0,
 ):
     print("--- Fine-tuning Driving Policy ---")
@@ -130,9 +126,7 @@ def finetune_policy(
 
     train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size)
 
-    model_cls    = DrivingPolicyNet2 if policy == "deep" else DrivingPolicyNet
-    policy_model = model_cls(image_size=image_size).to(device)
-    print(f"[INFO] Policy network: {model_cls.__name__}")
+    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
     if freeze_bb:
         freeze_backbone(policy_model)
 
@@ -183,14 +177,11 @@ def test_offline_policy(
     data_dir:     str,
     pred_dir:     str  = None,
     image_size:   int  = None,
-    policy:       str  = "standard",
 ):
     print("--- Phase 3: Offline Testing Driving Policy ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model_cls    = DrivingPolicyNet2 if policy == "deep" else DrivingPolicyNet
-    policy_model = model_cls(image_size=image_size).to(device)
-    print(f"[INFO] Policy network: {model_cls.__name__}")
+    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
         
     ckpt = torch.load(model_path, map_location=device)
     if isinstance(ckpt, dict):
@@ -280,7 +271,6 @@ if __name__ == "__main__":
     parser.add_argument("--fully_masked_epochs", type=int, default=3)
     parser.add_argument("--image_size",   type=int, default=84)
     parser.add_argument("--batch_size",   type=int, default=32)
-    parser.add_argument("--policy",       type=str, default="standard", choices=["standard", "deep"])
     parser.add_argument("--lane_mask_prob", type=float, default=0.05)
     args = parser.parse_args()
 
@@ -290,7 +280,6 @@ if __name__ == "__main__":
                      curriculum_epochs=args.curriculum_epochs,
                      fully_masked_epochs=args.fully_masked_epochs,
                      image_size=args.image_size,
-                     policy=args.policy,
                      lane_mask_prob=args.lane_mask_prob)
 
     elif args.mode == "finetune":
@@ -311,10 +300,9 @@ if __name__ == "__main__":
             curriculum_epochs=args.curriculum_epochs,
             fully_masked_epochs=args.fully_masked_epochs,
             image_size=args.image_size,
-            policy=args.policy,
             lane_mask_prob=args.lane_mask_prob,
         )
 
     elif args.mode == "test":
         test_offline_policy(args.model_path, args.dpt_path, args.data_dir,
-                            pred_dir=args.pred_dir, image_size=args.image_size, policy=args.policy)
+                            pred_dir=args.pred_dir, image_size=args.image_size)

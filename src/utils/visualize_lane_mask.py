@@ -40,6 +40,8 @@ def white_only_mask(rgb_tensor: torch.Tensor, threshold: float = 180 / 255.0) ->
     return (gray >= threshold).float().unsqueeze(1)
 
 
+
+
 def main(data_dir: str, n_frames: int, split: str, image_size: int = 84):
     split_dir = os.path.join(data_dir, split)
     files = sorted(glob.glob(os.path.join(split_dir, "*.npz")))
@@ -97,7 +99,7 @@ def main(data_dir: str, n_frames: int, split: str, image_size: int = 84):
             label_h   = 24
             label_row = np.zeros((label_h, row.shape[1], 3), dtype=np.uint8)
             panel_w   = disp
-            for i, txt in enumerate(["Original", "White only", "White+Yellow", "Yellow pixels"]):
+            for i, txt in enumerate(["Original", "White only", "White+Yellow (Teacher)", "Yellow pixels"]):
                 cv2.putText(label_row, txt,
                             (i * panel_w + 4, 16),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)

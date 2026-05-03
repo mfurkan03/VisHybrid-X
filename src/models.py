@@ -7,8 +7,7 @@ DepthEstimationModel   – DepthAnythingV2 wrapper (frozen or trainable)
 EgoReading             – NamedTuple snapshot from extract_ego_state()
 EGO_DIM                – number of dimensions fed to the policy network (2)
 extract_ego_state()    – build EgoReading from a MetaDrive agent
-DrivingPolicyNet       – two-stream CNN + ego policy network
-DrivingPolicyNet2      – deeper variant with BatchNorm fusion head
+DrivingPolicyNet       – IMPALA-style variant; no BatchNorm, safe for RL fine-tuning
 """
 
 import os
@@ -162,54 +161,6 @@ def extract_ego_state(agent, last_steer: float = 0.0) -> EgoReading:
         timestamp     = timestamp,
     )
 
-# ============================================================
-# 3. DRIVING POLICY NETWORKS
-# ============================================================
-class DrivingPolicyNet(nn.Module):
-    """
-    Two-stream policy network.
-
-    Visual stream  : CNN on (4, H, W) observation  → 512-d feature
-    Ego stream     : MLP on EGO_DIM ego-state vector →  32-d feature
-    Fusion head    : Linear(544 → 2)  →  [steer, accel]
-
-    Ego input: [total_speed, last_steer]
-    """
-
-    def __init__(self, in_channels: int = 4, out_dim: int = 2, ego_dim: int = EGO_DIM, p: float = 0.5, image_size: int = None):
-        super().__init__()
-
-        self.conv1   = nn.Conv2d(in_channels, 32, kernel_size=8, stride=4)
-        self.conv2   = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3   = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        self.flatten = nn.Flatten()
-        
-        with torch.no_grad():
-            dummy = torch.zeros(1, in_channels, image_size, image_size)
-            dummy_out = self.flatten(self.conv3(self.conv2(self.conv1(dummy))))
-            flattened_dim = dummy_out.shape[1]
-        
-        self.fc_vis  = nn.Linear(flattened_dim, 512)
-        self.dropout_vis = nn.Dropout(p) # Görsel feature dropout
-
-        self.ego_fc = nn.Sequential(
-            nn.Linear(ego_dim, 64), nn.ReLU(),
-            nn.Dropout(p), # Ego state dropout
-            nn.Linear(64, 32),      nn.ReLU(),
-        )
-
-        self.fc_out = nn.Linear(512 + 32, out_dim)
-
-    def forward(self, x: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
-        v = F.relu(self.conv1(x))
-        v = F.relu(self.conv2(v))
-        v = F.relu(self.conv3(v))
-        v = self.flatten(v)
-        v = F.relu(self.fc_vis(v))
-        v = self.dropout_vis(v)
-        e = self.ego_fc(ego)
-        return self.fc_out(torch.cat([v, e], dim=1))
-
 
 class _ImpalaResBlock(nn.Module):
     """Pre-activation residual block used inside the IMPALA CNN."""
@@ -235,7 +186,7 @@ def _impala_stage(in_ch: int, out_ch: int) -> nn.Sequential:
     )
 
 
-class DrivingPolicyNet2(nn.Module):
+class DrivingPolicyNet(nn.Module):
     """
     IMPALA-style residual CNN backbone — the standard choice for visual RL.
 
@@ -283,8 +234,17 @@ class DrivingPolicyNet2(nn.Module):
             nn.Linear(256, out_dim),
         )
 
-    def forward(self, x: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
-        v = self.vis_head(self.cnn(x))
-        e = self.ego_fc(ego)
-        return self.fusion(torch.cat([v, e], dim=1))
+    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
+        v   = self.vis_head(self.cnn(x))
+        e   = self.ego_fc(ego)
+        out = self.fusion(torch.cat([v, e], dim=1))
+        if return_features:
+            return out, v
+        return out
+
+
+
+
+
+
 

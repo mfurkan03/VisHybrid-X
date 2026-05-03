@@ -5,8 +5,7 @@ Usage
 -----
 python src/visualize_test_predictions.py \
     --pred_dir  data/processed/dpt_pred \
-    --model_path models/policy_model_deep_best.pth \
-    --policy deep \
+    --model_path models/policy_model.pth \
     --image_size 84 \
     --num_samples 20 \
     --output visualizations/test_predictions.png
@@ -27,16 +26,15 @@ import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
 
-from models import DrivingPolicyNet, DrivingPolicyNet2, DepthEstimationModel
+from models import DrivingPolicyNet, DepthEstimationModel
 from policy.datasets import PrecomputedDepthDataset, MetaDriveRGBDataset
 from policy.trainer import apply_lane_mask, extract_features_frozen
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _load_model(model_path, policy, image_size, device):
-    model_cls = DrivingPolicyNet2 if policy == "deep" else DrivingPolicyNet
-    model = model_cls(image_size=image_size).to(device)
+def _load_model(model_path, image_size, device):
+    model = DrivingPolicyNet(image_size=image_size).to(device)
     ckpt = torch.load(model_path, map_location=device)
     if isinstance(ckpt, dict):
         key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
@@ -44,7 +42,7 @@ def _load_model(model_path, policy, image_size, device):
     else:
         model.load_state_dict(ckpt)
     model.eval()
-    print(f"[INFO] Loaded {model_cls.__name__} from {model_path}")
+    print(f"[INFO] Loaded DrivingPolicyNet from {model_path}")
     return model
 
 
@@ -87,7 +85,6 @@ def visualize(
     data_dir:    str,
     model_path:  str,
     dpt_path:    str,
-    policy:      str,
     image_size:  int,
     num_samples: int,
     output_path: str,
@@ -95,7 +92,7 @@ def visualize(
 ):
     random.seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = _load_model(model_path, policy, image_size, device)
+    model  = _load_model(model_path, image_size, device)
 
     # ── choose data source ──────────────────────────────────────────────────
     use_precomputed = (
@@ -228,8 +225,6 @@ if __name__ == "__main__":
     parser.add_argument("--model_path",  type=str, required=True)
     parser.add_argument("--dpt_path",    type=str, default="models/dpt_finetuned.pth",
                         help="DPT checkpoint (only needed when falling back to live inference).")
-    parser.add_argument("--policy",      type=str, default="standard",
-                        choices=["standard", "deep"])
     parser.add_argument("--image_size",  type=int, default=84)
     parser.add_argument("--num_samples", type=int, default=20)
     parser.add_argument("--output",      type=str, default="visualizations/test_predictions.png")
@@ -241,7 +236,6 @@ if __name__ == "__main__":
         data_dir    = args.data_dir,
         model_path  = args.model_path,
         dpt_path    = args.dpt_path,
-        policy      = args.policy,
         image_size  = args.image_size,
         num_samples = args.num_samples,
         output_path = args.output,
