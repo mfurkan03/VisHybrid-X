@@ -2,6 +2,7 @@
 policy/trainer.py – shared epoch loop, data loader builder, and feature extractor.
 """
 
+import csv
 import os
 
 import numpy as np
@@ -142,10 +143,23 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size):
 # ============================================================
 # SINGLE EPOCH
 # ============================================================
+def _apply_pixel_noise(x: torch.Tensor, noise_frac: float = 0.05) -> torch.Tensor:
+    """Replace a random `noise_frac` fraction of pixels with uniform [0,1] noise."""
+    B, C, H, W = x.shape
+    n_pixels = H * W
+    n_noisy  = max(1, int(n_pixels * noise_frac))
+    indices  = torch.randint(0, n_pixels, (B, n_noisy), device=x.device)
+    noise    = torch.rand(B, C, n_noisy, device=x.device)
+    out      = x.clone()
+    out.view(B, C, -1).scatter_(2, indices.unsqueeze(1).expand(B, C, n_noisy), noise)
+    return out
+
+
 def run_epoch(policy_model, loader, optimizer, device,
               use_precomputed, depth_estimator, is_train, desc,
               current_epoch: int = 999, curriculum_epochs: int = 10, fully_masked_epochs: int = 3,
-              image_size: int = None, scaler=None, lane_mask_prob: float = 0.0):
+              image_size: int = None, scaler=None, lane_mask_prob: float = 0.0,
+              pixel_noise_frac: float = 0.05):
     """Run one training or validation epoch. Returns (avg_loss, preds, trues)."""
     policy_model.train() if is_train else policy_model.eval()
     total_loss         = 0.0
@@ -183,6 +197,7 @@ def run_epoch(policy_model, loader, optimizer, device,
                 ego_t = torch.tensor(ego_np, dtype=torch.float32, device=device)
 
             if is_train:
+                combined = _apply_pixel_noise(combined, pixel_noise_frac)
                 optimizer.zero_grad()
 
             with torch.amp.autocast("cuda", enabled=use_amp):
@@ -207,6 +222,27 @@ def run_epoch(policy_model, loader, optimizer, device,
 
 
 # ============================================================
+# METRICS LOGGING
+# ============================================================
+_CSV_FIELDS = [
+    "tag", "epoch",
+    "train_loss", "val_loss",
+    "train_steering_mae", "val_steering_mae",
+    "val_steering_dir_acc", "val_brake_acc",
+    "val_active_turn_mae", "val_jitter_ratio", "val_steer_95th_pctl_err",
+    "lr",
+]
+
+def _log_metrics_csv(csv_path: str, row: dict) -> None:
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+# ============================================================
 # FULL TRAINING LOOP
 # ============================================================
 def train_loop(
@@ -227,10 +263,12 @@ def train_loop(
     fully_masked_epochs: int = 3,
     image_size: int = None,
     lane_mask_prob: float = 0.0,
+    pixel_noise_frac: float = 0.05,
 ) -> float:
     """Shared epoch loop used by train_policy and finetune_policy."""
     file_root, file_ext = os.path.splitext(model_path)
     best_path           = f"{file_root}_best{file_ext}"
+    metrics_csv_path    = f"{file_root}_metrics.csv"
     use_amp             = device.type == "cuda"
     scaler              = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -249,6 +287,7 @@ def train_loop(
             image_size=image_size,
             scaler=scaler,
             lane_mask_prob=lane_mask_prob,
+            pixel_noise_frac=pixel_noise_frac,
         )
         avg_val, val_pred, val_true = run_epoch(
             policy_model, val_loader, optimizer, device,
@@ -261,9 +300,10 @@ def train_loop(
             lane_mask_prob=0,
         )
 
-        tr_m  = compute_offline_metrics(tr_pred,  tr_true)
-        val_m = compute_offline_metrics(val_pred, val_true)
-        val_pred_m = compute_predictive_metrics(val_pred, val_true) # NEW
+        tr_m       = compute_offline_metrics(tr_pred,  tr_true)
+        val_m      = compute_offline_metrics(val_pred, val_true)
+        val_pred_m = compute_predictive_metrics(val_pred, val_true)
+        lr         = scheduler.get_last_lr()[0]
 
         print(
             f"[{tag}] Epoch [{epoch+1:02d}] "
@@ -271,11 +311,26 @@ def train_loop(
             f"Str MAE Tr/Val: {tr_m['steering_mae']:.4f}/{val_m['steering_mae']:.4f} | "
             f"Str Dir Acc: {val_m['steering_dir_acc']:.3f} | "
             f"Brake Acc: {val_m['brake_acc']:.3f} | "
-            f"Turn MAE: {val_pred_m['active_turn_mae']:.4f} | "  
-            f"Jitter: {val_pred_m['jitter_ratio']:.2f}x | "      
-            f"95th Pctl Error:  {val_pred_m['steer_95th_pctl_err']:.4f}"
-            f"LR: {scheduler.get_last_lr()[0]:.2e}"
+            f"Turn MAE: {val_pred_m['active_turn_mae']:.4f} | "
+            f"Jitter: {val_pred_m['jitter_ratio']:.2f}x | "
+            f"95th Pctl Error: {val_pred_m['steer_95th_pctl_err']:.4f} | "
+            f"LR: {lr:.2e}"
         )
+
+        _log_metrics_csv(metrics_csv_path, {
+            "tag":                    tag,
+            "epoch":                  epoch + 1,
+            "train_loss":             round(avg_train, 6),
+            "val_loss":               round(avg_val,   6),
+            "train_steering_mae":     round(tr_m["steering_mae"],          6),
+            "val_steering_mae":       round(val_m["steering_mae"],         6),
+            "val_steering_dir_acc":   round(val_m["steering_dir_acc"],     6),
+            "val_brake_acc":          round(val_m["brake_acc"],            6),
+            "val_active_turn_mae":    round(val_pred_m["active_turn_mae"], 6),
+            "val_jitter_ratio":       round(val_pred_m["jitter_ratio"],    6),
+            "val_steer_95th_pctl_err":round(val_pred_m["steer_95th_pctl_err"], 6),
+            "lr":                     lr,
+        })
 
         
         scheduler.step()
