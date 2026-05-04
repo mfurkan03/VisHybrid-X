@@ -68,7 +68,7 @@ def train_teacher(args):
         data_dir=args.data_dir, batch_size=args.batch_size,
     )
 
-    teacher   = DrivingPolicyNet(in_channels=4, image_size=args.image_size).to(device)
+    teacher   = DrivingPolicyNet(in_channels=2, image_size=args.image_size).to(device)
     optimizer = optim.AdamW(teacher.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_cosine_lr_lambda(args.epochs))
 
@@ -101,7 +101,7 @@ def train_student(args):
         data_dir=args.data_dir, batch_size=args.batch_size,
     )
 
-    teacher = DrivingPolicyNet(in_channels=4, image_size=args.image_size).to(device)
+    teacher = DrivingPolicyNet(in_channels=2, image_size=args.image_size).to(device)
     load_checkpoint(args.teacher_path, teacher, device=device)
     print(f"[INFO] Teacher loaded from {args.teacher_path}")
 
@@ -166,9 +166,9 @@ if __name__ == "__main__":
     # curriculum (student only, matches train_offline_policy.py defaults)
     parser.add_argument("--curriculum_epochs",   type=int,   default=40)
     parser.add_argument("--fully_masked_epochs", type=int,   default=8)
-    parser.add_argument("--lane_mask_prob",      type=float, default=0.05)
+    parser.add_argument("--lane_mask_prob",      type=float, default=0)
     # misc
-    parser.add_argument("--pixel_noise_frac", type=float, default=0.05)
+    parser.add_argument("--pixel_noise_frac", type=float, default=0.0)
     parser.add_argument("--patience",         type=int,   default=8)
     parser.add_argument("--resume_from",      type=str,   default=None,
                         help="Resume student training from an existing checkpoint")

@@ -5,6 +5,7 @@ policy/trainer.py – shared epoch loop, data loader builder, and feature extrac
 import csv
 import os
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -21,21 +22,20 @@ from utils.checkpoints import save_checkpoint
 # FEATURE EXTRACTION  (live DPT inference path)
 # ============================================================
 def _batch_lane_mask(rgb_tensor: torch.Tensor, threshold: float = 180 / 255.0) -> torch.Tensor:
-    """Vectorized lane mask for a whole batch — no per-image loops, no OpenCV."""
-    _, _, H, _ = rgb_tensor.shape
-    r, g, b = rgb_tensor[:, 0], rgb_tensor[:, 1], rgb_tensor[:, 2]
-
-    gray = 0.299 * r + 0.587 * g + 0.114 * b
-    gray[:, :int(H * 0.55), :] = 0.0
-    white_mask = gray >= threshold
-
-    # Golden + greyish-yellow: R > G is the core discriminator (road grey has R≈G, grass has G>R).
-    # (r - g) < 0.35 excludes orange/red. r > b avoids cool greys. Small margin on r > g + 0.02
-    # prevents floating-point ties with pure grey pixels from sneaking through.
-    yellow_mask = (r > g + 0.02) & (r > b) & ((r - g) < 0.35) & (r > 0.28)
-    yellow_mask[:, :int(H * 0.55), :] = False
-
-    return (white_mask | yellow_mask).float().unsqueeze(1)  # (B, 1, H, W)
+    """Per-image lane mask using OpenCV grayscale threshold (ROI = bottom 45% of frame)."""
+    B, _, H, W = rgb_tensor.shape
+    threshold_uint8 = int(threshold * 255)
+    masks = []
+    rgb_np = (rgb_tensor.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+    for i in range(B):
+        img = rgb_np[i]
+        roi = img.copy()
+        roi[:int(H * 0.55), :] = 0
+        gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+        _, mask = cv2.threshold(gray, threshold_uint8, 255, cv2.THRESH_BINARY)
+        masks.append(mask)
+    mask_t = torch.from_numpy(np.stack(masks, axis=0)).float() / 255.0  # (B, H, W)
+    return mask_t.unsqueeze(1).to(rgb_tensor.device)                     # (B, 1, H, W)
 
 
 def apply_lane_mask(
@@ -47,6 +47,7 @@ def apply_lane_mask(
     fully_masked_epochs: int = 3,
     image_size: int = None,
     always_lane_masked: bool = False,
+    two_channel: bool = False,
 ) -> torch.Tensor:
     if always_lane_masked and curriculum_epochs > 0:
         alpha = 0.0
@@ -62,13 +63,19 @@ def apply_lane_mask(
         rgb_tensor = rgb_tensor / 255.0
     rgb_tensor = rgb_tensor.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
 
-    if image_size:
-        rgb_tensor   = F.interpolate(rgb_tensor,   size=(image_size, image_size), mode='bilinear', align_corners=False)
-        depth_tensor = F.interpolate(depth_tensor, size=(image_size, image_size), mode='bilinear', align_corners=False)
+    mask = _batch_lane_mask(rgb_tensor)                              # (B, 1, H, W) at original res
 
-    mask = _batch_lane_mask(rgb_tensor)                              # (B, 1, H, W)
+    if two_channel:
+        if image_size:
+            mask         = F.interpolate(mask,         size=(image_size, image_size), mode='bilinear', align_corners=False)
+            depth_tensor = F.interpolate(depth_tensor, size=(image_size, image_size), mode='bilinear', align_corners=False)
+        return torch.cat([depth_tensor, mask], dim=1)                # (B, 2, H, W)
 
     blended = rgb_tensor * mask + rgb_tensor * (1.0 - mask) * alpha
+
+    if image_size:
+        blended      = F.interpolate(blended,      size=(image_size, image_size), mode='bilinear', align_corners=False)
+        depth_tensor = F.interpolate(depth_tensor, size=(image_size, image_size), mode='bilinear', align_corners=False)
 
     return torch.cat([depth_tensor, blended], dim=1)               # (B, 4, H, W)
 
@@ -82,9 +89,11 @@ def extract_features_frozen(
     fully_masked_epochs: int = 3,
     image_size: int = None,
     always_lane_masked: bool = False,
+    two_channel: bool = False,
 ):
+    print(rgb_batch.shape)
     with torch.no_grad():
-        depth_tensors = depth_estimator.predict_batch_with_grad(np.expand_dims(rgb_batch[0], 0))
+        depth_tensors = depth_estimator.predict_batch_with_grad(rgb_batch)
 
     for i in range(depth_tensors.shape[0]):
         d = depth_tensors[i, 0]
@@ -97,6 +106,7 @@ def extract_features_frozen(
         fully_masked_epochs=fully_masked_epochs,
         image_size=image_size,
         always_lane_masked=always_lane_masked,
+        two_channel=two_channel,
     )
 
     ego_zeros = torch.zeros(combined.shape[0], EGO_DIM, device=device)

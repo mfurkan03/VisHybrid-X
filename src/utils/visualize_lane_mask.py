@@ -63,10 +63,10 @@ def main(data_dir: str, n_frames: int, split: str, image_size: int = 84):
         for idx in indices:
             if frames_shown >= n_frames:
                 break
-            rgb = rgb_frames[idx]  # (H, W, 3) uint8
-            rgb = cv2.resize(rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+            rgb = rgb_frames[idx]  # (H, W, 3) uint8 — original resolution
             t   = rgb_np_to_tensor(rgb)
 
+            # Apply masks at original resolution
             white_m    = white_only_mask(t)
             combined_m = _batch_lane_mask(t)
 
@@ -81,6 +81,12 @@ def main(data_dir: str, n_frames: int, split: str, image_size: int = 84):
 
             n_yellow = yellow_pixels.sum()
             n_white  = white_m[0, 0].numpy().astype(bool).sum()
+
+            # Resize all images to image_size for display
+            rgb              = cv2.resize(rgb,              (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+            masked_white     = cv2.resize(masked_white,     (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+            masked_combined  = cv2.resize(masked_combined,  (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+            yellow_highlight = cv2.resize(yellow_highlight, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
             print(f"[{os.path.basename(fpath)} frame {idx}] "
                   f"white pixels: {n_white}  yellow pixels: {n_yellow}")
 

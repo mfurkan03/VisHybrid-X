@@ -27,7 +27,8 @@ def test_simulation(
     print("--- Online Evaluation (Simulation) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    policy_model = DrivingPolicyNet(in_channels=4, image_size=image_size).to(device)
+    in_channels  = 2 if policy == "teacher" else 4
+    policy_model = DrivingPolicyNet(in_channels=in_channels, image_size=image_size).to(device)
     print(f"[INFO] Policy: {policy}  ({policy_model.__class__.__name__})")
         
     ckpt = torch.load(model_path, map_location=device)
@@ -80,11 +81,13 @@ def test_simulation(
             rgb_img = np.array(rgb_img, dtype=np.uint8)
             # MetaDrive RGBCamera natively returns BGR, so we convert it to RGB
             rgb_img = rgb_img[..., ::-1].copy()
-
+            print(rgb_img.shape)
+            print(rgb_img[np.newaxis])
             input_tensor, _ = extract_features_frozen(
                 rgb_img[np.newaxis], depth_estimator,
                 image_size=image_size, device=device,
                 always_lane_masked=(policy == "teacher"),
+                two_channel=(policy == "teacher"),
             )
 
             ego_reading = extract_ego_state(env.agent, last_steer=last_steer)

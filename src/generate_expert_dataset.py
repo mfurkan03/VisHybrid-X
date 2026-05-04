@@ -3,7 +3,7 @@ generate_expert_dataset.py – collect expert demonstrations from MetaDrive in p
 
 Usage
 -----
-python generate_expert_dataset.py --episodes 100 --num_workers 4 --save_dir dataset
+python src/generate_expert_dataset.py --episodes 100 --num_workers 4 --save_dir dataset
 """
 
 import argparse
@@ -120,31 +120,30 @@ def _worker_collect(
                 applied_action[0] += random.uniform(-action_noise, action_noise)
 
             
-            if fps_counter.total_steps % 20 == 0:
-                reading = extract_ego_state(env.agent, last_steer=last_steer)
-                ego_states.append(reading.ego_model)
-                ego_states_full.append([
-                    reading.total_speed,
-                    reading.last_steer,
-                    reading.forward_speed,
-                    reading.lateral_speed,
-                    reading.heading_delta,
-                ])
-                frame_timestamps.append(reading.timestamp)
+            reading = extract_ego_state(env.agent, last_steer=last_steer)
+            ego_states.append(reading.ego_model)
+            ego_states_full.append([
+                reading.total_speed,
+                reading.last_steer,
+                reading.forward_speed,
+                reading.lateral_speed,
+                reading.heading_delta,
+            ])
+            frame_timestamps.append(reading.timestamp)
 
-                raw_frames = {}
-                for rgb_name, depth_name in zip(rgb_cam_names, depth_cam_names):
-                    # process_fn appends to the `observations` dict internally
-                    rgb_raw, depth_raw = process_fn(env, rgb_name, depth_name, observations)
-                    raw_frames[rgb_name] = (rgb_raw, depth_raw)
+            raw_frames = {}
+            for rgb_name, depth_name in zip(rgb_cam_names, depth_cam_names):
+                # process_fn appends to the `observations` dict internally
+                rgb_raw, depth_raw = process_fn(env, rgb_name, depth_name, observations)
+                raw_frames[rgb_name] = (rgb_raw, depth_raw)
 
-                actions.append(expert_action.copy())
+            actions.append(expert_action.copy())
 
-                # Visualize only on the collected frames to avoid UnboundLocalError
-                if visualize:
-                    quit_requested = show_cameras(raw_frames, rgb_cam_names, depth_cam_names, fps_counter)
-                    if quit_requested:
-                        done = True
+            # Visualize only on the collected frames to avoid UnboundLocalError
+            if visualize:
+                quit_requested = show_cameras(raw_frames, rgb_cam_names, depth_cam_names, fps_counter)
+                if quit_requested:
+                    done = True
             # ====================================================
 
             last_steer = float(expert_action[0])
@@ -216,7 +215,7 @@ def collect_expert_data_parallel(
     split_ratios   = (0.8, 0.1, 0.1),
     repeat_action    = 1,
     max_step         = 3000,
-    traffic_density  = 0.15,
+    traffic_density  = 0,
 ):
     os.makedirs(os.path.join(save_dir, "train"), exist_ok=True)
     os.makedirs(os.path.join(save_dir, "val"),   exist_ok=True)

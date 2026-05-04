@@ -4,7 +4,7 @@ policy/distillation.py – Teacher-Student knowledge distillation training loops
 Both teacher and student are DrivingPolicyNet(in_channels=4), so their visual streams
 are directly comparable for feature distillation.  The only difference is the input:
 
-  Teacher input : depth + lane-masked RGB (3 ch, non-lane pixels zeroed out — always)
+  Teacher input : depth + binary lane mask (2 ch total — always)
   Student input : depth + curriculum-blended RGB (3 ch, transitioning from masked → raw)
 
 Both inputs are produced by apply_lane_mask(); the teacher always sets
@@ -99,7 +99,7 @@ def run_teacher_epoch(
             depth_t   = depth_t.to(device)
             actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
             ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
-            teacher_in = apply_lane_mask(depth_t, rgb_np, device, always_lane_masked=True, image_size=image_size)
+            teacher_in = apply_lane_mask(depth_t, rgb_np, device, always_lane_masked=True, image_size=image_size, two_channel=True)
 
             if is_train:
                 if pixel_noise_frac > 0:
@@ -174,8 +174,8 @@ def run_student_epoch(
                 always_lane_masked=force_masked,
             )
 
-            # Teacher input: depth + lane-masked RGB (4-ch, always fully masked)
-            teacher_in = apply_lane_mask(depth_t, rgb_np, device, always_lane_masked=True, image_size=image_size)
+            # Teacher input: depth + binary lane mask (2-ch, always fully masked)
+            teacher_in = apply_lane_mask(depth_t, rgb_np, device, always_lane_masked=True, image_size=image_size, two_channel=True)
 
             if is_train:
                 if pixel_noise_frac > 0:
