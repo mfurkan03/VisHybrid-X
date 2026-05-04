@@ -19,7 +19,7 @@ import torch
 from metadrive import MetaDriveEnv
 from metadrive.component.sensors.rgb_camera import RGBCamera
 
-from models import DepthEstimationModel, DrivingPolicyNet, extract_ego_state
+from models import DepthEstimationModel, build_policy, extract_ego_state
 from policy.trainer import extract_features_frozen
 from data.cameras import build_cameras
 
@@ -29,11 +29,12 @@ def run_simulation(
     dpt_path:     str,
     num_episodes: int = 1,
     image_size:   int = None,
+    arch:         str = "simple",
 ):
     print("--- Online Evaluation (Simulation) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
+    policy_model = build_policy(arch, image_size).to(device)
     ckpt = torch.load(model_path, map_location=device)
     if isinstance(ckpt, dict):
         key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
@@ -173,6 +174,7 @@ if __name__ == "__main__":
     parser.add_argument("--dpt_path",   type=str,   default="models/dpt_finetuned.pth")
     parser.add_argument("--episodes",   type=int,   default=1)
     parser.add_argument("--image_size", type=int,   default=84)
+    parser.add_argument("--arch",       type=str,   default="simple", choices=["simple", "impala"])
     args = parser.parse_args()
 
     run_simulation(
@@ -180,4 +182,5 @@ if __name__ == "__main__":
         dpt_path     = args.dpt_path,
         num_episodes = args.episodes,
         image_size   = args.image_size,
+        arch         = args.arch,
     )

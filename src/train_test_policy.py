@@ -34,7 +34,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models import DepthEstimationModel, DrivingPolicyNet
+from models import DepthEstimationModel, build_policy
 from policy.datasets import PrecomputedDepthDataset, MetaDriveRGBDataset
 from policy.losses import custom_driving_loss, compute_offline_metrics
 from policy.trainer import build_loaders, train_loop, extract_features_frozen
@@ -57,6 +57,7 @@ def train_policy(
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
     image_size: int = None,
+    arch: str = "simple",
 ):
     print("--- Phase 2: Training Driving Policy (from scratch) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -68,9 +69,9 @@ def train_policy(
 
     train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator)
 
-    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
+    policy_model = build_policy(arch, image_size).to(device)
     optimizer    = optim.AdamW(policy_model.parameters(), lr=lr)
-    scheduler    = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-fully_masked_epochs, eta_min=lr*10**-2) # 3 epochs less steps for scheduler 
+    scheduler    = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-fully_masked_epochs, eta_min=lr*10**-2) # 3 epochs less steps for scheduler
 
     train_loop(
         policy_model, device, train_loader, val_loader,
@@ -102,6 +103,7 @@ def finetune_policy(
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
     image_size: int = None,
+    arch: str = "simple",
 ):
     """
     Fine-tune (or resume) a previously saved policy model.
@@ -122,7 +124,7 @@ def finetune_policy(
 
     train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator)
 
-    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
+    policy_model = build_policy(arch, image_size).to(device)
     if freeze_bb:
         freeze_backbone(policy_model)
 
@@ -167,11 +169,12 @@ def test_policy(
     data_dir:   str,
     pred_dir:   str = None,
     image_size: int = None,
+    arch: str = "simple",
 ):
     print("--- Phase 3: Offline Testing Driving Policy ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    policy_model = DrivingPolicyNet(image_size=image_size).to(device)
+    policy_model = build_policy(arch, image_size).to(device)
     ckpt = torch.load(model_path, map_location=device)
     if isinstance(ckpt, dict):
         key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
@@ -267,6 +270,7 @@ if __name__ == "__main__":
     parser.add_argument("--curriculum_epochs", type=int, default=10)
     parser.add_argument("--fully_masked_epochs", type=int, default=3)
     parser.add_argument("--image_size", type=int, default=84)
+    parser.add_argument("--arch", type=str, default="simple", choices=["simple", "impala"])
     args = parser.parse_args()
 
     if args.mode in ("train", "all"):
@@ -274,7 +278,8 @@ if __name__ == "__main__":
                      args.dpt_path, args.data_dir, args.lr, pred_dir=args.pred_dir,
                      curriculum_epochs=args.curriculum_epochs,
                      fully_masked_epochs=args.fully_masked_epochs,
-                     image_size=args.image_size)
+                     image_size=args.image_size,
+                     arch=args.arch)
 
     if args.mode == "finetune":
         if args.finetune_from is None:
@@ -294,8 +299,9 @@ if __name__ == "__main__":
             curriculum_epochs=args.curriculum_epochs,
             fully_masked_epochs=args.fully_masked_epochs,
             image_size=args.image_size,
+            arch=args.arch,
         )
 
     if args.mode in ("test", "all"):
         test_policy(args.model_path, args.dpt_path, args.data_dir,
-                    pred_dir=args.pred_dir, image_size=args.image_size)
+                    pred_dir=args.pred_dir, image_size=args.image_size, arch=args.arch)
