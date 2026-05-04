@@ -72,10 +72,11 @@ class PrecomputedDepthDataset(Dataset):
     def __init__(self, pred_dir: str, split: str = "train"):
         split_dir         = os.path.join(pred_dir, split)
         files             = sorted(glob.glob(os.path.join(split_dir, "*.npz")))
-        self.depth_frames: list = []
-        self.rgb_frames:   list = []
-        self.actions:      list = []
-        self.ego_states:   list = []
+        self.depth_frames:    list = []
+        self.rgb_frames:      list = []
+        self.actions:         list = []
+        self.ego_states:      list = []
+        self.ego_full_states: list = []
 
         skipped = 0
         for f in files:
@@ -96,17 +97,20 @@ class PrecomputedDepthDataset(Dataset):
                 print(f"[WARNING] Missing required keys in {f}, skipping.")
                 continue
 
-            depths  = data["depth_pred"]         
-            rgbs    = data["rgb"]                     
+            depths  = data["depth_pred"]
+            rgbs    = data["rgb"]
             actions = data["action"]
             n       = min(len(depths), len(rgbs), len(actions))
             ego     = (data["ego_state"][:n] if "ego_state" in data.files
                        else np.zeros((n, EGO_DIM), dtype=np.float32))
+            ego_full = (data["ego_state_full"][:n] if "ego_state_full" in data.files
+                        else np.zeros((n, 5), dtype=np.float32))
 
             self.depth_frames.extend(depths[:n])
             self.rgb_frames.extend(rgbs[:n])
             self.actions.extend(actions[:n])
             self.ego_states.extend(ego)
+            self.ego_full_states.extend(ego_full)
 
         if skipped:
             print(f"[WARNING] Skipped {skipped} file(s) with old format. "
@@ -121,8 +125,9 @@ class PrecomputedDepthDataset(Dataset):
 
     def __getitem__(self, idx):
         return (
-            self.depth_frames[idx],                       
-            self.rgb_frames[idx],                         
-            np.array(self.actions[idx],    dtype=np.float32),
-            np.array(self.ego_states[idx], dtype=np.float32),
+            self.depth_frames[idx],
+            self.rgb_frames[idx],
+            np.array(self.actions[idx],         dtype=np.float32),
+            np.array(self.ego_states[idx],      dtype=np.float32),
+            np.array(self.ego_full_states[idx], dtype=np.float32),
         )

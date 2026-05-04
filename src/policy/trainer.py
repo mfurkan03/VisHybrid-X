@@ -12,7 +12,8 @@ from tqdm import tqdm
 
 from models import EGO_DIM
 from policy.datasets import MetaDriveRGBDataset, PrecomputedDepthDataset
-from policy.losses import custom_driving_loss, compute_offline_metrics
+from policy.losses import (custom_driving_loss, compute_offline_metrics,
+                           compute_predictive_metrics, compute_heading_metrics)
 from utils.checkpoints import save_checkpoint
 
 
@@ -132,15 +133,13 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
         val_ds   = PrecomputedDepthDataset(pred_dir=pred_dir, split="val")
 
         def collate_fn(batch):
-            # Dataset now yields (depth, rgb, actions, egos) so lane mask can be
-            # applied at training time.  rgb is kept as numpy to avoid GPU pressure
-            # in the DataLoader workers.
-            depths, rgbs, actions, egos = zip(*batch)
+            depths, rgbs, actions, egos, ego_fulls = zip(*batch)
             return (
                 torch.tensor(np.stack(depths), dtype=torch.float32),
                 np.stack(rgbs),
                 np.stack(actions),
                 np.stack(egos),
+                np.stack(ego_fulls),
             )
     else:
         train_ds = MetaDriveRGBDataset(data_dir=data_dir, split="train")
@@ -148,7 +147,9 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
 
         def collate_fn(batch):
             rgbs, actions, egos = zip(*batch)
-            return np.stack(rgbs), np.stack(actions), np.stack(egos)
+            n = len(actions)
+            return (np.stack(rgbs), np.stack(actions), np.stack(egos),
+                    np.zeros((n, 5), dtype=np.float32))
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  collate_fn=collate_fn)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
@@ -162,17 +163,16 @@ def run_epoch(policy_model, loader, optimizer, device,
               use_precomputed, depth_estimator, is_train, desc,
               current_epoch: int = 999, curriculum_epochs: int = 10, fully_masked_epochs: int = 3,
               image_size: int = None):
-    """Run one training or validation epoch. Returns (avg_loss, preds, trues)."""
+    """Run one training or validation epoch. Returns (avg_loss, preds, trues, ego_states, ego_fulls)."""
     policy_model.train() if is_train else policy_model.eval()
-    total_loss          = 0.0
-    all_pred, all_true  = [], []
+    total_loss                           = 0.0
+    all_pred, all_true, all_ego, all_ego_full = [], [], [], []
 
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     with ctx:
         for batch in tqdm(loader, desc=desc, leave=False):
             if use_precomputed:
-                # depth_t: (B, 1, H, W) — lane mask added here at training time
-                depth_t, rgb_np, actions_np, ego_np = batch
+                depth_t, rgb_np, actions_np, ego_np, ego_full_np = batch
                 depth_t   = depth_t.to(device)
                 actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
                 ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
@@ -182,9 +182,9 @@ def run_epoch(policy_model, loader, optimizer, device,
                     curriculum_epochs=curriculum_epochs,
                     fully_masked_epochs=fully_masked_epochs,
                     image_size=image_size
-                )  # (B, 4, image_size, image_size)
+                )
             else:
-                rgb_np, actions_np, ego_np = batch
+                rgb_np, actions_np, ego_np, ego_full_np = batch
                 actions_t   = torch.tensor(actions_np, dtype=torch.float32, device=device)
                 combined, _ = extract_features_frozen(
                     rgb_np, depth_estimator, device,
@@ -193,7 +193,7 @@ def run_epoch(policy_model, loader, optimizer, device,
                     fully_masked_epochs=fully_masked_epochs,
                     image_size=image_size
                 )
-                ego_t       = torch.tensor(ego_np, dtype=torch.float32, device=device)
+                ego_t = torch.tensor(ego_np, dtype=torch.float32, device=device)
 
             if is_train:
                 optimizer.zero_grad()
@@ -208,9 +208,13 @@ def run_epoch(policy_model, loader, optimizer, device,
             total_loss += loss.item()
             all_pred.append(pred.detach().cpu().numpy())
             all_true.append(actions_np)
+            all_ego.append(ego_np)
+            all_ego_full.append(ego_full_np)
 
     avg_loss = total_loss / max(len(loader), 1)
-    return avg_loss, np.concatenate(all_pred), np.concatenate(all_true)
+    return (avg_loss,
+            np.concatenate(all_pred), np.concatenate(all_true),
+            np.concatenate(all_ego),  np.concatenate(all_ego_full))
 
 
 # ============================================================
@@ -239,7 +243,7 @@ def train_loop(
     best_path           = f"{file_root}_best{file_ext}"
 
     for epoch in range(start_epoch, start_epoch + epochs):
-        avg_train, tr_pred, tr_true = run_epoch(
+        avg_train, tr_pred, tr_true, tr_ego, _ = run_epoch(
             policy_model, train_loader, optimizer, device,
             use_precomputed, depth_estimator, is_train=True,
             desc=f"[{tag}] Epoch {epoch+1}/{start_epoch+epochs} [Train]",
@@ -248,7 +252,7 @@ def train_loop(
             fully_masked_epochs=fully_masked_epochs,
             image_size=image_size
         )
-        avg_val, val_pred, val_true = run_epoch(
+        avg_val, val_pred, val_true, val_ego, val_ego_full = run_epoch(
             policy_model, val_loader, optimizer, device,
             use_precomputed, depth_estimator, is_train=False,
             desc=f"[{tag}] Epoch {epoch+1}/{start_epoch+epochs} [Val]",
@@ -258,8 +262,10 @@ def train_loop(
             image_size=image_size
         )
 
-        tr_m  = compute_offline_metrics(tr_pred,  tr_true)
-        val_m = compute_offline_metrics(val_pred, val_true)
+        tr_m   = compute_offline_metrics(tr_pred, tr_true)
+        val_m  = compute_offline_metrics(val_pred, val_true)
+        val_pm = compute_predictive_metrics(val_pred, val_true, val_ego)
+        val_hm = compute_heading_metrics(val_pred, val_true, val_ego_full)
         print(
             f"[{tag}] Epoch [{epoch+1:02d}] "
             f"Loss Tr/Val: {avg_train:.4f}/{avg_val:.4f} | "
@@ -268,6 +274,21 @@ def train_loop(
             f"Brake Acc: {val_m['brake_acc']:.3f} | "
             f"LR: {scheduler.get_last_lr()[0]:.2e}"
         )
+        print(
+            f"         P95 Steer Err: {val_pm['steer_p95_error']:.4f} | "
+            f"Turn MAE: {val_pm['active_turn_mae']:.4f} | "
+            f"Crit Turn MAE: {val_pm['critical_turn_mae']:.4f} | "
+            f"Jitter: {val_pm['jitter_ratio']:.3f} | "
+            f"OOB: {val_pm['out_of_bounds_rate']:.3f} | "
+            f"SpeedWt MAE: {val_pm['speed_weighted_steer_mae']:.4f} | "
+            f"BrakeAntic: {val_pm['pre_brake_anticipation']:.3f}"
+        )
+        if val_hm:
+            print(
+                f"         HeadDirAcc: {val_hm['heading_dir_acc']:.3f} | "
+                f"HeadMAE: {val_hm['heading_delta_mae']:.4f} | "
+                f"WinDiv Mean/P95: {val_hm['window_heading_div_mean']:.4f}/{val_hm['window_heading_div_p95']:.4f}"
+            )
         if epoch>fully_masked_epochs:
             scheduler.step()
 

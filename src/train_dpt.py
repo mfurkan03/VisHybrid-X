@@ -324,6 +324,8 @@ def _process_episode(ep_path: str, out_path: str, dpt_path: str, batch_size: int
     save_dict = {"depth_pred": depth_preds, "rgb": rgb_frames}
     if "ego_state" in data.files:
         save_dict["ego_state"] = data["ego_state"]
+    if "ego_state_full" in data.files:
+        save_dict["ego_state_full"] = data["ego_state_full"]
     if actions is not None:
         save_dict["action"] = actions
 

@@ -177,7 +177,7 @@ class DrivingPolicyNet(nn.Module):
     Ego input: [total_speed, last_steer]
     """
 
-    def __init__(self, in_channels: int = 4, out_dim: int = 2, ego_dim: int = EGO_DIM, p: float = 0.5, image_size: int = None):
+    def __init__(self, in_channels: int = 4, out_dim: int = 2, ego_dim: int = EGO_DIM, p: float = 0.2, image_size: int = None):
         super().__init__()
 
         self.conv1   = nn.Conv2d(in_channels, 32, kernel_size=8, stride=4)
@@ -249,21 +249,25 @@ class ImpalaNet(nn.Module):
     - MaxPool stages → better spatial information retention than strided convs
     - Pre-activation ReLU in residual blocks → smoother gradient flow
 
-    Visual stream  : 3 IMPALA stages (16→32→32 ch) → 512-d feature
+    Visual stream  : 3 IMPALA stages (32→64→64 ch) → 512-d shared feature
     Ego stream     : 2-layer MLP                    →  32-d feature
-    Fusion head    : 2-layer MLP                    →   2-d output [steer, accel]
+    Steering head  : 2-layer MLP (544→128→1)        →  steer output
+    Accel head     : 2-layer MLP (544→128→1)        →  accel output
+
+    Dual heads let the steering and acceleration branches specialise
+    independently from the shared visual representation.
 
     RL note: call model.train() during gradient updates and model.eval()
     during rollout collection — Dropout is the only stateful layer.
     """
 
-    def __init__(self, in_channels: int = 4, out_dim: int = 2, ego_dim: int = EGO_DIM, p: float = 0.5, image_size: int = None):
+    def __init__(self, in_channels: int = 4, out_dim: int = 2, ego_dim: int = EGO_DIM, p: float = 0.3, image_size: int = None):
         super().__init__()
 
         self.cnn = nn.Sequential(
-            _impala_stage(in_channels, 16),
-            _impala_stage(16, 32),
-            _impala_stage(32, 32),
+            _impala_stage(in_channels, 32),
+            _impala_stage(32, 64),
+            _impala_stage(64, 64),
             nn.ReLU(),
             nn.Flatten(),
         )
@@ -272,8 +276,8 @@ class ImpalaNet(nn.Module):
             dummy         = torch.zeros(1, in_channels, image_size, image_size)
             flattened_dim = self.cnn(dummy).shape[1]
 
-        self.vis_head = nn.Sequential(
-            nn.Linear(flattened_dim, 512), nn.ReLU(), nn.Dropout(p),
+        self.vis_proj = nn.Sequential(
+            nn.Linear(flattened_dim, 512), nn.ReLU(),
         )
 
         self.ego_fc = nn.Sequential(
@@ -281,15 +285,21 @@ class ImpalaNet(nn.Module):
             nn.Linear(64, 32),      nn.ReLU(),
         )
 
-        self.fusion = nn.Sequential(
-            nn.Linear(512 + 32, 256), nn.ReLU(), nn.Dropout(p),
-            nn.Linear(256, out_dim),
+        merged_dim = 512 + 32
+        self.steer_head = nn.Sequential(
+            nn.Linear(merged_dim, 128), nn.ReLU(), nn.Dropout(p),
+            nn.Linear(128, 1),
+        )
+        self.accel_head = nn.Sequential(
+            nn.Linear(merged_dim, 128), nn.ReLU(), nn.Dropout(p),
+            nn.Linear(128, 1),
         )
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
-        v = self.vis_head(self.cnn(x))
+        v = self.vis_proj(self.cnn(x))
         e = self.ego_fc(ego)
-        return self.fusion(torch.cat([v, e], dim=1))
+        merged = torch.cat([v, e], dim=1)
+        return torch.cat([self.steer_head(merged), self.accel_head(merged)], dim=1)
 
 
 def build_policy(arch: str = "simple", image_size: int = None) -> nn.Module:

@@ -36,7 +36,8 @@ from tqdm import tqdm
 
 from models import DepthEstimationModel, build_policy
 from policy.datasets import PrecomputedDepthDataset, MetaDriveRGBDataset
-from policy.losses import custom_driving_loss, compute_offline_metrics
+from policy.losses import (custom_driving_loss, compute_offline_metrics,
+                           compute_predictive_metrics, compute_heading_metrics)
 from policy.trainer import build_loaders, train_loop, extract_features_frozen
 from utils.checkpoints import (
     load_checkpoint, freeze_backbone, print_trainable_params
@@ -191,19 +192,22 @@ def test_policy(
         from policy.trainer import apply_lane_mask
         test_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="test")
         def collate_fn(batch):
-            depths, rgbs, actions, egos = zip(*batch)
+            depths, rgbs, actions, egos, ego_fulls = zip(*batch)
             return (
                 torch.tensor(np.stack(depths), dtype=torch.float32),
                 np.stack(rgbs),
                 np.stack(actions),
                 np.stack(egos),
+                np.stack(ego_fulls),
             )
     else:
         depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
         test_ds = MetaDriveRGBDataset(data_dir=data_dir, split="test")
         def collate_fn(batch):
             rgbs, actions, egos = zip(*batch)
-            return np.stack(rgbs), np.stack(actions), np.stack(egos)
+            n = len(actions)
+            return (np.stack(rgbs), np.stack(actions), np.stack(egos),
+                    np.zeros((n, 5), dtype=np.float32))
 
     if len(test_ds) == 0:
         print("[WARN] No test samples found.")
@@ -211,18 +215,18 @@ def test_policy(
 
     test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, collate_fn=collate_fn)
     test_loss   = 0.0
-    test_pred, test_true = [], []
+    test_pred, test_true, test_ego, test_ego_full = [], [], [], []
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Testing"):
             if use_precomputed:
-                depth_t, rgb_np, actions_np, ego_np = batch
+                depth_t, rgb_np, actions_np, ego_np, ego_full_np = batch
                 depth_t   = depth_t.to(device)
                 actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
                 ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
-                combined  = apply_lane_mask(depth_t, rgb_np, device)
+                combined  = apply_lane_mask(depth_t, rgb_np, device, image_size=image_size)
             else:
-                rgb_np, actions_np, ego_np = batch
+                rgb_np, actions_np, ego_np, ego_full_np = batch
                 actions_t   = torch.tensor(actions_np, dtype=torch.float32, device=device)
                 combined, _ = extract_features_frozen(rgb_np, depth_estimator, device, image_size=image_size)
                 ego_t       = torch.tensor(ego_np, dtype=torch.float32, device=device)
@@ -231,22 +235,43 @@ def test_policy(
             test_loss += custom_driving_loss(pred, actions_t).item()
             test_pred.append(pred.cpu().numpy())
             test_true.append(actions_np)
+            test_ego.append(ego_np)
+            test_ego_full.append(ego_full_np)
 
-    test_pred_np  = np.concatenate(test_pred, axis=0)
-    test_true_np  = np.concatenate(test_true, axis=0)
-    test_metrics  = compute_offline_metrics(test_pred_np, test_true_np)
+    test_pred_np     = np.concatenate(test_pred,     axis=0)
+    test_true_np     = np.concatenate(test_true,     axis=0)
+    test_ego_np      = np.concatenate(test_ego,      axis=0)
+    test_ego_full_np = np.concatenate(test_ego_full, axis=0)
+
+    test_m   = compute_offline_metrics(test_pred_np, test_true_np)
+    test_pm  = compute_predictive_metrics(test_pred_np, test_true_np, test_ego_np)
+    test_hm  = compute_heading_metrics(test_pred_np, test_true_np, test_ego_full_np)
     avg_test_loss = test_loss / len(test_loader)
 
     print(f"\n=== OFFLINE SUMMARY ===")
-    print(f"Test Loss:        {avg_test_loss:.4f}")
-    print(f"Steer MSE:        {test_metrics['steering_mse']:.4f}")
-    print(f"Accel MSE:        {test_metrics['accel_mse']:.4f}")
-    print(f"Steer MAE:        {test_metrics['steering_mae']:.4f}")
-    print(f"Accel MAE:        {test_metrics['accel_mae']:.4f}")
-    print(f"Steer Dir Acc:    {test_metrics['steering_dir_acc']*100:.1f}%")
-    print(f"Accel Dir Acc:    {test_metrics['direction_acc']*100:.1f}%")
-    print(f"Braking Acc:      {test_metrics['brake_acc']*100:.1f}%")
-    print(f"Steering Corr:    {test_metrics['steering_corr']:.4f}")
+    print(f"Test Loss:              {avg_test_loss:.4f}")
+    print(f"Steer MSE:              {test_m['steering_mse']:.4f}")
+    print(f"Accel MSE:              {test_m['accel_mse']:.4f}")
+    print(f"Steer MAE:              {test_m['steering_mae']:.4f}")
+    print(f"Accel MAE:              {test_m['accel_mae']:.4f}")
+    print(f"Steer Dir Acc:          {test_m['steering_dir_acc']*100:.1f}%")
+    print(f"Accel Dir Acc:          {test_m['direction_acc']*100:.1f}%")
+    print(f"Braking Acc:            {test_m['brake_acc']*100:.1f}%")
+    print(f"Steering Corr:          {test_m['steering_corr']:.4f}")
+    print(f"\n--- Predictive Metrics ---")
+    print(f"P95 Steer Error:        {test_pm['steer_p95_error']:.4f}")
+    print(f"Active Turn MAE:        {test_pm['active_turn_mae']:.4f}")
+    print(f"Critical Turn MAE:      {test_pm['critical_turn_mae']:.4f}")
+    print(f"Jitter Ratio:           {test_pm['jitter_ratio']:.3f}  (1.0=expert)")
+    print(f"Out-of-Bounds Rate:     {test_pm['out_of_bounds_rate']*100:.1f}%")
+    print(f"Speed-Weighted MAE:     {test_pm['speed_weighted_steer_mae']:.4f}")
+    print(f"Pre-Brake Anticipation: {test_pm['pre_brake_anticipation']*100:.1f}%")
+    if test_hm:
+        print(f"\n--- Heading Metrics ---")
+        print(f"Heading Dir Acc:        {test_hm['heading_dir_acc']*100:.1f}%")
+        print(f"Heading Delta MAE:      {test_hm['heading_delta_mae']:.4f}")
+        print(f"Window Div Mean:        {test_hm['window_heading_div_mean']:.4f}")
+        print(f"Window Div P95:         {test_hm['window_heading_div_p95']:.4f}")
 
 
 # ============================================================

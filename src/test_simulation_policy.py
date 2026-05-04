@@ -84,7 +84,7 @@ def run_simulation(
             rgb_img = rgb_img[..., ::-1].copy()
 
             combined_tensor, _ = extract_features_frozen(
-                rgb_img[np.newaxis], depth_estimator, image_size=image_size, device=device
+                rgb_img[np.newaxis], depth_estimator, image_size=image_size,current_epoch=0, device=device
             )
 
             ego_reading = extract_ego_state(env.agent, last_steer=last_steer)
