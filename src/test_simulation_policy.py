@@ -16,6 +16,7 @@ from metadrive import MetaDriveEnv
 from models import DepthEstimationModel, DrivingPolicyNet, DrivingPolicyNetFast, extract_ego_state
 from policy.trainer import extract_features_frozen
 from data.cameras import build_cameras
+from utils.checkpoints import detect_arch_from_ckpt
 
 def test_simulation(
     model_path:   str,
@@ -23,28 +24,34 @@ def test_simulation(
     num_episodes: int,
     image_size:   int  = None,
     policy:       str  = "standard",
-    use_ego:      bool = True,
-    use_depth:    bool = True,
-    fast:         bool = False,
+    use_ego       = None,   # None → auto-detect from checkpoint; True/False → override
+    use_depth     = None,   # None → auto-detect from checkpoint; True/False → override
+    fast          = None,   # None → auto-detect from checkpoint; True → force fast arch
 ):
     print("--- Online Evaluation (Simulation) ---")
-    print(f"[INFO] policy={policy}  use_ego={use_ego}  use_depth={use_depth}  fast={fast}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    in_channels  = 3 if not use_depth else 4
-    ModelClass   = DrivingPolicyNetFast if fast else DrivingPolicyNet
-    policy_model = ModelClass(in_channels=in_channels, image_size=image_size, use_ego=use_ego).to(device)
-    print(f"[INFO] Architecture: {policy_model.__class__.__name__}  in_channels={in_channels}")
-
+    # ── Auto-detect architecture from the checkpoint ──────────────────────────
     ckpt = torch.load(model_path, map_location=device)
-    if isinstance(ckpt, dict):
-        key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
-        policy_model.load_state_dict(ckpt[key] if key else ckpt)
-    else:
-        policy_model.load_state_dict(ckpt)
+    arch = detect_arch_from_ckpt(ckpt)
+    print(f"[INFO] Checkpoint arch: class={arch['class']}  use_ego={arch['use_ego']}  in_channels={arch['in_channels']}")
+
+    # CLI flags override auto-detected values when explicitly provided (not None)
+    is_fast     = bool(fast)    or (arch["class"] == "DrivingPolicyNetFast")
+    resolved_ego   = arch["use_ego"]     if use_ego   is None else use_ego
+    resolved_inch  = arch["in_channels"] if use_depth is None else (3 if not use_depth else arch["in_channels"])
+    resolved_depth = resolved_inch != 3
+
+    print(f"[INFO] Resolved: fast={is_fast}  use_ego={resolved_ego}  use_depth={resolved_depth}  policy={policy}")
+
+    ModelClass   = DrivingPolicyNetFast if is_fast else DrivingPolicyNet
+    policy_model = ModelClass(in_channels=resolved_inch, image_size=image_size, use_ego=resolved_ego).to(device)
+
+    key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
+    policy_model.load_state_dict(ckpt[key] if key else ckpt)
     policy_model.eval()
 
-    depth_estimator = DepthEstimationModel(finetuned_path=dpt_path) if use_depth else None
+    depth_estimator = DepthEstimationModel(finetuned_path=dpt_path) if resolved_depth else None
 
     angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(1)
     rgb_name = rgb_cam_names[0]
@@ -91,11 +98,11 @@ def test_simulation(
                 rgb_img[np.newaxis], depth_estimator,
                 image_size=image_size, device=device,
                 always_lane_masked=(policy == "teacher"),
-                use_depth=use_depth,
+                use_depth=resolved_depth,
             )
 
             ego_reading = extract_ego_state(env.agent, last_steer=last_steer)
-            if use_ego:
+            if resolved_ego:
                 ego_t = torch.tensor(ego_reading.ego_model, dtype=torch.float32, device=device).unsqueeze(0)
             else:
                 ego_t = torch.zeros(1, 2, dtype=torch.float32, device=device)
@@ -105,7 +112,7 @@ def test_simulation(
             last_steer = float(pred_action[0])
 
             # HUD visualisation
-            if use_depth:
+            if resolved_depth:
                 depth_uint8 = (input_tensor[0, 0].cpu().numpy() * 255).astype(np.uint8)
                 left_panel  = cv2.resize(cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO), (400, 400))
                 blended_rgb = np.transpose(input_tensor[0, 1:4].cpu().numpy(), (1, 2, 0))
@@ -113,7 +120,7 @@ def test_simulation(
                 left_panel  = np.zeros((400, 400, 3), dtype=np.uint8)
                 blended_rgb = np.transpose(input_tensor[0, 0:3].cpu().numpy(), (1, 2, 0))
             right_panel = cv2.resize(cv2.cvtColor((blended_rgb * 255).astype(np.uint8), cv2.COLOR_RGB2BGR), (400, 400))
-            win_title   = "Depth | Lane-Masked RGB  (Teacher)" if policy == "teacher" else ("No-Depth | RGB" if not use_depth else "Depth | RGB")
+            win_title   = "Depth | Lane-Masked RGB  (Teacher)" if policy == "teacher" else ("No-Depth | RGB" if not resolved_depth else "Depth | RGB")
 
             hud = np.zeros((40, 800, 3), dtype=np.uint8)
             cv2.putText(
@@ -180,13 +187,20 @@ if __name__ == "__main__":
     parser.add_argument("--image_size", type=int,   default=84)
     parser.add_argument("--policy",     type=str,   default="standard", choices=["standard", "teacher"],
                         help="standard: normal input; teacher: always lane-masked RGB")
-    parser.add_argument("--no_ego",   action="store_true", help="Disable ego-state input (speed, last steer)")
-    parser.add_argument("--no_depth", action="store_true", help="Disable depth channel — use RGB-only (3-ch) input")
-    parser.add_argument("--fast",     action="store_true", help="Use DrivingPolicyNetFast (lightweight CNN backbone)")
+    # Architecture overrides — omit to auto-detect from checkpoint
+    parser.add_argument("--no_ego",   default=None, action="store_true",
+                        help="Force-disable ego-state input (auto-detected from checkpoint if omitted)")
+    parser.add_argument("--no_depth", default=None, action="store_true",
+                        help="Force-disable depth channel / RGB-only input (auto-detected if omitted)")
+    parser.add_argument("--fast",     default=None, action="store_true",
+                        help="Force DrivingPolicyNetFast backbone (auto-detected if omitted)")
     args = parser.parse_args()
+
+    use_ego   = False if args.no_ego   else None   # None = auto-detect
+    use_depth = False if args.no_depth else None   # None = auto-detect
 
     test_simulation(
         args.model_path, args.dpt_path, args.episodes,
         image_size=args.image_size, policy=args.policy,
-        use_ego=not args.no_ego, use_depth=not args.no_depth, fast=args.fast,
+        use_ego=use_ego, use_depth=use_depth, fast=args.fast,
     )

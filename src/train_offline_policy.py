@@ -22,7 +22,7 @@ from policy.trainer import (
     _collate_precomputed, _collate_rgb, apply_lane_mask
 )
 from utils.checkpoints import (
-    load_checkpoint, freeze_backbone, print_trainable_params
+    load_checkpoint, freeze_backbone, print_trainable_params, detect_arch_from_ckpt
 )
 
 def get_curriculum_lr_lambda(fully_masked_epochs, total_epochs):
@@ -191,24 +191,27 @@ def test_offline_policy(
     data_dir:     str,
     pred_dir:     str  = None,
     image_size:   int  = None,
-    use_ego:      bool = True,
-    use_depth:    bool = True,
-    fast:         bool = False,
+    use_ego       = None,   # None → auto-detect from checkpoint
+    use_depth     = None,   # None → auto-detect from checkpoint
+    fast          = None,   # None → auto-detect from checkpoint
 ):
     print("--- Phase 3: Offline Testing Driving Policy ---")
-    print(f"[INFO] use_ego={use_ego}  use_depth={use_depth}  fast={fast}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    in_channels  = 3 if not use_depth else 4
-    ModelClass   = DrivingPolicyNetFast if fast else DrivingPolicyNet
-    policy_model = ModelClass(in_channels=in_channels, image_size=image_size, use_ego=use_ego).to(device)
-
     ckpt = torch.load(model_path, map_location=device)
-    if isinstance(ckpt, dict):
-        key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
-        policy_model.load_state_dict(ckpt[key] if key else ckpt)
-    else:
-        policy_model.load_state_dict(ckpt)
+    arch = detect_arch_from_ckpt(ckpt)
+    print(f"[INFO] Checkpoint arch: class={arch['class']}  use_ego={arch['use_ego']}  in_channels={arch['in_channels']}")
+
+    is_fast        = bool(fast) or (arch["class"] == "DrivingPolicyNetFast")
+    resolved_ego   = arch["use_ego"]     if use_ego   is None else use_ego
+    resolved_inch  = arch["in_channels"] if use_depth is None else (3 if not use_depth else arch["in_channels"])
+    resolved_depth = resolved_inch != 3
+    print(f"[INFO] Resolved: fast={is_fast}  use_ego={resolved_ego}  use_depth={resolved_depth}")
+
+    ModelClass   = DrivingPolicyNetFast if is_fast else DrivingPolicyNet
+    policy_model = ModelClass(in_channels=resolved_inch, image_size=image_size, use_ego=resolved_ego).to(device)
+    key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
+    policy_model.load_state_dict(ckpt[key] if key else ckpt)
     policy_model.eval()
 
     depth_estimator = None
@@ -220,7 +223,7 @@ def test_offline_policy(
         test_ds    = PrecomputedDepthDataset(pred_dir=pred_dir, split="test")
         collate_fn = _collate_precomputed
     else:
-        if use_depth:
+        if resolved_depth:
             depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
         test_ds    = MetaDriveRGBDataset(data_dir=data_dir, split="test")
         collate_fn = _collate_rgb
@@ -238,15 +241,15 @@ def test_offline_policy(
                     actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
                     ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
                     combined  = apply_lane_mask(depth_t, rgb_np, device, image_size=image_size,
-                                               use_depth=use_depth)
+                                               use_depth=resolved_depth)
                 else:
                     rgb_np, actions_np, ego_np = batch
                     actions_t   = torch.tensor(actions_np, dtype=torch.float32, device=device)
                     combined, _ = extract_features_frozen(rgb_np, depth_estimator, device,
-                                                          image_size=image_size, use_depth=use_depth)
+                                                          image_size=image_size, use_depth=resolved_depth)
                     ego_t       = torch.tensor(ego_np, dtype=torch.float32, device=device)
 
-                if not use_ego:
+                if not resolved_ego:
                     ego_t = torch.zeros_like(ego_t)
 
                 pred       = policy_model(combined, ego_t)
@@ -298,14 +301,19 @@ if __name__ == "__main__":
     parser.add_argument("--image_size",          type=int,   default=84)
     parser.add_argument("--batch_size",          type=int,   default=32)
     parser.add_argument("--lane_mask_prob",      type=float, default=0.05)
-    # ablation / architecture flags
-    parser.add_argument("--no_ego",   action="store_true", help="Disable ego-state input (speed, last steer)")
-    parser.add_argument("--no_depth", action="store_true", help="Disable depth channel — use RGB-only (3-ch) input")
-    parser.add_argument("--fast",     action="store_true", help="Use DrivingPolicyNetFast (lightweight CNN backbone)")
+    # ablation / architecture flags (omit to auto-detect from checkpoint; only applies to finetune/test)
+    parser.add_argument("--no_ego",   default=None, action="store_true",
+                        help="Disable ego-state input. For train: explicit. For finetune/test: overrides auto-detect.")
+    parser.add_argument("--no_depth", default=None, action="store_true",
+                        help="Disable depth channel. For train: explicit. For finetune/test: overrides auto-detect.")
+    parser.add_argument("--fast",     default=None, action="store_true",
+                        help="Use DrivingPolicyNetFast. For train: explicit. For finetune/test: overrides auto-detect.")
     args = parser.parse_args()
 
-    use_ego   = not args.no_ego
-    use_depth = not args.no_depth
+    # For train mode, flags are explicit (default True/False); for finetune/test, None = auto-detect
+    use_ego_train   = False if args.no_ego   else True
+    use_depth_train = False if args.no_depth else True
+    fast_train      = bool(args.fast)
 
     if args.mode == "train":
         train_policy(args.epochs, args.batch_size, args.model_path,
@@ -314,7 +322,7 @@ if __name__ == "__main__":
                      fully_masked_epochs=args.fully_masked_epochs,
                      image_size=args.image_size,
                      lane_mask_prob=args.lane_mask_prob,
-                     use_ego=use_ego, use_depth=use_depth, fast=args.fast)
+                     use_ego=use_ego_train, use_depth=use_depth_train, fast=fast_train)
 
     elif args.mode == "finetune":
         if args.finetune_from is None:
@@ -335,10 +343,13 @@ if __name__ == "__main__":
             fully_masked_epochs= args.fully_masked_epochs,
             image_size         = args.image_size,
             lane_mask_prob     = args.lane_mask_prob,
-            use_ego=use_ego, use_depth=use_depth, fast=args.fast,
+            use_ego=use_ego_train, use_depth=use_depth_train, fast=fast_train,
         )
 
     elif args.mode == "test":
+        # None → auto-detect from checkpoint
+        use_ego_test   = False if args.no_ego   is True else None
+        use_depth_test = False if args.no_depth is True else None
         test_offline_policy(args.model_path, args.dpt_path, args.data_dir,
                             pred_dir=args.pred_dir, image_size=args.image_size,
-                            use_ego=use_ego, use_depth=use_depth, fast=args.fast)
+                            use_ego=use_ego_test, use_depth=use_depth_test, fast=args.fast)

@@ -30,7 +30,7 @@ import torch.optim as optim
 from models import DrivingPolicyNet, DrivingPolicyNetFast
 from policy.distillation import DistillationLoss, train_teacher_loop, train_student_loop
 from policy.trainer import build_loaders
-from utils.checkpoints import load_checkpoint
+from utils.checkpoints import load_checkpoint, detect_arch_from_ckpt
 
 
 def _curriculum_lr_lambda(fully_masked_epochs: int, total_epochs: int):
@@ -106,15 +106,24 @@ def train_student(args):
 
     use_ego   = not args.no_ego
     use_depth = not args.no_depth
-    print(f"[INFO] use_ego={use_ego}  use_depth={use_depth}  fast={args.fast}")
+
+    # Auto-detect teacher arch from its checkpoint; warn when it differs from CLI flags
+    teacher_ckpt = torch.load(args.teacher_path, map_location=device)
+    t_arch = detect_arch_from_ckpt(teacher_ckpt)
+    print(f"[INFO] Teacher checkpoint arch: class={t_arch['class']}  use_ego={t_arch['use_ego']}  in_channels={t_arch['in_channels']}")
+    if t_arch["use_ego"] != use_ego or (t_arch["in_channels"] == 3) != (not use_depth) or \
+       (t_arch["class"] == "DrivingPolicyNetFast") != args.fast:
+        print("[WARN] CLI arch flags differ from teacher checkpoint — using teacher checkpoint arch for both teacher and student.")
+    use_ego   = t_arch["use_ego"]
+    in_channels = t_arch["in_channels"]
+    ModelClass  = DrivingPolicyNetFast if (t_arch["class"] == "DrivingPolicyNetFast") else DrivingPolicyNet
+    use_depth   = in_channels != 3
+    print(f"[INFO] Resolved: fast={ModelClass.__name__}  use_ego={use_ego}  use_depth={use_depth}")
 
     train_loader, val_loader = build_loaders(
         use_precomputed=True, pred_dir=args.pred_dir,
         data_dir=args.data_dir, batch_size=args.batch_size,
     )
-
-    in_channels = 3 if not use_depth else 4
-    ModelClass  = DrivingPolicyNetFast if args.fast else DrivingPolicyNet
 
     teacher = ModelClass(in_channels=in_channels, image_size=args.image_size, use_ego=use_ego).to(device)
     load_checkpoint(args.teacher_path, teacher, device=device)
