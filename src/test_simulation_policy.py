@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from metadrive import MetaDriveEnv
 
-from models import DepthEstimationModel, DrivingPolicyNet, extract_ego_state
+from models import DepthEstimationModel, DrivingPolicyNet, DrivingPolicyNetFast, extract_ego_state
 from policy.trainer import extract_features_frozen
 from data.cameras import build_cameras
 
@@ -23,13 +23,19 @@ def test_simulation(
     num_episodes: int,
     image_size:   int  = None,
     policy:       str  = "standard",
+    use_ego:      bool = True,
+    use_depth:    bool = True,
+    fast:         bool = False,
 ):
     print("--- Online Evaluation (Simulation) ---")
+    print(f"[INFO] policy={policy}  use_ego={use_ego}  use_depth={use_depth}  fast={fast}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    policy_model = DrivingPolicyNet(in_channels=4, image_size=image_size).to(device)
-    print(f"[INFO] Policy: {policy}  ({policy_model.__class__.__name__})")
-        
+    in_channels  = 3 if not use_depth else 4
+    ModelClass   = DrivingPolicyNetFast if fast else DrivingPolicyNet
+    policy_model = ModelClass(in_channels=in_channels, image_size=image_size, use_ego=use_ego).to(device)
+    print(f"[INFO] Architecture: {policy_model.__class__.__name__}  in_channels={in_channels}")
+
     ckpt = torch.load(model_path, map_location=device)
     if isinstance(ckpt, dict):
         key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
@@ -38,7 +44,7 @@ def test_simulation(
         policy_model.load_state_dict(ckpt)
     policy_model.eval()
 
-    depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
+    depth_estimator = DepthEstimationModel(finetuned_path=dpt_path) if use_depth else None
 
     angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(1)
     rgb_name = rgb_cam_names[0]
@@ -85,22 +91,29 @@ def test_simulation(
                 rgb_img[np.newaxis], depth_estimator,
                 image_size=image_size, device=device,
                 always_lane_masked=(policy == "teacher"),
+                use_depth=use_depth,
             )
 
             ego_reading = extract_ego_state(env.agent, last_steer=last_steer)
-            ego_t       = torch.tensor(ego_reading.ego_model, dtype=torch.float32, device=device).unsqueeze(0)
+            if use_ego:
+                ego_t = torch.tensor(ego_reading.ego_model, dtype=torch.float32, device=device).unsqueeze(0)
+            else:
+                ego_t = torch.zeros(1, 2, dtype=torch.float32, device=device)
 
             with torch.no_grad():
                 pred_action = policy_model(input_tensor, ego_t).cpu().numpy()[0]
             last_steer = float(pred_action[0])
 
             # HUD visualisation
-            depth_uint8 = (input_tensor[0, 0].cpu().numpy() * 255).astype(np.uint8)
-            depth_color = cv2.resize(cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO), (400, 400))
-
-            blended_rgb = np.transpose(input_tensor[0, 1:4].cpu().numpy(), (1, 2, 0))
+            if use_depth:
+                depth_uint8 = (input_tensor[0, 0].cpu().numpy() * 255).astype(np.uint8)
+                left_panel  = cv2.resize(cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO), (400, 400))
+                blended_rgb = np.transpose(input_tensor[0, 1:4].cpu().numpy(), (1, 2, 0))
+            else:
+                left_panel  = np.zeros((400, 400, 3), dtype=np.uint8)
+                blended_rgb = np.transpose(input_tensor[0, 0:3].cpu().numpy(), (1, 2, 0))
             right_panel = cv2.resize(cv2.cvtColor((blended_rgb * 255).astype(np.uint8), cv2.COLOR_RGB2BGR), (400, 400))
-            win_title   = "Depth | Lane-Masked RGB  (Teacher)" if policy == "teacher" else "Depth | RGB"
+            win_title   = "Depth | Lane-Masked RGB  (Teacher)" if policy == "teacher" else ("No-Depth | RGB" if not use_depth else "Depth | RGB")
 
             hud = np.zeros((40, 800, 3), dtype=np.uint8)
             cv2.putText(
@@ -111,7 +124,7 @@ def test_simulation(
                 f"->  steer:{pred_action[0]:+.2f}  throt:{pred_action[1]:+.2f}",
                 (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 200), 1,
             )
-            cv2.imshow(win_title, np.vstack((hud, np.hstack((depth_color, right_panel)))))
+            cv2.imshow(win_title, np.vstack((hud, np.hstack((left_panel, right_panel)))))
             cv2.waitKey(1)
             
             obs, reward, terminated, truncated, info = env.step(pred_action)
@@ -165,7 +178,15 @@ if __name__ == "__main__":
     parser.add_argument("--dpt_path",   type=str,   default="models/dpt_finetuned.pth")
     parser.add_argument("--model_path", type=str,   default="models/policy_model.pth")
     parser.add_argument("--image_size", type=int,   default=84)
-    parser.add_argument("--policy",     type=str,   default="standard", choices=["standard", "teacher"])
+    parser.add_argument("--policy",     type=str,   default="standard", choices=["standard", "teacher"],
+                        help="standard: normal input; teacher: always lane-masked RGB")
+    parser.add_argument("--no_ego",   action="store_true", help="Disable ego-state input (speed, last steer)")
+    parser.add_argument("--no_depth", action="store_true", help="Disable depth channel — use RGB-only (3-ch) input")
+    parser.add_argument("--fast",     action="store_true", help="Use DrivingPolicyNetFast (lightweight CNN backbone)")
     args = parser.parse_args()
 
-    test_simulation(args.model_path, args.dpt_path, args.episodes, image_size=args.image_size, policy=args.policy)
+    test_simulation(
+        args.model_path, args.dpt_path, args.episodes,
+        image_size=args.image_size, policy=args.policy,
+        use_ego=not args.no_ego, use_depth=not args.no_depth, fast=args.fast,
+    )

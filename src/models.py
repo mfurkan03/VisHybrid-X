@@ -198,15 +198,17 @@ class DrivingPolicyNet(nn.Module):
     - Pre-activation ReLU in residual blocks → smoother gradient flow
 
     Visual stream  : 3 IMPALA stages (16→32→32 ch) → 512-d feature
-    Ego stream     : 2-layer MLP                    →  32-d feature
+    Ego stream     : 2-layer MLP (skipped if use_ego=False)  →  32-d feature
     Fusion head    : 2-layer MLP                    →   2-d output [steer, accel]
 
     RL note: call model.train() during gradient updates and model.eval()
     during rollout collection — Dropout is the only stateful layer.
     """
 
-    def __init__(self, in_channels: int = 4, out_dim: int = 2, ego_dim: int = EGO_DIM, p: float = 0.5, image_size: int = None):
+    def __init__(self, in_channels: int = 4, out_dim: int = 2, ego_dim: int = EGO_DIM,
+                 p: float = 0.5, image_size: int = None, use_ego: bool = True):
         super().__init__()
+        self.use_ego = use_ego
 
         self.cnn = nn.Sequential(
             _impala_stage(in_channels, 16),
@@ -224,25 +226,95 @@ class DrivingPolicyNet(nn.Module):
             nn.Linear(flattened_dim, 512), nn.ReLU(), nn.Dropout(p),
         )
 
-        self.ego_fc = nn.Sequential(
-            nn.Linear(ego_dim, 64), nn.ReLU(),
-            nn.Linear(64, 32),      nn.ReLU(),
-        )
+        if use_ego:
+            self._ego_dim = ego_dim
+            self.ego_fc = nn.Sequential(
+                nn.Linear(ego_dim, 64), nn.ReLU(),
+                nn.Linear(64, 32),      nn.ReLU(),
+            )
+            fusion_in = 512 + 32
+        else:
+            fusion_in = 512
 
         self.fusion = nn.Sequential(
-            nn.Linear(512 + 32, 256), nn.ReLU(), nn.Dropout(p),
+            nn.Linear(fusion_in, 256), nn.ReLU(), nn.Dropout(p),
             nn.Linear(256, out_dim),
         )
 
-    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
-        v   = self.vis_head(self.cnn(x))
-        e   = self.ego_fc(ego)
-        out = self.fusion(torch.cat([v, e], dim=1))
+    def forward(self, x: torch.Tensor, ego: torch.Tensor = None, return_features: bool = False):
+        v = self.vis_head(self.cnn(x))
+        if self.use_ego:
+            if ego is None:
+                ego = x.new_zeros(x.shape[0], self._ego_dim)
+            e     = self.ego_fc(ego)
+            fused = torch.cat([v, e], dim=1)
+        else:
+            fused = v
+        out = self.fusion(fused)
         if return_features:
             return out, v
         return out
 
+class DrivingPolicyNetFast(nn.Module):
+    """
+    Two-stream policy network (lightweight CNN backbone).
 
+    Visual stream  : CNN on (in_channels, H, W) observation  → 512-d feature
+    Ego stream     : MLP on EGO_DIM ego-state vector (skipped if use_ego=False) → 32-d feature
+    Fusion head    : Linear(512[+32] → 2)  →  [steer, accel]
+
+    Ego input: [total_speed, last_steer]
+    """
+
+    def __init__(self, in_channels: int = 4, out_dim: int = 2, ego_dim: int = EGO_DIM,
+                 p: float = 0.5, image_size: int = None, use_ego: bool = True):
+        super().__init__()
+        self.use_ego = use_ego
+
+        self.conv1   = nn.Conv2d(in_channels, 32, kernel_size=8, stride=4)
+        self.conv2   = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3   = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+        self.flatten = nn.Flatten()
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, image_size, image_size)
+            dummy_out = self.flatten(self.conv3(self.conv2(self.conv1(dummy))))
+            flattened_dim = dummy_out.shape[1]
+
+        self.fc_vis      = nn.Linear(flattened_dim, 512)
+        self.dropout_vis = nn.Dropout(p)
+
+        if use_ego:
+            self._ego_dim = ego_dim
+            self.ego_fc = nn.Sequential(
+                nn.Linear(ego_dim, 64), nn.ReLU(),
+                nn.Dropout(p),
+                nn.Linear(64, 32), nn.ReLU(),
+            )
+            fusion_in = 512 + 32
+        else:
+            fusion_in = 512
+
+        self.fc_out = nn.Linear(fusion_in, out_dim)
+
+    def forward(self, x: torch.Tensor, ego: torch.Tensor = None, return_features: bool = False):
+        v = F.relu(self.conv1(x))
+        v = F.relu(self.conv2(v))
+        v = F.relu(self.conv3(v))
+        v = self.flatten(v)
+        v = F.relu(self.fc_vis(v))
+        v = self.dropout_vis(v)
+        if self.use_ego:
+            if ego is None:
+                ego = x.new_zeros(x.shape[0], self._ego_dim)
+            e     = self.ego_fc(ego)
+            fused = torch.cat([v, e], dim=1)
+        else:
+            fused = v
+        out = self.fc_out(fused)
+        if return_features:
+            return out, v
+        return out
 
 
 

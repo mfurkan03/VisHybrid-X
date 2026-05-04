@@ -27,7 +27,7 @@ import math
 import torch
 import torch.optim as optim
 
-from models import DrivingPolicyNet
+from models import DrivingPolicyNet, DrivingPolicyNetFast
 from policy.distillation import DistillationLoss, train_teacher_loop, train_student_loop
 from policy.trainer import build_loaders
 from utils.checkpoints import load_checkpoint
@@ -63,14 +63,20 @@ def train_teacher(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"DEVICE: {device}")
 
+    use_ego   = not args.no_ego
+    use_depth = not args.no_depth
+    print(f"[INFO] use_ego={use_ego}  use_depth={use_depth}  fast={args.fast}")
+
     train_loader, val_loader = build_loaders(
         use_precomputed=True, pred_dir=args.pred_dir,
         data_dir=args.data_dir, batch_size=args.batch_size,
     )
 
-    teacher   = DrivingPolicyNet(in_channels=4, image_size=args.image_size).to(device)
-    optimizer = optim.AdamW(teacher.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_cosine_lr_lambda(args.epochs))
+    in_channels = 3 if not use_depth else 4
+    ModelClass  = DrivingPolicyNetFast if args.fast else DrivingPolicyNet
+    teacher     = ModelClass(in_channels=in_channels, image_size=args.image_size, use_ego=use_ego).to(device)
+    optimizer   = optim.AdamW(teacher.parameters(), lr=args.lr)
+    scheduler   = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_cosine_lr_lambda(args.epochs))
 
     train_teacher_loop(
         teacher, device, train_loader, val_loader,
@@ -80,6 +86,8 @@ def train_teacher(args):
         image_size=args.image_size,
         pixel_noise_frac=args.pixel_noise_frac,
         patience=args.patience,
+        use_ego=use_ego,
+        use_depth=use_depth,
     )
 
 
@@ -88,7 +96,7 @@ def train_teacher(args):
 # ============================================================
 
 def train_student(args):
-    print("--- Phase 2: Training Student (DrivingPolicyNet) with Distillation ---")
+    print("--- Phase 2: Training Student with Distillation ---")
     if not args.teacher_path:
         raise ValueError("--teacher_path is required for train_student mode")
 
@@ -96,16 +104,23 @@ def train_student(args):
     print(f"DEVICE: {device}")
     print(f"λ_output={args.lambda_output}  λ_feature={args.lambda_feature}")
 
+    use_ego   = not args.no_ego
+    use_depth = not args.no_depth
+    print(f"[INFO] use_ego={use_ego}  use_depth={use_depth}  fast={args.fast}")
+
     train_loader, val_loader = build_loaders(
         use_precomputed=True, pred_dir=args.pred_dir,
         data_dir=args.data_dir, batch_size=args.batch_size,
     )
 
-    teacher = DrivingPolicyNet(in_channels=4, image_size=args.image_size).to(device)
+    in_channels = 3 if not use_depth else 4
+    ModelClass  = DrivingPolicyNetFast if args.fast else DrivingPolicyNet
+
+    teacher = ModelClass(in_channels=in_channels, image_size=args.image_size, use_ego=use_ego).to(device)
     load_checkpoint(args.teacher_path, teacher, device=device)
     print(f"[INFO] Teacher loaded from {args.teacher_path}")
 
-    student   = DrivingPolicyNet(image_size=args.image_size).to(device)
+    student   = ModelClass(in_channels=in_channels, image_size=args.image_size, use_ego=use_ego).to(device)
     optimizer = optim.AdamW(student.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -139,6 +154,8 @@ def train_student(args):
         lane_mask_prob=args.lane_mask_prob,
         pixel_noise_frac=args.pixel_noise_frac,
         patience=args.patience,
+        use_ego=use_ego,
+        use_depth=use_depth,
     )
 
 
@@ -172,6 +189,10 @@ if __name__ == "__main__":
     parser.add_argument("--patience",         type=int,   default=8)
     parser.add_argument("--resume_from",      type=str,   default=None,
                         help="Resume student training from an existing checkpoint")
+    # ablation / architecture flags
+    parser.add_argument("--no_ego",   action="store_true", help="Disable ego-state input (speed, last steer)")
+    parser.add_argument("--no_depth", action="store_true", help="Disable depth channel — use RGB-only (3-ch) input")
+    parser.add_argument("--fast",     action="store_true", help="Use DrivingPolicyNetFast (lightweight CNN backbone)")
     args = parser.parse_args()
 
     if args.mode == "train_teacher":

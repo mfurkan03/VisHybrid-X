@@ -85,6 +85,8 @@ def run_teacher_epoch(
     image_size: int = None,
     scaler=None,
     pixel_noise_frac: float = 0.0,
+    use_ego: bool = True,
+    use_depth: bool = True,
 ):
     """One training or validation epoch for the teacher (lane-mask input)."""
     teacher.train() if is_train else teacher.eval()
@@ -99,7 +101,10 @@ def run_teacher_epoch(
             depth_t   = depth_t.to(device)
             actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
             ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
-            teacher_in = apply_lane_mask(depth_t, rgb_np, device, always_lane_masked=True, image_size=image_size)
+            if not use_ego:
+                ego_t = torch.zeros_like(ego_t)
+            teacher_in = apply_lane_mask(depth_t, rgb_np, device, always_lane_masked=True,
+                                         image_size=image_size, use_depth=use_depth)
 
             if is_train:
                 if pixel_noise_frac > 0:
@@ -141,12 +146,14 @@ def run_student_epoch(
     scaler=None,
     lane_mask_prob:      float = 0.0,
     pixel_noise_frac:    float = 0.0,
+    use_ego:             bool  = True,
+    use_depth:           bool  = True,
 ):
     """
     One training or validation epoch for the student.
 
-    Student input : curriculum-blended depth+RGB (4-ch) — identical to train_offline_policy.py.
-    Teacher input : depth + lane-masked RGB (4-ch), always fully masked.
+    Student input : curriculum-blended depth+RGB (4-ch) or RGB-only (3-ch) when use_depth=False.
+    Teacher input : same channel config, always fully lane-masked.
     """
     student.train() if is_train else student.eval()
     teacher.eval()
@@ -162,6 +169,8 @@ def run_student_epoch(
             depth_t   = depth_t.to(device)
             actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
             ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
+            if not use_ego:
+                ego_t = torch.zeros_like(ego_t)
 
             # Student input: same curriculum pipeline as the baseline training
             force_masked = curriculum_epochs > 0 and np.random.random() < lane_mask_prob
@@ -172,10 +181,12 @@ def run_student_epoch(
                 fully_masked_epochs=fully_masked_epochs,
                 image_size=image_size,
                 always_lane_masked=force_masked,
+                use_depth=use_depth,
             )
 
-            # Teacher input: depth + lane-masked RGB (4-ch, always fully masked)
-            teacher_in = apply_lane_mask(depth_t, rgb_np, device, always_lane_masked=True, image_size=image_size)
+            # Teacher input: same channel config, always fully masked
+            teacher_in = apply_lane_mask(depth_t, rgb_np, device, always_lane_masked=True,
+                                         image_size=image_size, use_depth=use_depth)
 
             if is_train:
                 if pixel_noise_frac > 0:
@@ -252,6 +263,8 @@ def train_teacher_loop(
     image_size:       int   = None,
     pixel_noise_frac: float = 0.0,
     patience:         int   = 8,
+    use_ego:          bool  = True,
+    use_depth:        bool  = True,
 ) -> float:
     """Full training loop for the teacher on lane masks."""
     file_root, file_ext = os.path.splitext(model_path)
@@ -270,12 +283,14 @@ def train_teacher_loop(
             desc=f"[Teacher] Epoch {epoch+1}/{epochs} [Train]",
             image_size=image_size, scaler=scaler,
             pixel_noise_frac=pixel_noise_frac,
+            use_ego=use_ego, use_depth=use_depth,
         )
         avg_val, val_pred, val_true = run_teacher_epoch(
             teacher, val_loader, optimizer, device,
             is_train=False,
             desc=f"[Teacher] Epoch {epoch+1}/{epochs} [Val]",
             image_size=image_size,
+            use_ego=use_ego, use_depth=use_depth,
         )
 
         tr_m   = compute_offline_metrics(tr_pred,  tr_true)
@@ -342,6 +357,8 @@ def train_student_loop(
     lane_mask_prob:      float = 0.0,
     pixel_noise_frac:    float = 0.05,
     patience:            int   = 8,
+    use_ego:             bool  = True,
+    use_depth:           bool  = True,
 ) -> float:
     """
     Full distillation training loop for the student (DrivingPolicyNet).
@@ -374,6 +391,7 @@ def train_student_loop(
             image_size=image_size, scaler=scaler,
             lane_mask_prob=lane_mask_prob,
             pixel_noise_frac=pixel_noise_frac,
+            use_ego=use_ego, use_depth=use_depth,
         )
         avg_val, val_pred, val_true, val_bd = run_student_epoch(
             student, teacher, val_loader, optimizer, device,
@@ -385,6 +403,7 @@ def train_student_loop(
             fully_masked_epochs=fully_masked_epochs,
             image_size=image_size,
             lane_mask_prob=0,
+            use_ego=use_ego, use_depth=use_depth,
         )
 
         tr_m   = compute_offline_metrics(tr_pred,  tr_true)
