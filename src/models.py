@@ -302,8 +302,125 @@ class ImpalaNet(nn.Module):
         return torch.cat([self.steer_head(merged), self.accel_head(merged)], dim=1)
 
 
+# ============================================================
+# SE building blocks (used only by ImpalaNetV2)
+# ============================================================
+
+class _SEBlock(nn.Module):
+    """Squeeze-and-Excitation channel attention."""
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc   = nn.Sequential(
+            nn.Linear(channels, hidden), nn.ReLU(),
+            nn.Linear(hidden, channels), nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s = self.pool(x).flatten(1)
+        return x * self.fc(s).view(x.size(0), x.size(1), 1, 1)
+
+
+class _ImpalaResBlockSE(nn.Module):
+    """Pre-activation residual block with SE channel attention."""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+        )
+        self.se = _SEBlock(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.se(self.net(x))
+
+
+def _impala_stage_se(in_ch: int, out_ch: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+        nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+        _ImpalaResBlockSE(out_ch),
+        _ImpalaResBlockSE(out_ch),
+    )
+
+
+class ImpalaNetV2(nn.Module):
+    """
+    Stronger IMPALA variant with better RGB handling.  Use --arch impala_v2.
+
+    Improvements over ImpalaNet:
+    - Wider stages (48→96→96 vs 32→64→64) — more capacity for RGB textures
+    - SE (Squeeze-and-Excitation) in every res-block — channel attention lets
+      each stage learn how much to weight depth vs R/G/B
+    - Deeper vis_proj (flat→1024→512 vs flat→512) — richer feature compression
+    - Larger output heads (256 vs 128 units)
+    - ImageNet normalisation of RGB channels (1-3) inside forward(); depth
+      channel (0) is already range-normalised upstream and is left as-is
+
+    Same API as ImpalaNet: forward(x, ego) → [steer, accel]
+    No BatchNorm — safe at batch_size=1 for RL rollouts.
+    """
+
+    _RGB_MEAN = [0.485, 0.456, 0.406]
+    _RGB_STD  = [0.229, 0.224, 0.225]
+
+    def __init__(self, in_channels: int = 4, out_dim: int = 2,
+                 ego_dim: int = EGO_DIM, p: float = 0.3, image_size: int = None):
+        super().__init__()
+
+        self.register_buffer('rgb_mean', torch.tensor(self._RGB_MEAN).view(1, 3, 1, 1))
+        self.register_buffer('rgb_std',  torch.tensor(self._RGB_STD).view(1, 3, 1, 1))
+
+        self.cnn = nn.Sequential(
+            _impala_stage_se(in_channels, 48),
+            _impala_stage_se(48, 96),
+            _impala_stage_se(96, 96),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        with torch.no_grad():
+            dummy         = torch.zeros(1, in_channels, image_size, image_size)
+            flattened_dim = self.cnn(dummy).shape[1]
+
+        self.vis_proj = nn.Sequential(
+            nn.Linear(flattened_dim, 1024), nn.ReLU(),
+            nn.Linear(1024, 512),           nn.ReLU(),
+        )
+
+        self.ego_fc = nn.Sequential(
+            nn.Linear(ego_dim, 64), nn.ReLU(),
+            nn.Linear(64, 32),      nn.ReLU(),
+        )
+
+        merged_dim = 512 + 32
+        self.steer_head = nn.Sequential(
+            nn.Linear(merged_dim, 256), nn.ReLU(), nn.Dropout(p),
+            nn.Linear(256, 1),
+        )
+        self.accel_head = nn.Sequential(
+            nn.Linear(merged_dim, 256), nn.ReLU(), nn.Dropout(p),
+            nn.Linear(256, 1),
+        )
+
+    def forward(self, x: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([
+            x[:, :1],
+            (x[:, 1:] - self.rgb_mean) / self.rgb_std,
+        ], dim=1)
+        v = self.vis_proj(self.cnn(x))
+        e = self.ego_fc(ego)
+        merged = torch.cat([v, e], dim=1)
+        return torch.cat([self.steer_head(merged), self.accel_head(merged)], dim=1)
+
+
 def build_policy(arch: str = "simple", image_size: int = None) -> nn.Module:
-    """Factory: 'simple' → DrivingPolicyNet, 'impala' → ImpalaNet."""
+    """Factory: 'simple' → DrivingPolicyNet, 'impala' → ImpalaNet, 'impala_v2' → ImpalaNetV2."""
     if arch == "impala":
         return ImpalaNet(image_size=image_size)
+    if arch == "impala_v2":
+        return ImpalaNetV2(image_size=image_size)
     return DrivingPolicyNet(image_size=image_size)
