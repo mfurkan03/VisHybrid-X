@@ -44,7 +44,7 @@ def apply_lane_mask(
     image_size: int = None
 ) -> torch.Tensor:
     """
-    Refactored version with optimized interpolations and tensor handling.
+    Applies lane masking at original resolution and interpolates the final result.
     """
     
     # 1. Calculate Alpha for Curriculum Learning
@@ -55,46 +55,48 @@ def apply_lane_mask(
     else:
         alpha = (current_epoch - fully_masked_epochs) / max(1, curriculum_epochs - fully_masked_epochs)
 
-    # 2. Pre-process RGB Batch
-    # Convert NumPy (B, H, W, C) to Torch Tensor (B, C, H, W)
+    # 2. Pre-process RGB Batch (Maintain original resolution for now)
     rgb_tensor = torch.from_numpy(rgb_batch).float().to(device)
     
-    # Normalize if input is in uint8 (0-255)
     if rgb_tensor.max() > 1.0:
         rgb_tensor /= 255.0
         
+    # Convert (B, H, W, C) -> (B, C, H, W)
     rgb_tensor = rgb_tensor.permute(0, 3, 1, 2) 
 
-    # 3. Optimized Batch Interpolation
-    # Resize both RGB and Depth tensors to the target image_size simultaneously
-    if image_size:
-        rgb_tensor = F.interpolate(rgb_tensor, size=(image_size, image_size), mode='bilinear', align_corners=False)
-        depth_tensor = F.interpolate(depth_tensor, size=(image_size, image_size), mode='bilinear', align_corners=False)
-
-    # 4. Lane Masking and Blending
+    # 3. Lane Masking and Blending (at original resolution)
     blended_list = []
     
     for i in range(rgb_tensor.shape[0]):
         # Extract single image for mask generation
-        # If get_lane_mask_visual requires NumPy, we convert it back temporarily
         img_torch = rgb_tensor[i]
-        img_np = img_torch.permute(1, 2, 0).cpu().numpy()
+        img_np = (img_torch.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         
-        # Generate mask
+        # Generate mask (Expected output: H, W)
         mask = get_lane_mask_visual(img_np) 
         mask_tensor = torch.from_numpy(mask).float().to(device).unsqueeze(0) / 255.0
         
-        # Apply blending logic:
+        # Apply blending logic
         # Final = (Original * Mask) + (Original * (1 - Mask) * Alpha)
         blended = img_torch * mask_tensor + img_torch * (1.0 - mask_tensor) * alpha
         blended_list.append(blended)
 
-    # Stack processed images back into a batch
     blended_batch = torch.stack(blended_list)
 
-    # 5. Concatenate Depth (C=1) and Blended RGB (C=3) -> (B, 4, H, W)
-    return torch.cat([depth_tensor, blended_batch], dim=1)
+    # 4. Concatenate Depth (C=1) and Blended RGB (C=3) -> (B, 4, H, W)
+    combined_tensor = torch.cat([depth_tensor, blended_batch], dim=1)
 
+    # 5. Final Interpolation
+    # We resize the concatenated tensor once at the very end
+    if image_size:
+        combined_tensor = F.interpolate(
+            combined_tensor, 
+            size=(image_size, image_size), 
+            mode='bilinear', 
+            align_corners=False
+        )
+
+    return combined_tensor
 
 def extract_features_frozen(
     rgb_batch,
