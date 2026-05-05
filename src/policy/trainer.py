@@ -309,7 +309,7 @@ def train_loop(
         past_curriculum = epoch >= fully_masked_epochs + curriculum_epochs
 
         save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, model_path)
-        if avg_val < best_val_loss - early_stopping_min_delta:
+        if past_curriculum and avg_val < best_val_loss - early_stopping_min_delta:
             best_val_loss    = avg_val
             no_improve_count = 0
             save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, best_path)
