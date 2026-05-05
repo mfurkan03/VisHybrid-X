@@ -53,10 +53,10 @@ def apply_lane_mask(
         alpha = 0.0
     elif current_epoch < fully_masked_epochs:
         alpha = 0.0
-    elif current_epoch >= curriculum_epochs:
+    elif current_epoch >= fully_masked_epochs + curriculum_epochs:
         alpha = 1.0
     else:
-        alpha = (current_epoch - fully_masked_epochs) / max(1, curriculum_epochs - fully_masked_epochs)
+        alpha = (current_epoch - fully_masked_epochs) / max(1, curriculum_epochs)
 
     # 2. Pre-process RGB Batch (Maintain original resolution for now)
     rgb_tensor = torch.from_numpy(rgb_batch).float().to(device)
@@ -306,7 +306,7 @@ def train_loop(
                 f"WinDiv Mean/P95: {val_hm['window_heading_div_mean']:.4f}/{val_hm['window_heading_div_p95']:.4f}"
             )
         scheduler.step()
-        past_curriculum = epoch >= curriculum_epochs
+        past_curriculum = epoch >= fully_masked_epochs + curriculum_epochs
 
         save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, model_path)
         if avg_val < best_val_loss - early_stopping_min_delta:
