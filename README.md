@@ -1,121 +1,149 @@
-Autonomous Driving Project - Dual-Brain V2 & Asymmetric Loss
-This project is built on the MetaDrive simulator to perform autonomous driving tasks using imitation learning. With recent updates, the project has evolved from a simple imitator; it has reached a level where it can perform driving and Autonomous Emergency Braking (AEB) using purely AI, without relying on any rule-based hacks, utilizing Sensor Fusion, Dual-Stream Architecture (V2), and an Asymmetric Loss Function.
+# Metadrive Autonomous
 
-What's Changed & What's New?
-Dual-Brain V2: Independent Full Vision (Dual-Stream Architecture)
-In the first Dual-Brain attempt, the steering branch only looked at the lane, while the throttle/brake branch only looked at depth. This caused a "Blind Steering" issue: when a car suddenly cut in front, the acceleration brain applied the brakes, but the steering brain couldn't see the obstacle, so it didn't know how to change lanes.
+An autonomous driving agent trained via **Behavioral Cloning (Imitation Learning)** on the [MetaDrive](https://github.com/metadriverse/metadrive) simulator. An expert policy collects driving demonstrations; a CNN policy network with depth estimation is trained offline to imitate it.
 
-Solution (V2): The DrivingPolicyNet architecture was updated. The weights and neurons of the Steering Branch and Acceleration Branch remain completely separated, but both brains are now fed the 2-Channel full input (Lane + Depth). As a result, the steering brain can now see obstacles and independently learn to change lanes to avoid collisions.
+## Architecture
 
-Autonomous Emergency Braking via Pure AI: Asymmetric Loss Function (Brake Penalty)
-In Behavioral Cloning (Imitation Learning), over 90% of the dataset consists of accelerating (positive) actions. When using a standard MSE Loss, the AI treated the "braking" action as an insignificant detail to keep its overall error rate low, which resulted in crashing straight into obstacles.
+Three policy networks are available, selected with `--arch`:
 
-Solution: Instead of forcing the system with hardcoded if/else blocks, a mathematical intelligence was integrated into the Loss Function. Thanks to the custom_driving_loss, if the AI makes a mistake on an empty road, it receives a standard 1x penalty. However, if it misses a required braking action, it faces a penalty multiplier 3 times (x3) larger. Thanks to this "Asymmetric Penalty" system, the AI has learned to brake on its own initiative when it detects obstacles, without any rule-based intervention.
+| `--arch` | Network | Description |
+|---|---|---|
+| `simple` | `DrivingPolicyNet` | 3-layer CNN (8×8/4 → 4×4/2 → 3×3/1), single fusion head |
+| `impala` | `ImpalaNet` | IMPALA-style residual CNN, 3 MaxPool stages (32→64→64 ch), dual output heads |
+| `impala_v2` | `ImpalaNetV2` | Wider stages (48→96→96 ch), SE channel attention, deeper vis_proj (flat→1024→512), 256-d heads, ImageNet-normalised RGB |
 
-Curriculum Learning
-To ease the training burden, the network uses Curriculum Learning. For the first few epochs, the network relies entirely on clear lane masks. Then, over a series of epochs, the raw RGB environment is gradually blended back into the image. This prevents the model from overfitting to pure Lane Masks and ensures robust real-world environment awareness.
+All networks accept a **4-channel input** (depth + 3-ch RGB) at `image_size × image_size`, fuse a 512-d visual feature with a 32-d ego-state feature, and output `[steering, accel/brake]` ∈ [-1, 1].
 
-Enhanced Validation & Simulation Metrics
-Instead of basic MSE, the evaluation suite now provides interpretable offline metrics like Steering MAE, Acceleration MAE, Steering Direction Accuracy, and Braking Accuracy. In simulation testing, expert-agnostic metrics are tracked (Success Rate, Out-of-Road Rate, Crash Rates, Avg Speed) to give a holistic view of the agent's actual driving abilities.
+**Ego state (EGO_DIM=2):** `[total_speed, last_steer]` — additional fields (forward/lateral speed, heading delta, timestamp) are logged but not fed to the model.
 
-Installation Setup
-To run this project, you need to set up the main environment and integrate the Depth Anything V2 repository.
+**No BatchNorm in ImpalaNet/ImpalaNetV2** — intentional; BatchNorm is undefined at batch_size=1 during RL rollouts and causes train/eval stat drift.
 
-1. Create and activate a new Conda environment
+### Key Features
 
-Bash
-conda create -n driving-new python=3.11 -y
-conda activate driving-new
-2. Install PyTorch (Adjust the CUDA version to match your system, e.g., cu118 or cu121 or else)
+**Asymmetric Braking Loss** — `custom_driving_loss` applies a **3× penalty** when the model misses a required braking action (`target < -0.1`). Braking events are rare but safety-critical; this counteracts class imbalance without rule-based hacks.
 
-Bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu1xx
-3. Install the main project requirements
+**Curriculum Lane Masking** — training starts with only lane markings visible (α=0, non-lane areas zeroed), then gradually blends full RGB back in over `curriculum_epochs`. Prevents over-reliance on lane colour cues.
 
-Bash
+**Depth Estimation** — `DepthEstimationModel` wraps [Depth-Anything-V2](https://github.com/DepthAnything/Depth-Anything-V2) (ViT-based, `vits` encoder). Fine-tuned on MetaDrive frames via Scale-Shift Invariant Loss. Depth is inverted (`1 - normalised`) so closer objects have higher values. Precomputed and cached to disk before policy training for speed.
+
+## Installation
+
+```bash
+# 1. Create environment
+conda create -n metadrive-auto python=3.11 -y
+conda activate metadrive-auto
+
+# 2. Install PyTorch (adjust CUDA version: cu118, cu121, etc.)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# 3. Install project requirements
 pip install -r requirements.txt
-4. Clone and Install Video-Depth-Anything
 
-Bash
+# 4. Clone Depth-Anything-V2 (or use the submodule)
 git clone https://github.com/DepthAnything/Depth-Anything-V2
-cd Depth-Anything-V2
-pip install -r requirements.txt
-cd ..
-Important Parameters and Arguments
-The project is now modularized into specialized scripts. Here are the key arguments you can use:
+cd Depth-Anything-V2 && pip install -r requirements.txt && cd ..
+```
 
-Data Collection (generate_expert_dataset.py)
+For Google Colab: `pip install -r requirements_colab.txt`
 
---episodes: How many episodes of expert data to collect (automatically splits into train/val/test).
+Download the Depth-Anything-V2 checkpoint (`depth_anything_v2_vits.pth`) from the [official repo](https://github.com/DepthAnything/Depth-Anything-V2) and place it in `Depth-Anything-V2/checkpoints/`.
 
---num_cameras: Number of cameras distributed around the vehicle (default: 1).
+## Pipeline
 
---image_on_cuda: Highly recommended. Processes the lane masks and camera data directly on the GPU for a massive speedup.
+### 1. Collect Expert Data
 
-Depth Processing (train_dpt.py)
+```bash
+python src/generate_expert_dataset.py --episodes 100 --image_on_cuda --num_workers 4
+```
 
---mode train: Fine-tunes the Depth-Anything-V2 model on your dataset.
+Parallel workers drive MetaDrive with its built-in expert policy. Auto-splits into train/val/test (80/10/10) on episode boundaries. Output: `.npz` files with keys `rgb`, `action`, `ego_state`, `ego_state_full`.
 
---mode precompute: Runs the DPT model over your dataset and caches the tensors to disk. This skips live inference during policy training.
+### 2. Fine-tune Depth Model (Optional)
 
-Policy Training & Testing (train_test_policy.py)
-
---pred_dir: The directory containing your precomputed DPT predictions. Passing this drastically speeds up training.
-
---test_mode: Choose between offline (evaluates on the test dataset split), simulation (runs the live MetaDrive environment), or all (default).
-
---image_size: The resolution the policy network expects (e.g., 84 or 112). Default is 84.
-
---curriculum_epochs: Number of epochs to transition from fully masked lane images to full RGB.
-
---fully_masked_epochs: Number of initial epochs where the input is strictly lane masked (no RGB).
-
-How to Run the Project
-The pipeline consists of 4 distinct steps: Data Collection, Depth Fine-tuning, Precomputing (for speed), and Policy Training/Testing.
-
-1. Data Collection
-Generate the expert dataset. The script automatically separates the data into train, val, and test folders. We recommend using the --image_on_cuda flag if you have a dedicated GPU.
-
-Bash
-python src/generate_expert_dataset.py --save_dir dataset --episodes 100 --image_on_cuda
-2. Fine-tune the Depth Model (Optional but Recommended)
-Train the Depth-Anything-V2 model specifically on your MetaDrive environment data so it better understands the simulator's depth geometry.
-
-Bash
+```bash
 python src/train_dpt.py --mode train --epochs 5 --data_dir dataset --model_path models/dpt_finetuned.pth
-3. Precompute Depth Predictions (Speed Optimization)
-To avoid running the heavy Depth-Anything-V2 model on every single frame during policy training, precompute and cache the depth and lane mask tensors.
+```
 
-Bash
+### 3. Precompute Depth Predictions
+
+```bash
 python src/train_dpt.py --mode precompute \
     --model_path models/dpt_finetuned.pth \
     --data_dir dataset \
     --out_dir data/processed/dpt_pred
-4. Train the Driving Policy
-Train the Dual-Brain Steering and Throttle/Brake networks using the Asymmetric Loss Function. Point it to the precomputed directory so it trains at maximum speed.
+```
 
-Bash
-python src/train_test_policy.py --mode train \
-    --epochs 30 \
+Caches depth tensors to disk. Skipping live DPT inference during policy training provides a significant speedup.
+
+### 4. Train Policy
+
+```bash
+python src/train_test_policy.py --mode train --epochs 30 \
     --pred_dir data/processed/dpt_pred \
-    --model_path models/policy_model.pth
-
-4.5. Fine-tuning an Existing Policy (Optional)
-You can resume training or fine-tune an existing model using the `--mode finetune` argument. You can also freeze the backbone layers to only train the action head.
-
-Bash
-python src/train_test_policy.py --mode finetune \
-    --finetune_from models/policy_model.pth \
-    --model_path models/policy_finetuned.pth \
-    --epochs 10 --lr 2e-5 --freeze_backbone
-
-5. Autonomous Testing
-Test the fully trained policy. The default `--test_mode` is `all`, which evaluates the model against the offline test dataset (calculating detailed offline metrics like MAE and Braking Accuracy) and then launches the live MetaDrive simulation so you can watch the AI drive and capture expert-agnostic metrics. To run only offline testing, use `--test_mode offline`. To run only simulation, use `--test_mode simulation`.
-
-Bash
-python src/train_test_policy.py --mode test \
     --model_path models/policy_model.pth \
-    --dpt_path models/dpt_finetuned.pth \
-    --data_dir dataset \
+    --arch impala --image_size 84
+```
+
+### 4b. Fine-tune an Existing Checkpoint
+
+```bash
+python src/train_test_policy.py --mode finetune \
+    --finetune_from models/policy_model_best.pth \
+    --model_path models/policy_finetuned.pth \
     --pred_dir data/processed/dpt_pred \
-    --test_mode all
+    --epochs 10 --lr 2e-5 --freeze_backbone
+```
+
+### 5. Offline Test
+
+```bash
+python src/train_test_policy.py --mode test \
+    --model_path models/policy_model_best.pth \
+    --pred_dir data/processed/dpt_pred
+```
+
+Reports steering/accel MAE & MSE, direction accuracy, braking accuracy, Pearson correlation, and predictive metrics (p95 steering error, active/critical turn MAE, jitter ratio, out-of-bounds rate).
+
+### 6. Live Simulation Test
+
+```bash
+python src/test_simulation_policy.py \
+    --model_path models/policy_model_best.pth \
+    --dpt_path models/dpt_finetuned.pth \
+    --arch impala
+```
+
+## Key Arguments
+
+| Script | Argument | Description |
+|---|---|---|
+| `generate_expert_dataset.py` | `--episodes` | Number of expert episodes to collect |
+| | `--image_on_cuda` | Process camera data on GPU (recommended) |
+| | `--num_workers` | Parallel collection workers |
+| `train_dpt.py` | `--mode` | `train` or `precompute` |
+| `train_test_policy.py` | `--arch` | `simple`, `impala`, or `impala_v2` |
+| | `--pred_dir` | Path to precomputed depth cache |
+| | `--image_size` | Input resolution (default: 84) |
+| | `--fully_masked_epochs` | Epochs with lane-only input before curriculum starts |
+| | `--curriculum_epochs` | Epochs to blend from lane-only to full RGB |
+| | `--freeze_backbone` | Freeze CNN during fine-tuning |
+
+## Project Structure
+
+```
+src/
+├── generate_expert_dataset.py  # Expert data collection
+├── train_dpt.py                # Depth model fine-tuning & precomputation
+├── train_test_policy.py        # Policy training, fine-tuning, offline test
+├── test_simulation_policy.py   # Live MetaDrive simulation test
+├── models.py                   # All network definitions + ego-state utilities
+├── data/
+│   └── cameras.py              # Multi-camera rig configuration
+├── policy/
+│   ├── datasets.py             # MetaDriveRGBDataset, PrecomputedDepthDataset
+│   ├── losses.py               # custom_driving_loss, offline/predictive metrics
+│   └── trainer.py              # Epoch loop, lane masking, curriculum logic
+└── utils/
+    ├── checkpoints.py          # save/load checkpoint, freeze backbone
+    └── fps.py                  # FPS measurement
+```
