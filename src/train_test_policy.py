@@ -60,6 +60,8 @@ def train_policy(
     image_size: int = None,
     arch: str = "simple",
     always_lane_masked: bool = False,
+    early_stopping_patience: int = 0,
+    early_stopping_min_delta: float = 0.0,
 ):
     print("--- Phase 2: Training Driving Policy (from scratch) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -85,6 +87,8 @@ def train_policy(
         fully_masked_epochs=fully_masked_epochs,
         image_size=image_size,
         always_lane_masked=always_lane_masked,
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
     )
 
 
@@ -108,6 +112,8 @@ def finetune_policy(
     image_size: int = None,
     arch: str = "simple",
     always_lane_masked: bool = False,
+    early_stopping_patience: int = 0,
+    early_stopping_min_delta: float = 0.0,
 ):
     """
     Fine-tune (or resume) a previously saved policy model.
@@ -162,6 +168,8 @@ def finetune_policy(
         fully_masked_epochs=fully_masked_epochs,
         image_size=image_size,
         always_lane_masked=always_lane_masked,
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
     )
 
 
@@ -305,6 +313,10 @@ if __name__ == "__main__":
     parser.add_argument("--arch", type=str, default="simple", choices=["simple", "impala"])
     parser.add_argument("--always_lane_masked", action="store_true",
                         help="Force alpha=0 (fully lane-masked) for every batch, skipping curriculum")
+    parser.add_argument("--early_stopping_patience", type=int, default=8,
+                        help="Stop if val loss does not improve for this many epochs (0=disabled)")
+    parser.add_argument("--early_stopping_min_delta", type=float, default=0.0,
+                        help="Minimum improvement in val loss to count as progress")
     args = parser.parse_args()
 
     if args.mode in ("train", "all"):
@@ -314,7 +326,9 @@ if __name__ == "__main__":
                      fully_masked_epochs=args.fully_masked_epochs,
                      image_size=args.image_size,
                      arch=args.arch,
-                     always_lane_masked=args.always_lane_masked)
+                     always_lane_masked=args.always_lane_masked,
+                     early_stopping_patience=args.early_stopping_patience,
+                     early_stopping_min_delta=args.early_stopping_min_delta)
 
     if args.mode == "finetune":
         if args.finetune_from is None:
@@ -336,6 +350,8 @@ if __name__ == "__main__":
             image_size=args.image_size,
             arch=args.arch,
             always_lane_masked=args.always_lane_masked,
+            early_stopping_patience=args.early_stopping_patience,
+            early_stopping_min_delta=args.early_stopping_min_delta,
         )
 
     if args.mode in ("test", "all"):

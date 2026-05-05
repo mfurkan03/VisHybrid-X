@@ -247,10 +247,14 @@ def train_loop(
     fully_masked_epochs: int = 3,
     image_size: int = None,
     always_lane_masked: bool = False,
+    early_stopping_patience: int = 0,
+    early_stopping_min_delta: float = 0.0,
 ) -> float:
     """Shared epoch loop used by train_policy and finetune_policy."""
     file_root, file_ext = os.path.splitext(model_path)
     best_path           = f"{file_root}_best{file_ext}"
+
+    no_improve_count = 0
 
     for epoch in range(start_epoch, start_epoch + epochs):
         avg_train, tr_pred, tr_true, tr_ego, _ = run_epoch(
@@ -305,9 +309,17 @@ def train_loop(
             scheduler.step()
 
         save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, model_path)
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
+        if avg_val < best_val_loss - early_stopping_min_delta:
+            best_val_loss    = avg_val
+            no_improve_count = 0
             save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, best_path)
             print(f"*** Best model saved → {best_path}  (Val Loss: {best_val_loss:.4f}) ***")
+        else:
+            no_improve_count += 1
+            if early_stopping_patience > 0:
+                print(f"    [EarlyStopping] No improvement for {no_improve_count}/{early_stopping_patience} epochs")
+            if early_stopping_patience > 0 and no_improve_count >= early_stopping_patience:
+                print(f"[{tag}] Early stopping triggered at epoch {epoch+1}.")
+                break
 
     return best_val_loss
