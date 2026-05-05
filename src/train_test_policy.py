@@ -26,6 +26,7 @@ python src/train_test_policy.py --mode test \
 """
 
 import argparse
+import math
 import os
 
 import numpy as np
@@ -35,6 +36,19 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models import DepthEstimationModel, build_policy
+
+
+def _curriculum_lr_lambda(fully_masked_epochs: int, total_epochs: int, eta_min_ratio: float = 1e-2):
+    """LR schedule: hold at 1.0 during fully-masked phase, drop ×0.1 at curriculum start, cosine anneal after."""
+    drop = 0.1
+    T = max(total_epochs - fully_masked_epochs, 1)
+    def lr_lambda(epoch: int) -> float:
+        if epoch < fully_masked_epochs:
+            return 1.0
+        t = epoch - fully_masked_epochs
+        cosine = eta_min_ratio + 0.5 * (1.0 - eta_min_ratio) * (1 + math.cos(math.pi * t / T))
+        return drop * cosine
+    return lr_lambda
 from policy.datasets import PrecomputedDepthDataset, MetaDriveRGBDataset
 from policy.losses import (custom_driving_loss, compute_offline_metrics,
                            compute_predictive_metrics, compute_heading_metrics)
@@ -75,7 +89,7 @@ def train_policy(
 
     policy_model = build_policy(arch, image_size).to(device)
     optimizer    = optim.AdamW(policy_model.parameters(), lr=lr)
-    scheduler    = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-fully_masked_epochs, eta_min=lr*10**-2) # 3 epochs less steps for scheduler
+    scheduler    = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_curriculum_lr_lambda(fully_masked_epochs, epochs))
 
     train_loop(
         policy_model, device, train_loader, val_loader,
@@ -139,7 +153,7 @@ def finetune_policy(
         freeze_backbone(policy_model)
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, policy_model.parameters()), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 1e-2)
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_curriculum_lr_lambda(fully_masked_epochs, epochs))
 
     restore_opt              = resume and not reset_optimizer
     start_epoch, best_val   = load_checkpoint(

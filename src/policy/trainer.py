@@ -305,8 +305,8 @@ def train_loop(
                 f"HeadMAE: {val_hm['heading_delta_mae']:.4f} | "
                 f"WinDiv Mean/P95: {val_hm['window_heading_div_mean']:.4f}/{val_hm['window_heading_div_p95']:.4f}"
             )
-        if epoch>fully_masked_epochs:
-            scheduler.step()
+        scheduler.step()
+        past_curriculum = epoch >= curriculum_epochs
 
         save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, model_path)
         if avg_val < best_val_loss - early_stopping_min_delta:
@@ -314,7 +314,7 @@ def train_loop(
             no_improve_count = 0
             save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, best_path)
             print(f"*** Best model saved → {best_path}  (Val Loss: {best_val_loss:.4f}) ***")
-        else:
+        elif past_curriculum:
             no_improve_count += 1
             if early_stopping_patience > 0:
                 print(f"    [EarlyStopping] No improvement for {no_improve_count}/{early_stopping_patience} epochs")

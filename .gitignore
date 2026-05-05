@@ -10,3 +10,4 @@ Depth-Anything-V2/checkpoints/*
 dataset
 epoch_visualizations/*
 **/__pycache__
+CLAUDE.md
