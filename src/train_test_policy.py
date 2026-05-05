@@ -59,6 +59,7 @@ def train_policy(
     fully_masked_epochs: int = 3,
     image_size: int = None,
     arch: str = "simple",
+    always_lane_masked: bool = False,
 ):
     print("--- Phase 2: Training Driving Policy (from scratch) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -83,6 +84,7 @@ def train_policy(
         curriculum_epochs=curriculum_epochs,
         fully_masked_epochs=fully_masked_epochs,
         image_size=image_size,
+        always_lane_masked=always_lane_masked,
     )
 
 
@@ -105,6 +107,7 @@ def finetune_policy(
     fully_masked_epochs: int = 3,
     image_size: int = None,
     arch: str = "simple",
+    always_lane_masked: bool = False,
 ):
     """
     Fine-tune (or resume) a previously saved policy model.
@@ -158,6 +161,7 @@ def finetune_policy(
         curriculum_epochs=curriculum_epochs,
         fully_masked_epochs=fully_masked_epochs,
         image_size=image_size,
+        always_lane_masked=always_lane_masked,
     )
 
 
@@ -171,6 +175,7 @@ def test_policy(
     pred_dir:   str = None,
     image_size: int = None,
     arch: str = "simple",
+    always_lane_masked: bool = False,
 ):
     print("--- Phase 3: Offline Testing Driving Policy ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -224,11 +229,13 @@ def test_policy(
                 depth_t   = depth_t.to(device)
                 actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
                 ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
-                combined  = apply_lane_mask(depth_t, rgb_np, device, image_size=image_size)
+                combined  = apply_lane_mask(depth_t, rgb_np, device, image_size=image_size,
+                                            always_lane_masked=always_lane_masked)
             else:
                 rgb_np, actions_np, ego_np, ego_full_np = batch
                 actions_t   = torch.tensor(actions_np, dtype=torch.float32, device=device)
-                combined, _ = extract_features_frozen(rgb_np, depth_estimator, device, image_size=image_size)
+                combined, _ = extract_features_frozen(rgb_np, depth_estimator, device, image_size=image_size,
+                                                      always_lane_masked=always_lane_masked)
                 ego_t       = torch.tensor(ego_np, dtype=torch.float32, device=device)
 
             pred       = policy_model(combined, ego_t)
@@ -296,6 +303,8 @@ if __name__ == "__main__":
     parser.add_argument("--fully_masked_epochs", type=int, default=3)
     parser.add_argument("--image_size", type=int, default=84)
     parser.add_argument("--arch", type=str, default="simple", choices=["simple", "impala"])
+    parser.add_argument("--always_lane_masked", action="store_true",
+                        help="Force alpha=0 (fully lane-masked) for every batch, skipping curriculum")
     args = parser.parse_args()
 
     if args.mode in ("train", "all"):
@@ -304,7 +313,8 @@ if __name__ == "__main__":
                      curriculum_epochs=args.curriculum_epochs,
                      fully_masked_epochs=args.fully_masked_epochs,
                      image_size=args.image_size,
-                     arch=args.arch)
+                     arch=args.arch,
+                     always_lane_masked=args.always_lane_masked)
 
     if args.mode == "finetune":
         if args.finetune_from is None:
@@ -325,8 +335,10 @@ if __name__ == "__main__":
             fully_masked_epochs=args.fully_masked_epochs,
             image_size=args.image_size,
             arch=args.arch,
+            always_lane_masked=args.always_lane_masked,
         )
 
     if args.mode in ("test", "all"):
         test_policy(args.model_path, args.dpt_path, args.data_dir,
-                    pred_dir=args.pred_dir, image_size=args.image_size, arch=args.arch)
+                    pred_dir=args.pred_dir, image_size=args.image_size, arch=args.arch,
+                    always_lane_masked=args.always_lane_masked)

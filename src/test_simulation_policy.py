@@ -25,11 +25,12 @@ from data.cameras import build_cameras
 
 
 def run_simulation(
-    model_path:   str,
-    dpt_path:     str,
-    num_episodes: int = 1,
-    image_size:   int = None,
-    arch:         str = "simple",
+    model_path:         str,
+    dpt_path:           str,
+    num_episodes:       int  = 1,
+    image_size:         int  = None,
+    arch:               str  = "simple",
+    always_lane_masked: bool = False,
 ):
     print("--- Online Evaluation (Simulation) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -84,7 +85,8 @@ def run_simulation(
             rgb_img = rgb_img[..., ::-1].copy()
 
             combined_tensor, _ = extract_features_frozen(
-                rgb_img[np.newaxis], depth_estimator, image_size=image_size,current_epoch=0, device=device
+                rgb_img[np.newaxis], depth_estimator, image_size=image_size, device=device,
+                always_lane_masked=always_lane_masked,
             )
 
             ego_reading = extract_ego_state(env.agent, last_steer=last_steer)
@@ -173,14 +175,17 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str,   required=True)
     parser.add_argument("--dpt_path",   type=str,   default="models/dpt_finetuned.pth")
     parser.add_argument("--episodes",   type=int,   default=1)
-    parser.add_argument("--image_size", type=int,   default=84)
-    parser.add_argument("--arch",       type=str,   default="simple", choices=["simple", "impala"])
+    parser.add_argument("--image_size",         type=int,   default=84)
+    parser.add_argument("--arch",               type=str,   default="simple", choices=["simple", "impala"])
+    parser.add_argument("--always_lane_masked", action="store_true",
+                        help="Force alpha=0 (fully lane-masked) during simulation")
     args = parser.parse_args()
 
     run_simulation(
-        model_path   = args.model_path,
-        dpt_path     = args.dpt_path,
-        num_episodes = args.episodes,
-        image_size   = args.image_size,
-        arch         = args.arch,
+        model_path          = args.model_path,
+        dpt_path            = args.dpt_path,
+        num_episodes        = args.episodes,
+        image_size          = args.image_size,
+        arch                = args.arch,
+        always_lane_masked  = args.always_lane_masked,
     )

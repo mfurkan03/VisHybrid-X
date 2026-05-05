@@ -41,14 +41,17 @@ def apply_lane_mask(
     current_epoch: int = 999,
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
-    image_size: int = None
+    image_size: int = None,
+    always_lane_masked: bool = False,
 ) -> torch.Tensor:
     """
     Applies lane masking at original resolution and interpolates the final result.
     """
-    
+
     # 1. Calculate Alpha for Curriculum Learning
-    if current_epoch < fully_masked_epochs:
+    if always_lane_masked:
+        alpha = 0.0
+    elif current_epoch < fully_masked_epochs:
         alpha = 0.0
     elif current_epoch >= curriculum_epochs:
         alpha = 1.0
@@ -105,7 +108,8 @@ def extract_features_frozen(
     current_epoch: int = 999,
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
-    image_size: int = None
+    image_size: int = None,
+    always_lane_masked: bool = False,
 ):
     with torch.no_grad():
         depth_tensors = depth_estimator.predict_batch_with_grad(np.expand_dims(rgb_batch[0], 0))
@@ -119,7 +123,8 @@ def extract_features_frozen(
         current_epoch=current_epoch,
         curriculum_epochs=curriculum_epochs,
         fully_masked_epochs=fully_masked_epochs,
-        image_size = image_size
+        image_size=image_size,
+        always_lane_masked=always_lane_masked,
     )
 
     ego_zeros = torch.zeros(combined.shape[0], EGO_DIM, device=device)
@@ -164,7 +169,7 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
 def run_epoch(policy_model, loader, optimizer, device,
               use_precomputed, depth_estimator, is_train, desc,
               current_epoch: int = 999, curriculum_epochs: int = 10, fully_masked_epochs: int = 3,
-              image_size: int = None):
+              image_size: int = None, always_lane_masked: bool = False):
     """Run one training or validation epoch. Returns (avg_loss, preds, trues, ego_states, ego_fulls)."""
     policy_model.train() if is_train else policy_model.eval()
     total_loss                           = 0.0
@@ -183,7 +188,8 @@ def run_epoch(policy_model, loader, optimizer, device,
                     current_epoch=current_epoch,
                     curriculum_epochs=curriculum_epochs,
                     fully_masked_epochs=fully_masked_epochs,
-                    image_size=image_size
+                    image_size=image_size,
+                    always_lane_masked=always_lane_masked,
                 )
             else:
                 rgb_np, actions_np, ego_np, ego_full_np = batch
@@ -193,7 +199,8 @@ def run_epoch(policy_model, loader, optimizer, device,
                     current_epoch=current_epoch,
                     curriculum_epochs=curriculum_epochs,
                     fully_masked_epochs=fully_masked_epochs,
-                    image_size=image_size
+                    image_size=image_size,
+                    always_lane_masked=always_lane_masked,
                 )
                 ego_t = torch.tensor(ego_np, dtype=torch.float32, device=device)
 
@@ -239,6 +246,7 @@ def train_loop(
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
     image_size: int = None,
+    always_lane_masked: bool = False,
 ) -> float:
     """Shared epoch loop used by train_policy and finetune_policy."""
     file_root, file_ext = os.path.splitext(model_path)
@@ -252,7 +260,8 @@ def train_loop(
             current_epoch=epoch,
             curriculum_epochs=curriculum_epochs,
             fully_masked_epochs=fully_masked_epochs,
-            image_size=image_size
+            image_size=image_size,
+            always_lane_masked=always_lane_masked,
         )
         avg_val, val_pred, val_true, val_ego, val_ego_full = run_epoch(
             policy_model, val_loader, optimizer, device,
@@ -261,7 +270,8 @@ def train_loop(
             current_epoch=epoch,
             curriculum_epochs=curriculum_epochs,
             fully_masked_epochs=fully_masked_epochs,
-            image_size=image_size
+            image_size=image_size,
+            always_lane_masked=always_lane_masked,
         )
 
         tr_m   = compute_offline_metrics(tr_pred, tr_true)
