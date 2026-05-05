@@ -239,12 +239,12 @@ def train_loop(
     use_precomputed: bool,
     depth_estimator,
     tag:             str = "Train",
-    curriculum_epochs: int = 10,
-    fully_masked_epochs: int = 3,
+    curriculum_epochs: int = None,
+    fully_masked_epochs: int = None,
     image_size: int = None,
     always_lane_masked: bool = False,
-    early_stopping_patience: int = 0,
-    early_stopping_min_delta: float = 0.0,
+    early_stopping_patience: int = None,
+    early_stopping_min_delta: float = None,
 ) -> float:
     """Shared epoch loop used by train_policy and finetune_policy."""
     file_root, file_ext = os.path.splitext(model_path)
