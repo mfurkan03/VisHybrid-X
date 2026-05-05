@@ -162,7 +162,6 @@ def extract_ego_state(agent, last_steer: float = 0.0) -> EgoReading:
         timestamp     = timestamp,
     )
 
-import random
 # ============================================================
 # 3. DRIVING POLICY NETWORKS
 # ============================================================
@@ -205,13 +204,10 @@ class DrivingPolicyNet(nn.Module):
         v = F.relu(self.conv1(x))
         v = F.relu(self.conv2(v))
         v = F.relu(self.conv3(v))
-        
         v = self.flatten(v)
         v = F.relu(self.fc_vis(v))
-        v = self.dropout_vis(v) # Feature seviyesinde dropout
-        
+        v = self.dropout_vis(v)
         e = self.ego_fc(ego)
-        
         return self.fc_out(torch.cat([v, e], dim=1))
 
 class _ImpalaResBlock(nn.Module):

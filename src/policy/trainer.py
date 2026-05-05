@@ -3,10 +3,11 @@ policy/trainer.py – shared epoch loop, data loader builder, and feature extrac
 """
 
 import os
-
 import cv2
+
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -15,7 +16,6 @@ from policy.datasets import MetaDriveRGBDataset, PrecomputedDepthDataset
 from policy.losses import (custom_driving_loss, compute_offline_metrics,
                            compute_predictive_metrics, compute_heading_metrics)
 from utils.checkpoints import save_checkpoint
-
 
 # ============================================================
 # FEATURE EXTRACTION  (live DPT inference path)
@@ -28,11 +28,6 @@ def get_lane_mask_visual(rgb_image: np.ndarray, threshold_value: int = 180) -> n
     gray      = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
     _, mask   = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)
     return mask
-
-
-import torch
-import torch.nn.functional as F
-import numpy as np
 
 def apply_lane_mask(
     depth_tensor: torch.Tensor,
@@ -132,7 +127,8 @@ def extract_features_frozen(
 
 
 # ============================================================
-# DATA LOADER BUILDER
+# MODULE-LEVEL COLLATE FUNCTIONS  (must be at module level for
+# pickling when num_workers > 0 on Windows spawn)
 # ============================================================
 def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_estimator):
     if use_precomputed:
