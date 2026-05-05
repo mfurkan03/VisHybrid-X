@@ -176,7 +176,7 @@ if __name__ == "__main__":
     parser.add_argument("--dpt_path",   type=str,   default="models/dpt_finetuned.pth")
     parser.add_argument("--episodes",   type=int,   default=1)
     parser.add_argument("--image_size",         type=int,   default=84)
-    parser.add_argument("--arch",               type=str,   default="simple", choices=["simple", "impala"])
+    parser.add_argument("--arch",               type=str,   default="simple", choices=["simple", "impala", "impala_v2"])
     parser.add_argument("--always_lane_masked", action="store_true",
                         help="Force alpha=0 (fully lane-masked) during simulation")
     args = parser.parse_args()

@@ -325,7 +325,7 @@ if __name__ == "__main__":
     parser.add_argument("--curriculum_epochs", type=int, default=10)
     parser.add_argument("--fully_masked_epochs", type=int, default=3)
     parser.add_argument("--image_size", type=int, default=84)
-    parser.add_argument("--arch", type=str, default="simple", choices=["simple", "impala"])
+    parser.add_argument("--arch", type=str, default="simple", choices=["simple", "impala", "impala_v2"])
     parser.add_argument("--always_lane_masked", action="store_true",
                         help="Force alpha=0 (fully lane-masked) for every batch, skipping curriculum")
     parser.add_argument("--early_stopping_patience", type=int, default=8,
