@@ -12,8 +12,7 @@ import torch.nn as nn
 
 def custom_driving_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
-
-    smooth_l1 = nn.functional.smooth_l1_loss(pred, target, reduction='none', beta=1.0)
+    smooth_l1 = nn.functional.smooth_l1_loss(pred, target, reduction='none')
     
     brake_mask = (target[:, 1] < -0.1).float()
     
