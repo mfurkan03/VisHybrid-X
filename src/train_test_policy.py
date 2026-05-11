@@ -29,6 +29,13 @@ import argparse
 import math
 import os
 
+BENCHMARK_SEEDS = [0, 1, 2, 3, 4]
+
+
+def _seeded_path(model_path: str, seed: int) -> str:
+    base, ext = os.path.splitext(model_path)
+    return f"{base}_seed_{seed}{ext}"
+
 import numpy as np
 import torch
 import torch.optim as optim
@@ -57,6 +64,7 @@ from policy.trainer import build_loaders, train_loop, extract_features_frozen
 from utils.checkpoints import (
     load_checkpoint, freeze_backbone, print_trainable_params
 )
+from utils.seed import seed_everything
 
 
 # ============================================================
@@ -77,8 +85,10 @@ def train_policy(
     always_lane_masked: bool = False,
     early_stopping_patience: int = 0,
     early_stopping_min_delta: float = 0.0,
+    seed: int = 42,
 ):
     print("--- Phase 2: Training Driving Policy (from scratch) ---")
+    seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     use_precomputed = pred_dir is not None and os.path.isdir(os.path.join(pred_dir, "train"))
@@ -86,7 +96,7 @@ def train_policy(
 
     print(f"[INFO] {'Using PRECOMPUTED DPT from: ' + pred_dir if use_precomputed else 'Live DPT inference.'}")
 
-    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator)
+    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator, seed=seed)
 
     policy_model = build_policy(arch, image_size).to(device)
     optimizer    = optim.AdamW(policy_model.parameters(), lr=lr)
@@ -129,6 +139,7 @@ def finetune_policy(
     always_lane_masked: bool = False,
     early_stopping_patience: int = 0,
     early_stopping_min_delta: float = 0.0,
+    seed: int = 42,
 ):
     """
     Fine-tune (or resume) a previously saved policy model.
@@ -142,12 +153,13 @@ def finetune_policy(
     print(f"    Epochs : {epochs}  |  LR : {lr}  |  Freeze backbone : {freeze_bb}")
     print(f"    Resume optimizer : {resume and not reset_optimizer}")
 
+    seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     use_precomputed = pred_dir is not None and os.path.isdir(os.path.join(pred_dir, "train"))
     depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path)
 
-    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator)
+    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator, seed=seed)
 
     policy_model = build_policy(arch, image_size).to(device)
     if freeze_bb:
@@ -199,8 +211,10 @@ def test_policy(
     image_size: int = None,
     arch: str = "simple",
     always_lane_masked: bool = False,
+    seed: int = 42,
 ):
     print("--- Phase 3: Offline Testing Driving Policy ---")
+    seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     policy_model = build_policy(arch, image_size).to(device)
@@ -332,44 +346,62 @@ if __name__ == "__main__":
                         help="Stop if val loss does not improve for this many epochs (0=disabled)")
     parser.add_argument("--early_stopping_min_delta", type=float, default=0.0,
                         help="Minimum improvement in val loss to count as progress")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Global random seed for reproducibility")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Run training over 5 seeds (0-4); checkpoints saved with _seed_x suffix")
     args = parser.parse_args()
 
+    seeds = BENCHMARK_SEEDS if args.benchmark else [args.seed]
+    if args.benchmark:
+        print(f"[BENCHMARK] Running {len(seeds)} seeds: {seeds}")
+
     if args.mode in ("train", "all"):
-        train_policy(args.epochs, 32, args.model_path,
-                     args.dpt_path, args.data_dir, args.lr, pred_dir=args.pred_dir,
-                     curriculum_epochs=args.curriculum_epochs,
-                     fully_masked_epochs=args.fully_masked_epochs,
-                     image_size=args.image_size,
-                     arch=args.arch,
-                     always_lane_masked=args.always_lane_masked,
-                     early_stopping_patience=args.early_stopping_patience,
-                     early_stopping_min_delta=args.early_stopping_min_delta)
+        for seed in seeds:
+            mp = _seeded_path(args.model_path, seed) if args.benchmark else args.model_path
+            if args.benchmark:
+                print(f"\n[BENCHMARK] === Seed {seed} — checkpoint: {mp} ===")
+            train_policy(args.epochs, 32, mp,
+                         args.dpt_path, args.data_dir, args.lr, pred_dir=args.pred_dir,
+                         curriculum_epochs=args.curriculum_epochs,
+                         fully_masked_epochs=args.fully_masked_epochs,
+                         image_size=args.image_size,
+                         arch=args.arch,
+                         always_lane_masked=args.always_lane_masked,
+                         early_stopping_patience=args.early_stopping_patience,
+                         early_stopping_min_delta=args.early_stopping_min_delta,
+                         seed=seed)
 
     if args.mode == "finetune":
         if args.finetune_from is None:
             parser.error("--finetune_from is required when --mode finetune")
-        finetune_policy(
-            finetune_from   = args.finetune_from,
-            epochs          = args.epochs,
-            batch_size      = 32,
-            model_path      = args.model_path,
-            dpt_path        = args.dpt_path,
-            data_dir        = args.data_dir,
-            lr              = args.lr if args.lr != 1e-4 else 1e-6,
-            pred_dir        = args.pred_dir,
-            freeze_bb       = args.freeze_backbone,
-            reset_optimizer = args.reset_optimizer,
-            resume          = args.resume,
-            curriculum_epochs=args.curriculum_epochs,
-            fully_masked_epochs=args.fully_masked_epochs,
-            image_size=args.image_size,
-            arch=args.arch,
-            always_lane_masked=args.always_lane_masked,
-            early_stopping_patience=args.early_stopping_patience,
-            early_stopping_min_delta=args.early_stopping_min_delta,
-        )
+        for seed in seeds:
+            mp = _seeded_path(args.model_path, seed) if args.benchmark else args.model_path
+            if args.benchmark:
+                print(f"\n[BENCHMARK] === Seed {seed} — checkpoint: {mp} ===")
+            finetune_policy(
+                finetune_from   = args.finetune_from,
+                epochs          = args.epochs,
+                batch_size      = 32,
+                model_path      = mp,
+                dpt_path        = args.dpt_path,
+                data_dir        = args.data_dir,
+                lr              = args.lr if args.lr != 1e-4 else 1e-6,
+                pred_dir        = args.pred_dir,
+                freeze_bb       = args.freeze_backbone,
+                reset_optimizer = args.reset_optimizer,
+                resume          = args.resume,
+                curriculum_epochs=args.curriculum_epochs,
+                fully_masked_epochs=args.fully_masked_epochs,
+                image_size=args.image_size,
+                arch=args.arch,
+                always_lane_masked=args.always_lane_masked,
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_min_delta=args.early_stopping_min_delta,
+                seed=seed,
+            )
 
     if args.mode in ("test", "all"):
         test_policy(args.model_path, args.dpt_path, args.data_dir,
                     pred_dir=args.pred_dir, image_size=args.image_size, arch=args.arch,
-                    always_lane_masked=args.always_lane_masked)
+                    always_lane_masked=args.always_lane_masked, seed=args.seed)

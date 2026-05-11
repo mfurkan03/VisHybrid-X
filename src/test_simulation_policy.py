@@ -22,6 +22,7 @@ from metadrive.component.sensors.rgb_camera import RGBCamera
 from models import DepthEstimationModel, build_policy, extract_ego_state
 from policy.trainer import extract_features_frozen
 from data.cameras import build_cameras
+from utils.seed import seed_everything
 
 
 def run_simulation(
@@ -31,8 +32,10 @@ def run_simulation(
     image_size:         int  = None,
     arch:               str  = "simple",
     always_lane_masked: bool = False,
+    seed:               int  = 42,
 ):
     print("--- Online Evaluation (Simulation) ---")
+    seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     policy_model = build_policy(arch, image_size).to(device)
@@ -56,7 +59,7 @@ def run_simulation(
         "vehicle_config":    {"image_source": rgb_name},
         "show_interface":    False,
         "image_on_cuda":     False,
-        "start_seed":        316181,
+        "start_seed":        316182,
     }
     env = MetaDriveEnv(config)
 
@@ -179,6 +182,8 @@ if __name__ == "__main__":
     parser.add_argument("--arch",               type=str,   default="simple", choices=["simple", "impala", "impala_v2"])
     parser.add_argument("--always_lane_masked", action="store_true",
                         help="Force alpha=0 (fully lane-masked) during simulation")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Global random seed for reproducibility")
     args = parser.parse_args()
 
     run_simulation(
@@ -188,4 +193,5 @@ if __name__ == "__main__":
         image_size          = args.image_size,
         arch                = args.arch,
         always_lane_masked  = args.always_lane_masked,
+        seed                = args.seed,
     )

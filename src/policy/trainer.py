@@ -2,6 +2,7 @@
 policy/trainer.py – shared epoch loop, data loader builder, and feature extractor.
 """
 
+import csv
 import os
 import cv2
 
@@ -16,6 +17,7 @@ from policy.datasets import MetaDriveRGBDataset, PrecomputedDepthDataset
 from policy.losses import (custom_driving_loss, compute_offline_metrics,
                            compute_predictive_metrics, compute_heading_metrics)
 from utils.checkpoints import save_checkpoint
+from utils.seed import worker_init_fn
 
 # ============================================================
 # FEATURE EXTRACTION  (live DPT inference path)
@@ -130,7 +132,8 @@ def extract_features_frozen(
 # MODULE-LEVEL COLLATE FUNCTIONS  (must be at module level for
 # pickling when num_workers > 0 on Windows spawn)
 # ============================================================
-def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_estimator):
+def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_estimator,
+                  seed: int = 0):
     if use_precomputed:
         train_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="train")
         val_ds   = PrecomputedDepthDataset(pred_dir=pred_dir, split="val")
@@ -154,8 +157,12 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
             return (np.stack(rgbs), np.stack(actions), np.stack(egos),
                     np.zeros((n, 5), dtype=np.float32))
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  collate_fn=collate_fn)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    g = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              collate_fn=collate_fn, generator=g,
+                              worker_init_fn=worker_init_fn)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              collate_fn=collate_fn, worker_init_fn=worker_init_fn)
     return train_loader, val_loader
 
 
@@ -251,6 +258,24 @@ def train_loop(
     best_path           = f"{file_root}_best{file_ext}"
 
     no_improve_count = 0
+    best_epoch       = -1
+    best_metrics     = None
+
+    csv_path    = f"{file_root}_metrics.csv"
+    csv_headers = [
+        "epoch", "train_loss", "val_loss", "lr",
+        "steering_mae_train", "accel_mae_train",
+        "steering_mae_val", "accel_mae_val", "steering_mse_val", "accel_mse_val",
+        "steering_dir_acc_val", "direction_acc_val", "brake_acc_val", "steering_corr_val",
+        "steer_p95_error", "active_turn_mae", "critical_turn_mae",
+        "jitter_ratio", "out_of_bounds_rate", "speed_weighted_steer_mae", "pre_brake_anticipation",
+        "heading_dir_acc", "heading_delta_mae", "window_heading_div_mean", "window_heading_div_p95",
+    ]
+    write_header = not os.path.exists(csv_path)
+    csv_file     = open(csv_path, "a", newline="")
+    csv_writer   = csv.DictWriter(csv_file, fieldnames=csv_headers)
+    if write_header:
+        csv_writer.writeheader()
 
     for epoch in range(start_epoch, start_epoch + epochs):
         avg_train, tr_pred, tr_true, tr_ego, _ = run_epoch(
@@ -301,12 +326,47 @@ def train_loop(
                 f"HeadMAE: {val_hm['heading_delta_mae']:.4f} | "
                 f"WinDiv Mean/P95: {val_hm['window_heading_div_mean']:.4f}/{val_hm['window_heading_div_p95']:.4f}"
             )
+        current_lr = scheduler.get_last_lr()[0]
+        csv_writer.writerow({
+            "epoch":                  epoch + 1,
+            "train_loss":             round(avg_train, 6),
+            "val_loss":               round(avg_val,   6),
+            "lr":                     current_lr,
+            "steering_mae_train":     round(tr_m["steering_mae"],      6),
+            "accel_mae_train":        round(tr_m["accel_mae"],         6),
+            "steering_mae_val":       round(val_m["steering_mae"],     6),
+            "accel_mae_val":          round(val_m["accel_mae"],        6),
+            "steering_mse_val":       round(val_m["steering_mse"],     6),
+            "accel_mse_val":          round(val_m["accel_mse"],        6),
+            "steering_dir_acc_val":   round(val_m["steering_dir_acc"], 6),
+            "direction_acc_val":      round(val_m["direction_acc"],    6),
+            "brake_acc_val":          round(val_m["brake_acc"],        6),
+            "steering_corr_val":      round(val_m["steering_corr"],    6),
+            "steer_p95_error":        round(val_pm["steer_p95_error"],           6),
+            "active_turn_mae":        round(val_pm["active_turn_mae"],           6),
+            "critical_turn_mae":      round(val_pm["critical_turn_mae"],         6),
+            "jitter_ratio":           round(val_pm["jitter_ratio"],              6),
+            "out_of_bounds_rate":     round(val_pm["out_of_bounds_rate"],        6),
+            "speed_weighted_steer_mae": round(val_pm["speed_weighted_steer_mae"],6),
+            "pre_brake_anticipation": round(val_pm["pre_brake_anticipation"],    6),
+            "heading_dir_acc":          round(val_hm["heading_dir_acc"],           6) if val_hm else "",
+            "heading_delta_mae":        round(val_hm["heading_delta_mae"],         6) if val_hm else "",
+            "window_heading_div_mean":  round(val_hm["window_heading_div_mean"],   6) if val_hm else "",
+            "window_heading_div_p95":   round(val_hm["window_heading_div_p95"],    6) if val_hm else "",
+        })
+        csv_file.flush()
+
         scheduler.step()
         past_curriculum = epoch >= fully_masked_epochs + curriculum_epochs
 
         save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, model_path)
         if past_curriculum and avg_val < best_val_loss - early_stopping_min_delta:
             best_val_loss    = avg_val
+            best_epoch       = epoch + 1
+            best_metrics     = dict(
+                train_loss=avg_train, val_loss=avg_val,
+                tr_m=tr_m, val_m=val_m, val_pm=val_pm, val_hm=val_hm,
+            )
             no_improve_count = 0
             save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, best_path)
             print(f"*** Best model saved → {best_path}  (Val Loss: {best_val_loss:.4f}) ***")
@@ -317,5 +377,42 @@ def train_loop(
             if early_stopping_patience > 0 and no_improve_count >= early_stopping_patience:
                 print(f"[{tag}] Early stopping triggered at epoch {epoch+1}.")
                 break
+
+    csv_file.close()
+    print(f"[{tag}] Metrics saved → {csv_path}")
+
+    sep = "=" * 64
+    if best_metrics:
+        bm  = best_metrics
+        print(f"\n{sep}")
+        print(f"[{tag}] TRAINING COMPLETE  —  Best checkpoint: epoch {best_epoch}")
+        print(sep)
+        print(f"  Loss  Train / Val    : {bm['train_loss']:.4f} / {bm['val_loss']:.4f}")
+        print(f"  Steer MAE  Tr / Val  : {bm['tr_m']['steering_mae']:.4f} / {bm['val_m']['steering_mae']:.4f}")
+        print(f"  Accel MAE  Tr / Val  : {bm['tr_m']['accel_mae']:.4f} / {bm['val_m']['accel_mae']:.4f}")
+        print(f"  Steer MSE  (val)     : {bm['val_m']['steering_mse']:.4f}")
+        print(f"  Accel MSE  (val)     : {bm['val_m']['accel_mse']:.4f}")
+        print(f"  Steer Dir Acc (val)  : {bm['val_m']['steering_dir_acc']*100:.1f}%")
+        print(f"  Accel Dir Acc (val)  : {bm['val_m']['direction_acc']*100:.1f}%")
+        print(f"  Braking Acc   (val)  : {bm['val_m']['brake_acc']*100:.1f}%")
+        print(f"  Steering Corr (val)  : {bm['val_m']['steering_corr']:.4f}")
+        print(f"  --- Predictive ---")
+        print(f"  P95 Steer Err        : {bm['val_pm']['steer_p95_error']:.4f}")
+        print(f"  Active Turn MAE      : {bm['val_pm']['active_turn_mae']:.4f}")
+        print(f"  Critical Turn MAE    : {bm['val_pm']['critical_turn_mae']:.4f}")
+        print(f"  Jitter Ratio         : {bm['val_pm']['jitter_ratio']:.3f}  (1.0=expert)")
+        print(f"  Out-of-Bounds Rate   : {bm['val_pm']['out_of_bounds_rate']*100:.1f}%")
+        print(f"  Speed-Weighted MAE   : {bm['val_pm']['speed_weighted_steer_mae']:.4f}")
+        print(f"  Pre-Brake Anticipation: {bm['val_pm']['pre_brake_anticipation']*100:.1f}%")
+        if bm['val_hm']:
+            print(f"  --- Heading ---")
+            print(f"  Heading Dir Acc      : {bm['val_hm']['heading_dir_acc']*100:.1f}%")
+            print(f"  Heading Delta MAE    : {bm['val_hm']['heading_delta_mae']:.4f}")
+            print(f"  Window Div Mean/P95  : {bm['val_hm']['window_heading_div_mean']:.4f} / {bm['val_hm']['window_heading_div_p95']:.4f}")
+        print(sep)
+    else:
+        print(f"\n{sep}")
+        print(f"[{tag}] TRAINING COMPLETE  —  No best checkpoint saved (curriculum not yet passed or no improvement).")
+        print(sep)
 
     return best_val_loss
