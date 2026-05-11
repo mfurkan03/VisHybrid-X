@@ -100,7 +100,7 @@ class DepthEstimationModel:
 # ============================================================
 
 # Only total_speed and last_steer are passed to the policy network.
-EGO_DIM = 2  # [total_speed, last_steer]
+EGO_DIM = 3  # [total_speed, last_steer, heading_delta]
 
 
 class EgoReading(NamedTuple):
@@ -129,7 +129,7 @@ class EgoReading(NamedTuple):
     @property
     def ego_model(self) -> np.ndarray:
         """Return the (EGO_DIM,) array actually fed to the policy network."""
-        return np.array([self.total_speed, self.last_steer], dtype=np.float32)
+        return np.array([self.total_speed, self.last_steer, self.heading_delta], dtype=np.float32)
 
 
 def extract_ego_state(agent, last_steer: float = 0.0) -> EgoReading:

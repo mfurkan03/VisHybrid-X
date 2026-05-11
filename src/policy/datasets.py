@@ -124,10 +124,11 @@ class PrecomputedDepthDataset(Dataset):
         return len(self.actions)
 
     def __getitem__(self, idx):
+        ego_full = np.array(self.ego_full_states[idx], dtype=np.float32)
         return (
             self.depth_frames[idx],
             self.rgb_frames[idx],
-            np.array(self.actions[idx],         dtype=np.float32),
-            np.array(self.ego_states[idx],      dtype=np.float32),
-            np.array(self.ego_full_states[idx], dtype=np.float32),
+            np.array(self.actions[idx], dtype=np.float32),
+            ego_full[[0, 1, 4]],  # [total_speed, last_steer, heading_delta] → EGO_DIM=3
+            ego_full,             # full 5-dim kept for heading metrics
         )

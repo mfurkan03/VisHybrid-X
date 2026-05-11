@@ -28,11 +28,12 @@ from utils.seed import seed_everything
 def run_simulation(
     model_path:         str,
     dpt_path:           str,
-    num_episodes:       int  = 1,
-    image_size:         int  = None,
-    arch:               str  = "simple",
-    always_lane_masked: bool = False,
-    seed:               int  = 42,
+    num_episodes:       int   = 1,
+    image_size:         int   = None,
+    arch:               str   = "simple",
+    always_lane_masked: bool  = False,
+    seed:               int   = 42,
+    steer_momentum:     float = 0.0,
 ):
     print("--- Online Evaluation (Simulation) ---")
     seed_everything(seed)
@@ -97,6 +98,7 @@ def run_simulation(
 
             with torch.no_grad():
                 pred_action = policy_model(combined_tensor, ego_t).cpu().numpy()[0]
+            pred_action[0] = steer_momentum * last_steer + (1.0 - steer_momentum) * pred_action[0]
             last_steer = float(pred_action[0])
 
             # HUD visualisation
@@ -184,6 +186,10 @@ if __name__ == "__main__":
                         help="Force alpha=0 (fully lane-masked) during simulation")
     parser.add_argument("--seed", type=int, default=42,
                         help="Global random seed for reproducibility")
+    parser.add_argument("--steer_momentum", type=float, default=0.0,
+                        help="Steering low-pass filter (0=off, 0.35=moderate). "
+                             "Reduces jitter but does not fix directional ambiguity at "
+                             "intersections. Enable only if the retrained model still oscillates.")
     args = parser.parse_args()
 
     run_simulation(
@@ -194,4 +200,5 @@ if __name__ == "__main__":
         arch                = args.arch,
         always_lane_masked  = args.always_lane_masked,
         seed                = args.seed,
+        steer_momentum      = args.steer_momentum,
     )

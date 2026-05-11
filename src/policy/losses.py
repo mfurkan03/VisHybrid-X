@@ -11,14 +11,14 @@ import torch
 import torch.nn as nn
 
 def custom_driving_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-
-    smooth_l1 = nn.functional.smooth_l1_loss(pred, target, reduction='none')
-    
-    brake_mask = (target[:, 1] < -0.1).float()
-    
-    penalty = 1.0 + brake_mask * 1.0
+    smooth_l1    = nn.functional.smooth_l1_loss(pred, target, reduction='none')
     weighted_loss = smooth_l1.clone()
-    weighted_loss[:, 1] = smooth_l1[:, 1] * penalty
+    # 3x weight on hard turns (|steer| > 0.1) — counteracts straight-road dominance
+    turn_weight  = 1.0 + (target[:, 0].abs() > 0.1).float() * 2.0
+    weighted_loss[:, 0] = smooth_l1[:, 0] * turn_weight
+    # 3x weight on braking events
+    brake_weight = 1.0 + (target[:, 1] < -0.1).float() * 2.0
+    weighted_loss[:, 1] = smooth_l1[:, 1] * brake_weight
     return weighted_loss.mean()
 
 def compute_predictive_metrics(
