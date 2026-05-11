@@ -17,8 +17,8 @@ def custom_driving_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tenso
     turn_weight  = 1.0 + (target[:, 0].abs() > 0.1).float() * 2.0
     weighted_loss[:, 0] = smooth_l1[:, 0] * turn_weight
     # 3x weight on braking events
-    brake_weight = 1.0 + (target[:, 1] < -0.1).float() * 2.0
-    weighted_loss[:, 1] = smooth_l1[:, 1] * brake_weight
+    brake_weight = 1.0 + (target[:, 1] < -0.1).float() * 1.0
+    weighted_loss[:, 1] = smooth_l1[:, 1] * brake_weight  # matches original 2x brake penalty (1+1)
     return weighted_loss.mean()
 
 def compute_predictive_metrics(
