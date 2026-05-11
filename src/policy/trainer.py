@@ -98,6 +98,61 @@ def apply_lane_mask(
 
     return combined_tensor
 
+def apply_augmentations(
+    combined: torch.Tensor,
+    actions_np: np.ndarray,
+    ego_np: np.ndarray,
+    prob_pixel_noise: float = 1.0,
+    prob_hflip: float = 0.5,
+    prob_grayscale: float = 0.1,
+) -> tuple:
+    """
+    Per-sample stochastic augmentations applied to the combined (4, H, W) tensor.
+
+    - Pixel noise  : Gaussian noise (std=0.05) on 10 % of pixels, RGB channels only.
+    - Horizontal flip : flips image + negates steer, last_steer, heading_delta.
+    - Grayscale    : RGB → luminance, depth channel untouched.
+
+    prob_* is the per-sample probability; 0.0 disables the augmentation entirely.
+    """
+    actions_out = actions_np.copy()
+    ego_out     = ego_np.copy()
+    imgs        = list(combined.unbind(0))
+
+    for i, img in enumerate(imgs):
+        img = img.clone()
+        H, W = img.shape[1], img.shape[2]
+
+        if prob_pixel_noise > 0.0 and np.random.random() < prob_pixel_noise:
+            n_pix  = max(1, int(0.10 * H * W))
+            ys     = np.random.randint(0, H, n_pix)
+            xs     = np.random.randint(0, W, n_pix)
+            noise  = torch.zeros_like(img)
+            noise[1:4, ys, xs] = torch.tensor(
+                np.random.normal(0.0, 0.05, (3, n_pix)).astype(np.float32),
+                device=img.device,
+            )
+            img = (img + noise).clamp(0.0, 1.0)
+
+        if prob_hflip > 0.0 and np.random.random() < prob_hflip:
+            img = torch.flip(img, dims=[2])
+            actions_out[i, 0] *= -1
+            if ego_out.shape[1] > 1:
+                ego_out[i, 1] *= -1   # last_steer
+            if ego_out.shape[1] > 2:
+                ego_out[i, 2] *= -1   # heading_delta
+
+        if prob_grayscale > 0.0 and np.random.random() < prob_grayscale:
+            gray   = 0.299 * img[1] + 0.587 * img[2] + 0.114 * img[3]
+            img[1] = gray
+            img[2] = gray
+            img[3] = gray
+
+        imgs[i] = img
+
+    return torch.stack(imgs), actions_out, ego_out
+
+
 def extract_features_frozen(
     rgb_batch,
     depth_estimator,
@@ -185,21 +240,22 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
 def run_epoch(policy_model, loader, optimizer, device,
               use_precomputed, depth_estimator, is_train, desc,
               current_epoch: int = 999, curriculum_epochs: int = 10, fully_masked_epochs: int = 3,
-              image_size: int = None, always_lane_masked: bool = False):
+              image_size: int = None, always_lane_masked: bool = False,
+              prob_pixel_noise: float = 0.0, prob_hflip: float = 0.0, prob_grayscale: float = 0.0):
     """Run one training or validation epoch. Returns (avg_loss, preds, trues, ego_states, ego_fulls)."""
     policy_model.train() if is_train else policy_model.eval()
     total_loss                           = 0.0
     all_pred, all_true, all_ego, all_ego_full = [], [], [], []
+
+    aug_active = is_train and current_epoch >= fully_masked_epochs
 
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     with ctx:
         for batch in tqdm(loader, desc=desc, leave=False):
             if use_precomputed:
                 depth_t, rgb_np, actions_np, ego_np, ego_full_np = batch
-                depth_t   = depth_t.to(device)
-                actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
-                ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
-                combined  = apply_lane_mask(
+                depth_t  = depth_t.to(device)
+                combined = apply_lane_mask(
                     depth_t, rgb_np, device,
                     current_epoch=current_epoch,
                     curriculum_epochs=curriculum_epochs,
@@ -209,7 +265,6 @@ def run_epoch(policy_model, loader, optimizer, device,
                 )
             else:
                 rgb_np, actions_np, ego_np, ego_full_np = batch
-                actions_t   = torch.tensor(actions_np, dtype=torch.float32, device=device)
                 combined, _ = extract_features_frozen(
                     rgb_np, depth_estimator, device,
                     current_epoch=current_epoch,
@@ -218,7 +273,17 @@ def run_epoch(policy_model, loader, optimizer, device,
                     image_size=image_size,
                     always_lane_masked=always_lane_masked,
                 )
-                ego_t = torch.tensor(ego_np, dtype=torch.float32, device=device)
+
+            if aug_active:
+                combined, actions_np, ego_np = apply_augmentations(
+                    combined, actions_np, ego_np,
+                    prob_pixel_noise=prob_pixel_noise,
+                    prob_hflip=prob_hflip,
+                    prob_grayscale=prob_grayscale,
+                )
+
+            actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
+            ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
 
             if is_train:
                 optimizer.zero_grad()
@@ -265,6 +330,9 @@ def train_loop(
     always_lane_masked: bool = False,
     early_stopping_patience: int = None,
     early_stopping_min_delta: float = None,
+    prob_pixel_noise: float = 0.0,
+    prob_hflip: float = 0.0,
+    prob_grayscale: float = 0.0,
 ) -> float:
     """Shared epoch loop used by train_policy and finetune_policy."""
     file_root, file_ext = os.path.splitext(model_path)
@@ -300,6 +368,9 @@ def train_loop(
             fully_masked_epochs=fully_masked_epochs,
             image_size=image_size,
             always_lane_masked=always_lane_masked,
+            prob_pixel_noise=prob_pixel_noise,
+            prob_hflip=prob_hflip,
+            prob_grayscale=prob_grayscale,
         )
         avg_val, val_pred, val_true, val_ego, val_ego_full = run_epoch(
             policy_model, val_loader, optimizer, device,

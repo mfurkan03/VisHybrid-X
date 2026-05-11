@@ -14,7 +14,7 @@ def custom_driving_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tenso
     smooth_l1    = nn.functional.smooth_l1_loss(pred, target, reduction='none')
     weighted_loss = smooth_l1.clone()
     # 3x weight on hard turns (|steer| > 0.1) — counteracts straight-road dominance
-    turn_weight  = 1.0 + (target[:, 0].abs() > 0.1).float() * 2.0
+    turn_weight  = 1.0 + (target[:, 0].abs() > 0.1).float() * 0.5
     weighted_loss[:, 0] = smooth_l1[:, 0] * turn_weight
     # 3x weight on braking events
     brake_weight = 1.0 + (target[:, 1] < -0.1).float() * 1.0

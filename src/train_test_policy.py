@@ -86,6 +86,9 @@ def train_policy(
     early_stopping_patience: int = 0,
     early_stopping_min_delta: float = 0.0,
     seed: int = 42,
+    prob_pixel_noise: float = 1.0,
+    prob_hflip: float = 0.5,
+    prob_grayscale: float = 0.1,
 ):
     print("--- Phase 2: Training Driving Policy (from scratch) ---")
     seed_everything(seed)
@@ -114,6 +117,9 @@ def train_policy(
         always_lane_masked=always_lane_masked,
         early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=early_stopping_min_delta,
+        prob_pixel_noise=prob_pixel_noise,
+        prob_hflip=prob_hflip,
+        prob_grayscale=prob_grayscale,
     )
 
 
@@ -140,6 +146,9 @@ def finetune_policy(
     early_stopping_patience: int = 0,
     early_stopping_min_delta: float = 0.0,
     seed: int = 42,
+    prob_pixel_noise: float = 1.0,
+    prob_hflip: float = 0.5,
+    prob_grayscale: float = 0.1,
 ):
     """
     Fine-tune (or resume) a previously saved policy model.
@@ -197,6 +206,9 @@ def finetune_policy(
         always_lane_masked=always_lane_masked,
         early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=early_stopping_min_delta,
+        prob_pixel_noise=prob_pixel_noise,
+        prob_hflip=prob_hflip,
+        prob_grayscale=prob_grayscale,
     )
 
 
@@ -350,6 +362,12 @@ if __name__ == "__main__":
                         help="Global random seed for reproducibility")
     parser.add_argument("--benchmark", action="store_true",
                         help="Run training over 5 seeds (0-4); checkpoints saved with _seed_x suffix")
+    parser.add_argument("--aug_pixel_noise", type=float, default=1.0,
+                        help="Probability [0-1] of adding Gaussian noise to 10%% of RGB pixels per sample (0=off)")
+    parser.add_argument("--aug_hflip", type=float, default=0.5,
+                        help="Probability [0-1] of horizontal flip per sample; negates steer and heading_delta (0=off)")
+    parser.add_argument("--aug_grayscale", type=float, default=0.1,
+                        help="Probability [0-1] of converting RGB to grayscale per sample (0=off)")
     args = parser.parse_args()
 
     seeds = BENCHMARK_SEEDS if args.benchmark else [args.seed]
@@ -370,7 +388,10 @@ if __name__ == "__main__":
                          always_lane_masked=args.always_lane_masked,
                          early_stopping_patience=args.early_stopping_patience,
                          early_stopping_min_delta=args.early_stopping_min_delta,
-                         seed=seed)
+                         seed=seed,
+                         prob_pixel_noise=args.aug_pixel_noise,
+                         prob_hflip=args.aug_hflip,
+                         prob_grayscale=args.aug_grayscale)
 
     if args.mode == "finetune":
         if args.finetune_from is None:
@@ -399,6 +420,9 @@ if __name__ == "__main__":
                 early_stopping_patience=args.early_stopping_patience,
                 early_stopping_min_delta=args.early_stopping_min_delta,
                 seed=seed,
+                prob_pixel_noise=args.aug_pixel_noise,
+                prob_hflip=args.aug_hflip,
+                prob_grayscale=args.aug_grayscale,
             )
 
     if args.mode in ("test", "all"):
