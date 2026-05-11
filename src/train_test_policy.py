@@ -45,7 +45,7 @@ from tqdm import tqdm
 from models import DepthEstimationModel, build_policy
 
 
-def _curriculum_lr_lambda(fully_masked_epochs: int, total_epochs: int, eta_min_ratio: float = 1e-2):
+def _curriculum_lr_lambda(fully_masked_epochs: int, total_epochs: int, eta_min_ratio: float = 5e-2):
     """LR schedule: hold at 1.0 during fully-masked phase, drop ×0.1 at curriculum start, cosine anneal after."""
     drop = 0.1
     T = max(total_epochs - fully_masked_epochs, 1)
