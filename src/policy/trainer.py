@@ -160,7 +160,13 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
     from torch.utils.data import WeightedRandomSampler
     actions_np = np.array(train_ds.actions)
     steer_mag  = np.abs(actions_np[:, 0])
-    weights    = np.clip(1.0 + steer_mag * 2.0, 1.0, 3.0)  # straight 1x, hard turn ≤3x
+    # Bin turns so each magnitude category is equally represented:
+    #   0: straight (<0.05), 1: light (0.05-0.15), 2: moderate (0.15-0.3), 3: sharp (>0.3)
+    bins    = np.digitize(steer_mag, [0.05, 0.15, 0.3])
+    weights = np.zeros(len(steer_mag), dtype=np.float64)
+    for b in np.unique(bins):
+        mask        = bins == b
+        weights[mask] = 1.0 / mask.sum()   # inverse frequency within bin
     sampler    = WeightedRandomSampler(
         torch.tensor(weights, dtype=torch.float64),
         num_samples=len(train_ds),
