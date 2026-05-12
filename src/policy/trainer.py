@@ -215,8 +215,12 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
     from torch.utils.data import WeightedRandomSampler
     actions_np = np.array(train_ds.actions)
     steer_mag  = np.abs(actions_np[:, 0])
-    bins       = (steer_mag >= 0.02).astype(int)   # 0: straight, 1: turning
-    weights    = np.where(bins == 0, 0.5 / (bins == 0).sum(), 0.5 / (bins == 1).sum())
+    bins       = np.digitize(steer_mag, [0.02, 0.2])  # 0: straight, 1: turning, 2: intersection
+    bin_targets = {0: 0.48, 1: 0.47, 2: 0.05}
+    weights    = np.zeros(len(steer_mag), dtype=np.float64)
+    for b in np.unique(bins):
+        mask          = bins == b
+        weights[mask] = bin_targets[b] / mask.sum()
     sampler    = WeightedRandomSampler(
         torch.tensor(weights, dtype=torch.float64),
         num_samples=len(train_ds),

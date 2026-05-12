@@ -18,6 +18,7 @@ import torch
 
 from metadrive import MetaDriveEnv
 from metadrive.component.sensors.rgb_camera import RGBCamera
+from metadrive.examples import expert
 
 from models import DepthEstimationModel, build_policy, extract_ego_state
 from policy.trainer import extract_features_frozen
@@ -39,16 +40,19 @@ def run_simulation(
     seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    policy_model = build_policy(arch, image_size).to(device)
-    ckpt = torch.load(model_path, map_location=device)
-    if isinstance(ckpt, dict):
-        key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
-        policy_model.load_state_dict(ckpt[key] if key else ckpt)
-    else:
-        policy_model.load_state_dict(ckpt)
-    policy_model.eval()
+    use_expert = arch == "expert"
 
-    depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
+    if not use_expert:
+        policy_model = build_policy(arch, image_size).to(device)
+        ckpt = torch.load(model_path, map_location=device)
+        if isinstance(ckpt, dict):
+            key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
+            policy_model.load_state_dict(ckpt[key] if key else ckpt)
+        else:
+            policy_model.load_state_dict(ckpt)
+        policy_model.eval()
+
+    depth_estimator = None if use_expert else DepthEstimationModel(finetuned_path=dpt_path)
 
     angles, sensors, rgb_cam_names, _ = build_cameras(1)
     rgb_name = rgb_cam_names[0]
@@ -79,50 +83,67 @@ def run_simulation(
 
         while not done:
             step_count += 1
-            rgb_img = env.engine.get_sensor(rgb_name).perceive(
-                to_float=False, new_parent_node=env.agent.origin
-            )
-            if hasattr(rgb_img, "get"):
-                rgb_img = rgb_img.get()
-            rgb_img = np.array(rgb_img, dtype=np.uint8)
-            # MetaDrive RGBCamera natively returns BGR; convert to RGB
-            rgb_img = rgb_img[..., ::-1].copy()
-
-            combined_tensor, _ = extract_features_frozen(
-                rgb_img[np.newaxis], depth_estimator, image_size=image_size, device=device,
-                always_lane_masked=always_lane_masked,
-            )
 
             ego_reading = extract_ego_state(env.agent, last_steer=last_steer)
-            ego_t = torch.tensor(ego_reading.ego_model, dtype=torch.float32, device=device).unsqueeze(0)
 
-            with torch.no_grad():
-                pred_action = policy_model(combined_tensor, ego_t).cpu().numpy()[0]
-            pred_action[0] = steer_momentum * last_steer + (1.0 - steer_momentum) * pred_action[0]
-            last_steer = float(pred_action[0])
+            if use_expert:
+                pred_action = expert(env.agent, deterministic=True)
+                pred_action[0] = steer_momentum * last_steer + (1.0 - steer_momentum) * pred_action[0]
+                last_steer = float(pred_action[0])
 
-            # HUD visualisation
-            depth_uint8  = (combined_tensor[0, 0].cpu().numpy() * 255).astype(np.uint8)
-            blended_rgb  = combined_tensor[0, 1:4].cpu().numpy()
-            blended_rgb  = np.transpose(blended_rgb, (1, 2, 0))
-            blended_uint8 = (blended_rgb * 255).astype(np.uint8)
-            blended_bgr  = cv2.cvtColor(blended_uint8, cv2.COLOR_RGB2BGR)
+                hud = np.zeros((40, 400, 3), dtype=np.uint8)
+                cv2.putText(
+                    hud,
+                    f"[EXPERT]  spd:{ego_reading.total_speed:+.2f}  "
+                    f"str:{pred_action[0]:+.2f}  throt:{pred_action[1]:+.2f}",
+                    (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 200), 1,
+                )
+                cv2.imshow("Expert Policy", hud)
+                cv2.waitKey(1)
+            else:
+                rgb_img = env.engine.get_sensor(rgb_name).perceive(
+                    to_float=False, new_parent_node=env.agent.origin
+                )
+                if hasattr(rgb_img, "get"):
+                    rgb_img = rgb_img.get()
+                rgb_img = np.array(rgb_img, dtype=np.uint8)
+                # MetaDrive RGBCamera natively returns BGR; convert to RGB
+                rgb_img = rgb_img[..., ::-1].copy()
 
-            depth_color = cv2.resize(cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO), (400, 400))
-            rgb_color   = cv2.resize(blended_bgr, (400, 400))
+                combined_tensor, _ = extract_features_frozen(
+                    rgb_img[np.newaxis], depth_estimator, image_size=image_size, device=device,
+                    always_lane_masked=always_lane_masked,
+                )
 
-            hud = np.zeros((40, 800, 3), dtype=np.uint8)
-            cv2.putText(
-                hud,
-                f"spd:{ego_reading.total_speed:+.2f}  fwd:{ego_reading.forward_speed:+.2f}  "
-                f"lat:{ego_reading.lateral_speed:+.2f}  hdg:{ego_reading.heading_delta:+.2f}  "
-                f"str:{ego_reading.last_steer:+.2f}  "
-                f"->  steer:{pred_action[0]:+.2f}  throt:{pred_action[1]:+.2f}",
-                (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 200), 1,
-            )
-            cv2.imshow("Depth | RGB  (with Ego HUD)",
-                       np.vstack((hud, np.hstack((depth_color, rgb_color)))))
-            cv2.waitKey(1)
+                ego_t = torch.tensor(ego_reading.ego_model, dtype=torch.float32, device=device).unsqueeze(0)
+
+                with torch.no_grad():
+                    pred_action = policy_model(combined_tensor, ego_t).cpu().numpy()[0]
+                pred_action[0] = steer_momentum * last_steer + (1.0 - steer_momentum) * pred_action[0]
+                last_steer = float(pred_action[0])
+
+                # HUD visualisation
+                depth_uint8  = (combined_tensor[0, 0].cpu().numpy() * 255).astype(np.uint8)
+                blended_rgb  = combined_tensor[0, 1:4].cpu().numpy()
+                blended_rgb  = np.transpose(blended_rgb, (1, 2, 0))
+                blended_uint8 = (blended_rgb * 255).astype(np.uint8)
+                blended_bgr  = cv2.cvtColor(blended_uint8, cv2.COLOR_RGB2BGR)
+
+                depth_color = cv2.resize(cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO), (400, 400))
+                rgb_color   = cv2.resize(blended_bgr, (400, 400))
+
+                hud = np.zeros((40, 800, 3), dtype=np.uint8)
+                cv2.putText(
+                    hud,
+                    f"spd:{ego_reading.total_speed:+.2f}  fwd:{ego_reading.forward_speed:+.2f}  "
+                    f"lat:{ego_reading.lateral_speed:+.2f}  hdg:{ego_reading.heading_delta:+.2f}  "
+                    f"str:{ego_reading.last_steer:+.2f}  "
+                    f"->  steer:{pred_action[0]:+.2f}  throt:{pred_action[1]:+.2f}",
+                    (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 200), 1,
+                )
+                cv2.imshow("Depth | RGB  (with Ego HUD)",
+                           np.vstack((hud, np.hstack((depth_color, rgb_color)))))
+                cv2.waitKey(1)
 
             obs, reward, terminated, truncated, info = env.step(pred_action)
             done = terminated or truncated
@@ -177,11 +198,13 @@ def run_simulation(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str,   required=True)
+    parser.add_argument("--model_path", type=str,   default=None,
+                        help="Path to trained policy checkpoint. Not required when --arch expert.")
     parser.add_argument("--dpt_path",   type=str,   default="models/dpt_finetuned.pth")
     parser.add_argument("--episodes",   type=int,   default=1)
     parser.add_argument("--image_size",         type=int,   default=84)
-    parser.add_argument("--arch",               type=str,   default="simple", choices=["simple", "impala", "impala_v2"])
+    parser.add_argument("--arch",               type=str,   default="simple",
+                        choices=["simple", "impala", "impala_v2", "expert"])
     parser.add_argument("--always_lane_masked", action="store_true",
                         help="Force alpha=0 (fully lane-masked) during simulation")
     parser.add_argument("--seed", type=int, default=42,
@@ -191,6 +214,8 @@ if __name__ == "__main__":
                              "Reduces jitter but does not fix directional ambiguity at "
                              "intersections. Enable only if the retrained model still oscillates.")
     args = parser.parse_args()
+    if args.arch != "expert" and args.model_path is None:
+        parser.error("--model_path is required unless --arch expert")
 
     run_simulation(
         model_path          = args.model_path,
