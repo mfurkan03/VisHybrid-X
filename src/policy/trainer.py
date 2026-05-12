@@ -27,16 +27,9 @@ def get_lane_mask_visual(rgb_image: np.ndarray, threshold_value: int = 180) -> n
     h, w      = img_uint8.shape[:2]
     roi       = img_uint8.copy()
     roi[0:int(h * 0.55), :] = 0
-
-    # White/bright edge lines
-    gray             = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
-    _, white_mask    = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)
-
-    # Yellow center dividers (opposing-traffic separators)
-    hsv              = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
-    yellow_mask      = cv2.inRange(hsv, np.array([15, 80, 165]), np.array([35, 255, 255]))
-
-    return cv2.bitwise_or(white_mask, yellow_mask)
+    gray      = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    _, mask   = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)
+    return mask
 
 def apply_lane_mask(
     depth_tensor: torch.Tensor,
