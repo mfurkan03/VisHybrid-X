@@ -212,10 +212,18 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
             return (np.stack(rgbs), np.stack(actions), np.stack(egos),
                     np.zeros((n, 5), dtype=np.float32))
 
-    g = torch.Generator().manual_seed(seed)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              collate_fn=collate_fn, generator=g,
-                              worker_init_fn=worker_init_fn)
+    from torch.utils.data import WeightedRandomSampler
+    actions_np = np.array(train_ds.actions)
+    steer_mag  = np.abs(actions_np[:, 0])
+    bins       = (steer_mag >= 0.02).astype(int)   # 0: straight, 1: turning
+    weights    = np.where(bins == 0, 0.5 / (bins == 0).sum(), 0.5 / (bins == 1).sum())
+    sampler    = WeightedRandomSampler(
+        torch.tensor(weights, dtype=torch.float64),
+        num_samples=len(train_ds),
+        replacement=True,
+    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
+                              collate_fn=collate_fn, worker_init_fn=worker_init_fn)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
                               collate_fn=collate_fn, worker_init_fn=worker_init_fn)
     return train_loader, val_loader
