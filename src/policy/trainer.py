@@ -222,13 +222,24 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
     from torch.utils.data import WeightedRandomSampler
     actions_np = np.array(train_ds.actions)
     steer_mag  = np.abs(actions_np[:, 0])
-    bins       = np.digitize(steer_mag, [0.02, 0.2])  # 0: straight, 1: turning, 2: intersection
-    bin_targets = {0: 0.48, 1: 0.47, 2: 0.05}
-    weights    = np.zeros(len(steer_mag), dtype=np.float64)
+
+    # Look-ahead: promote approach frames — if any of the next K frames has a sharp
+    # turn, this frame is treated as if it were already in the intersection bin.
+    # Ensures the model sees what intersection approaches look like, not just mid-turn frames.
+    K = 20  # ~1 second at ~20 fps
+    lookahead = np.array([
+        steer_mag[i : min(i + K, len(steer_mag))].max()
+        for i in range(len(steer_mag))
+    ])
+    effective_steer = np.maximum(steer_mag, lookahead)
+
+    bins        = np.digitize(effective_steer, [0.02, 0.2])  # 0: straight, 1: turning, 2: intersection/approach
+    bin_targets = {0: 0.35, 1: 0.45, 2: 0.20}               # 20% intersection (was 5%)
+    weights     = np.zeros(len(steer_mag), dtype=np.float64)
     for b in np.unique(bins):
         mask          = bins == b
         weights[mask] = bin_targets[b] / mask.sum()
-    sampler    = WeightedRandomSampler(
+    sampler = WeightedRandomSampler(
         torch.tensor(weights, dtype=torch.float64),
         num_samples=len(train_ds),
         replacement=True,
@@ -308,6 +319,9 @@ def run_epoch(policy_model, loader, optimizer, device,
             all_ego_full.append(ego_full_np)
 
     avg_loss = total_loss / max(len(loader), 1)
+    if not all_pred:
+        empty = np.zeros((0, 2), dtype=np.float32)
+        return avg_loss, empty, empty, np.zeros((0, EGO_DIM), dtype=np.float32), np.zeros((0, 5), dtype=np.float32)
     return (avg_loss,
             np.concatenate(all_pred), np.concatenate(all_true),
             np.concatenate(all_ego),  np.concatenate(all_ego_full))
@@ -390,9 +404,10 @@ def train_loop(
         )
 
         tr_m   = compute_offline_metrics(tr_pred, tr_true)
-        val_m  = compute_offline_metrics(val_pred, val_true)
-        val_pm = compute_predictive_metrics(val_pred, val_true, val_ego)
-        val_hm = compute_heading_metrics(val_pred, val_true, val_ego_full)
+        val_empty = len(val_pred) == 0
+        val_m  = compute_offline_metrics(val_pred, val_true) if not val_empty else {k: 0.0 for k in ["steering_mae","accel_mae","steering_mse","accel_mse","steering_dir_acc","direction_acc","brake_acc","steering_corr"]}
+        val_pm = compute_predictive_metrics(val_pred, val_true, val_ego) if not val_empty else {k: 0.0 for k in ["steer_p95_error","active_turn_mae","critical_turn_mae","jitter_ratio","out_of_bounds_rate","speed_weighted_steer_mae","pre_brake_anticipation"]}
+        val_hm = compute_heading_metrics(val_pred, val_true, val_ego_full) if not val_empty else {}
         print(
             f"[{tag}] Epoch [{epoch+1:02d}] "
             f"Loss Tr/Val: {avg_train:.4f}/{avg_val:.4f} | "
@@ -450,6 +465,8 @@ def train_loop(
         past_curriculum = epoch >= fully_masked_epochs + curriculum_epochs
 
         save_checkpoint(policy_model, optimizer, scheduler, epoch, avg_val, model_path)
+        if val_empty:
+            continue
         if past_curriculum and avg_val < best_val_loss - early_stopping_min_delta:
             best_val_loss    = avg_val
             best_epoch       = epoch + 1
