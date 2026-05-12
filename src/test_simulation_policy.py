@@ -46,10 +46,23 @@ def run_simulation(
         policy_model = build_policy(arch, image_size).to(device)
         ckpt = torch.load(model_path, map_location=device)
         if isinstance(ckpt, dict):
-            key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
-            policy_model.load_state_dict(ckpt[key] if key else ckpt)
+            if "model" in ckpt:
+                # Standard IL checkpoint
+                state = ckpt["model"]
+            elif "policy" in ckpt:
+                # RL checkpoint (ILActorCritic) — strip "il_model." prefix to
+                # get back the raw IL backbone weights.
+                state = {
+                    k[len("il_model."):]: v
+                    for k, v in ckpt["policy"].items()
+                    if k.startswith("il_model.")
+                }
+                print(f"[INFO] RL checkpoint detected — extracted {len(state)} IL backbone tensors.")
+            else:
+                state = ckpt
         else:
-            policy_model.load_state_dict(ckpt)
+            state = ckpt
+        policy_model.load_state_dict(state)
         policy_model.eval()
 
     depth_estimator = None if use_expert else DepthEstimationModel(finetuned_path=dpt_path)

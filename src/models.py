@@ -200,7 +200,7 @@ class DrivingPolicyNet(nn.Module):
 
         self.fc_out = nn.Linear(512 + 32, out_dim)
 
-    def forward(self, x: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False) -> torch.Tensor:
         v = F.relu(self.conv1(x))
         v = F.relu(self.conv2(v))
         v = F.relu(self.conv3(v))
@@ -208,7 +208,10 @@ class DrivingPolicyNet(nn.Module):
         v = F.relu(self.fc_vis(v))
         v = self.dropout_vis(v)
         e = self.ego_fc(ego)
-        return self.fc_out(torch.cat([v, e], dim=1))
+        merged = torch.cat([v, e], dim=1)
+        if return_features:
+            return merged
+        return self.fc_out(merged)
 
 class _ImpalaResBlock(nn.Module):
     """Pre-activation residual block used inside the IMPALA CNN."""
@@ -291,10 +294,12 @@ class ImpalaNet(nn.Module):
             nn.Linear(128, 1),
         )
 
-    def forward(self, x: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False) -> torch.Tensor:
         v = self.vis_proj(self.cnn(x))
         e = self.ego_fc(ego)
         merged = torch.cat([v, e], dim=1)
+        if return_features:
+            return merged
         return torch.cat([self.steer_head(merged), self.accel_head(merged)], dim=1)
 
 
@@ -402,7 +407,7 @@ class ImpalaNetV2(nn.Module):
             nn.Linear(256, 1),
         )
 
-    def forward(self, x: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False) -> torch.Tensor:
         x = torch.cat([
             x[:, :1],
             (x[:, 1:] - self.rgb_mean) / self.rgb_std,
@@ -410,6 +415,8 @@ class ImpalaNetV2(nn.Module):
         v = self.vis_proj(self.cnn(x))
         e = self.ego_fc(ego)
         merged = torch.cat([v, e], dim=1)
+        if return_features:
+            return merged
         return torch.cat([self.steer_head(merged), self.accel_head(merged)], dim=1)
 
 
