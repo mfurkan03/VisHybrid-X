@@ -77,7 +77,7 @@ def run_simulation(
         "vehicle_config":    {"image_source": rgb_name},
         "show_interface":    False,
         "image_on_cuda":     False,
-        "start_seed":        316181,
+        "start_seed":        316184,
     }
     env = MetaDriveEnv(config)
 

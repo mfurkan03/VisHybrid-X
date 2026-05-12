@@ -218,18 +218,8 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
     actions_np = np.array(train_ds.actions)
     steer_mag  = np.abs(actions_np[:, 0])
 
-    # Look-ahead: promote approach frames — if any of the next K frames has a sharp
-    # turn, this frame is treated as if it were already in the intersection bin.
-    # Ensures the model sees what intersection approaches look like, not just mid-turn frames.
-    K = 20  # ~1 second at ~20 fps
-    lookahead = np.array([
-        steer_mag[i : min(i + K, len(steer_mag))].max()
-        for i in range(len(steer_mag))
-    ])
-    effective_steer = np.maximum(steer_mag, lookahead)
-
-    bins        = np.digitize(effective_steer, [0.02, 0.2])  # 0: straight, 1: turning, 2: intersection/approach
-    bin_targets = {0: 0.35, 1: 0.45, 2: 0.20}               # 20% intersection (was 5%)
+    bins        = np.digitize(steer_mag, [0.02, 0.2])  # 0: straight, 1: turning, 2: intersection
+    bin_targets = {0: 0.48, 1: 0.45, 2: 0.05}
     weights     = np.zeros(len(steer_mag), dtype=np.float64)
     for b in np.unique(bins):
         mask          = bins == b
