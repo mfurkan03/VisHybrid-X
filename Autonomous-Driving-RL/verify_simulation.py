@@ -90,7 +90,7 @@ def main():
         if not os.path.exists(args.checkpoint):
             print(f"Checkpoint not found: {args.checkpoint}")
             return
-        ckpt = torch.load(args.checkpoint, map_location=device)
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and "policy" in ckpt:
             policy.load_state_dict(ckpt["policy"])
             print(f"Loaded RL checkpoint (step={ckpt.get('global_step','?')})")

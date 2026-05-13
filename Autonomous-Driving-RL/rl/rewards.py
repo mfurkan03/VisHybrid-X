@@ -31,6 +31,15 @@ class RewardConfig:
     speed_bonus_min: float = 5.0            # no bonus below this speed (km/h)
     standing_still_penalty: float = -0.05
 
+    # Lane-keeping
+    lateral_offset_threshold: float = 0.5   # metres from lane centre — free zone, no penalty
+    lateral_offset_weight: float = -0.3     # penalty per metre beyond threshold, per step
+    # Passing suppression: lateral penalty fades linearly to 0 as |steer| reaches this value.
+    # Deliberate lateral manoeuvres (passing, avoidance) require nonzero steering, so the
+    # penalty is suppressed when the agent is actively steering and fully applied when drifting
+    # passively (steer ≈ 0).
+    lateral_suppression_steer: float = 0.15  # |steer| at which penalty is fully suppressed
+
 
 def compute_reward(info: dict,
                    action,
@@ -106,6 +115,20 @@ def compute_reward(info: dict,
     else:
         reward += cfg.standing_still_penalty
         details["standing_still"] = cfg.standing_still_penalty
+
+    # 9. Lateral offset — penalise passive drift out of lane, not intentional passing manoeuvres.
+    # Suppression logic: a deliberate lateral movement (passing, avoidance) requires the agent
+    # to actively steer. Passive drift has |steer| ≈ 0. The penalty therefore scales with
+    # (1 - |steer| / suppression_steer), clamped to [0, 1], so:
+    #   |steer| = 0          → full penalty  (drifting)
+    #   |steer| = 0.075      → half penalty
+    #   |steer| ≥ 0.15       → no penalty    (active passing/avoidance)
+    lateral_dist = info.get("lateral_dist", 0.0)
+    excess_lateral = max(0.0, abs(lateral_dist) - cfg.lateral_offset_threshold)
+    suppression = max(0.0, 1.0 - steer_val / cfg.lateral_suppression_steer)
+    lat_pen = cfg.lateral_offset_weight * excess_lateral * suppression
+    reward += lat_pen
+    details["lateral_offset"] = lat_pen
 
     # ──────────────────────────────────────────────
     #  YENİ CEZA EKLEMEK İÇİN BURAYA YAZ
