@@ -68,7 +68,7 @@ def main():
         if not os.path.exists(args.checkpoint):
             print(f"Checkpoint not found: {args.checkpoint}")
             return
-        ckpt = torch.load(args.checkpoint, map_location=device)
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and "policy" in ckpt:
             policy.load_state_dict(ckpt["policy"])
             print(f"Loaded RL checkpoint (step={ckpt.get('global_step','?')}): {args.checkpoint}")
@@ -99,10 +99,10 @@ def main():
     verifier = ObsVerifier() if args.obs_ref else None
 
     try:
-        obs       = env.reset()
-        ep_reward = 0.0
-        step_count = 0
         ep_count   = 1
+        obs        = env.reset(seed=0)
+        ep_reward  = 0.0
+        step_count = 0
 
         while True:
             img, ego = obs
@@ -135,7 +135,7 @@ def main():
                 if ep_count >= args.scenarios:
                     print("\nTest complete.")
                     break
-                obs        = env.reset()
+                obs        = env.reset(seed=ep_count)
                 ep_reward  = 0.0
                 step_count = 0
                 ep_count  += 1
@@ -149,7 +149,6 @@ def main():
         env.close()
 
     if verifier is not None and len(verifier) > 0:
-        import os
         if os.path.exists(args.obs_ref):
             verifier.compare(args.obs_ref)
         else:

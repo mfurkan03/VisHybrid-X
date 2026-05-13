@@ -96,11 +96,13 @@ class MetaDriveRLWrapper:
 
     # ── Gym-like interface ────────────────────────────────────────────────────
 
-    def reset(self):
-        raw_obs, _ = self.env.reset()
+    def reset(self, seed: int | None = None):
+        kwargs = {} if seed is None else {"seed": seed}
+        raw_obs, _ = self.env.reset(**kwargs)
         self._prev_route  = 0.0
         self._prev_action = np.zeros(self.ACT_DIM, dtype=np.float32)
         self.last_steer   = 0.0
+        self._step_count  = 0
         return self._get_obs(raw_obs)
 
     def step(self, action: np.ndarray):
