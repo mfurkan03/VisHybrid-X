@@ -6,10 +6,20 @@ Rollout buffer + mini-batch update.
 The buffer stores image observations and ego-state vectors separately so
 that the policy's forward(image, ego) signature is preserved throughout.
 
-Optimisations vs. the original:
-  - Buffer arrays are pinned when CUDA is available → async H2D transfers.
-  - torch.from_numpy + non_blocking=True in get_batches.
-  - Optional AMP (FP16 forward, FP32 grad scaler) via PPOConfig.use_amp.
+Multi-env support
+-----------------
+RolloutBuffer accepts n_envs ≥ 1.  All arrays are shaped (T, N, ...) where
+T = rollout_steps and N = n_envs.  get_batches() flattens to (T*N, ...) and
+shuffles before yielding mini-batches, so ppo_update() is unchanged.
+
+With n_envs=1 the shapes collapse to (T, 1, ...) → (T,) after flattening,
+which is behaviourally identical to the old single-env implementation.
+
+Optimisations
+-------------
+- Buffer arrays are pinned when CUDA is available → async H2D transfers.
+- torch.from_numpy + non_blocking=True in get_batches.
+- Optional AMP (FP16 forward, FP32 grad scaler) via PPOConfig.use_amp.
 """
 import numpy as np
 import torch
@@ -35,10 +45,15 @@ class PPOConfig:
 
 class RolloutBuffer:
     """
-    Stores one rollout (rollout_steps transitions).
+    Stores one rollout (rollout_steps × n_envs transitions).
 
     Image observations and ego vectors are kept in separate arrays so the
     policy receives them as distinct tensors, matching the IL model's API.
+
+    Shape convention
+    ----------------
+    All arrays: (rollout_steps, n_envs, ...)
+    get_batches() flattens to (rollout_steps * n_envs, ...) before shuffling.
     """
 
     def __init__(
@@ -48,71 +63,128 @@ class RolloutBuffer:
         ego_dim: int,
         act_dim: int,
         device: torch.device,
+        n_envs: int = 1,
     ):
         self.size   = size
+        self.n_envs = n_envs
         self.device = device
-        # Pin memory when training on CUDA: enables non-blocking async H2D transfers.
+        self._total = size * n_envs   # flattened size used by get_batches
+
+        # Pin small scalar arrays for async H2D transfers.
+        # imgs is NOT pinned: (T, N, 4, H, W) float32 can be hundreds of MB of
+        # non-swappable page-locked RAM, which outweighs the async-transfer benefit
+        # for 64-sample mini-batch slices (~7 MB each).
         use_pin = (device.type == "cuda")
 
-        def _buf(*shape):
+        def _buf(*shape, pin=False):
             t = torch.zeros(*shape, dtype=torch.float32)
-            return (t.pin_memory() if use_pin else t).numpy()
+            return (t.pin_memory() if (use_pin and pin) else t).numpy()
 
-        self.imgs       = _buf(size, *img_shape)
-        self.egos       = _buf(size, ego_dim)
-        self.actions    = _buf(size, act_dim)
-        self.rewards    = _buf(size)
-        self.dones      = _buf(size)
-        self.log_probs  = _buf(size)
-        self.values     = _buf(size)
-        self.advantages = _buf(size)
-        self.returns    = _buf(size)
+        # Shape: (T, N, ...) — N=1 is backward-compatible after flattening
+        self.imgs       = _buf(size, n_envs, *img_shape)           # not pinned (large)
+        self.egos       = _buf(size, n_envs, ego_dim)
+        self.actions    = _buf(size, n_envs, act_dim)
+        self.rewards    = _buf(size, n_envs, pin=True)
+        self.dones      = _buf(size, n_envs, pin=True)
+        self.log_probs  = _buf(size, n_envs, pin=True)
+        self.values     = _buf(size, n_envs, pin=True)
+        self.advantages = _buf(size, n_envs)
+        self.returns    = _buf(size, n_envs)
         self.ptr = 0
 
-    def store(self, img, ego, action, reward, done, log_prob, value):
+    def store(self, imgs, egos, actions, rewards, dones, log_probs, values):
+        """
+        Store one time-step of transitions for all N envs.
+
+        All inputs should be (N, ...) shaped numpy arrays (or scalars/1-D
+        arrays when N=1 from DummyVecEnv).
+        """
         i = self.ptr
-        self.imgs[i]      = img
-        self.egos[i]      = ego
-        self.actions[i]   = action
-        self.rewards[i]   = reward
-        self.dones[i]     = done
-        self.log_probs[i] = log_prob
-        self.values[i]    = value
+        self.imgs[i]      = imgs
+        self.egos[i]      = egos
+        self.actions[i]   = actions
+        self.rewards[i]   = rewards
+        self.dones[i]     = dones
+        self.log_probs[i] = log_probs
+        self.values[i]    = values
         self.ptr += 1
 
-    def compute_gae(self, last_value: float, gamma: float, lam: float):
-        """Generalized Advantage Estimation (backward pass)."""
-        gae = 0.0
-        for t in reversed(range(self.size)):
-            next_value        = last_value if t == self.size - 1 else self.values[t + 1]
-            next_non_terminal = 1.0 - self.dones[t]
-            delta = self.rewards[t] + gamma * next_value * next_non_terminal - self.values[t]
-            gae   = delta + gamma * lam * next_non_terminal * gae
-            self.advantages[t] = gae
+    def compute_gae(self, last_values: np.ndarray, gamma: float, lam: float):
+        """
+        Generalized Advantage Estimation — vectorized over N envs.
 
-        self.returns = self.advantages + self.values
+        Parameters
+        ----------
+        last_values : (N,) float32 — critic value at the observation *after*
+                      the last rollout step (bootstrapped from main process).
+        gamma, lam  : GAE hyperparameters.
+
+        Done-flag convention
+        --------------------
+        dones[t] == 1 means the episode ended at step t (the action taken from
+        obs[t] led to a terminal state).  The same scalar done that is stored
+        in the buffer is used to zero-out the bootstrap:
+
+            next_non_terminal = 1 - dones[t]
+
+        This also zero-resets the GAE carry so no advantage bleeds across
+        episode boundaries within the same env stream.
+
+        For the final step (t = size-1) the bootstrap value is last_values[n]
+        masked by 1 - dones[size-1, n] (already stored in the buffer).
+        """
+        gae = np.zeros(self.n_envs, dtype=np.float32)   # (N,)
+
+        for t in reversed(range(self.size)):
+            if t == self.size - 1:
+                next_values = last_values                    # (N,)
+            else:
+                next_values = self.values[t + 1]             # (N,)
+
+            next_non_terminal = 1.0 - self.dones[t]         # (N,) — done at step t
+
+            delta = (
+                self.rewards[t]
+                + gamma * next_values * next_non_terminal
+                - self.values[t]
+            )                                                 # (N,)
+            gae = delta + gamma * lam * next_non_terminal * gae   # (N,)
+            self.advantages[t] = gae                          # (N,)
+
+        self.returns = self.advantages + self.values           # (T, N)
 
     def get_batches(self, batch_size: int):
-        """Yield shuffled mini-batches as dicts of device tensors.
+        """
+        Flatten (T, N, ...) → (T*N, ...), shuffle, yield mini-batches.
 
         torch.from_numpy avoids a CPU copy; non_blocking=True lets DMA
         overlap with GPU compute when the buffer arrays are pinned.
         """
-        dev = self.device
-        nb  = dev.type == "cuda"
-        indices = np.random.permutation(self.size)
-        for start in range(0, self.size, batch_size):
+        dev   = self.device
+        nb    = dev.type == "cuda"
+        total = self._total
+
+        # Flatten time × env axes into a single sample axis
+        imgs_f       = self.imgs.reshape(total, *self.imgs.shape[2:])
+        egos_f       = self.egos.reshape(total, self.egos.shape[2])
+        actions_f    = self.actions.reshape(total, self.actions.shape[2])
+        log_probs_f  = self.log_probs.reshape(total)
+        advantages_f = self.advantages.reshape(total)
+        returns_f    = self.returns.reshape(total)
+
+        indices = np.random.permutation(total)
+        for start in range(0, total, batch_size):
             end = start + batch_size
-            if end > self.size:
+            if end > total:
                 break
             idx = indices[start:end]
             yield {
-                "imgs":       torch.from_numpy(self.imgs[idx].copy()).to(dev, non_blocking=nb),
-                "egos":       torch.from_numpy(self.egos[idx].copy()).to(dev, non_blocking=nb),
-                "actions":    torch.from_numpy(self.actions[idx].copy()).to(dev, non_blocking=nb),
-                "log_probs":  torch.from_numpy(self.log_probs[idx].copy()).to(dev, non_blocking=nb),
-                "advantages": torch.from_numpy(self.advantages[idx].copy()).to(dev, non_blocking=nb),
-                "returns":    torch.from_numpy(self.returns[idx].copy()).to(dev, non_blocking=nb),
+                "imgs":       torch.from_numpy(imgs_f[idx].copy()).to(dev, non_blocking=nb),
+                "egos":       torch.from_numpy(egos_f[idx].copy()).to(dev, non_blocking=nb),
+                "actions":    torch.from_numpy(actions_f[idx].copy()).to(dev, non_blocking=nb),
+                "log_probs":  torch.from_numpy(log_probs_f[idx].copy()).to(dev, non_blocking=nb),
+                "advantages": torch.from_numpy(advantages_f[idx].copy()).to(dev, non_blocking=nb),
+                "returns":    torch.from_numpy(returns_f[idx].copy()).to(dev, non_blocking=nb),
             }
 
     def reset(self):

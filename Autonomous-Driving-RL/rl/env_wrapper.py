@@ -8,8 +8,15 @@ Produces the same 4-channel observation format as the IL training pipeline:
 Ego state [total_speed, last_steer, heading_delta] is returned alongside the
 image as a separate (EGO_DIM,) array, matching the IL model's input API.
 
-Observation : tuple( np.ndarray (4, H, H) float32,
-                     np.ndarray (EGO_DIM,) float32 )
+Two modes controlled by use_depth_model:
+  True  (default) : full pipeline — DPT depth + RGB → (4, H, H) float32
+  False (worker)  : raw RGB only  → (196, 196, 3) uint8
+                    DPT runs in the main process on a batch of N images.
+
+Observation (use_depth_model=True)  : tuple( np.ndarray (4, H, H) float32,
+                                             np.ndarray (EGO_DIM,) float32 )
+Observation (use_depth_model=False) : tuple( np.ndarray (196, 196, 3) uint8,
+                                             np.ndarray (EGO_DIM,) float32 )
 Action      : np.ndarray (2,) → [steering, throttle]
 """
 import sys
@@ -36,8 +43,11 @@ class MetaDriveRLWrapper:
     """
     Gym-like wrapper around MetaDriveEnv.
 
-    Observation: tuple(img_np (4, image_size, image_size), ego_np (EGO_DIM,))
-    Action     : np.ndarray (2,)  →  [steering ∈ [-1,1], throttle ∈ [-1,1]]
+    use_depth_model=True  (default): standard single-env mode. DPT runs
+        inside this wrapper per step. Returns (4, H, W) float32 + ego.
+    use_depth_model=False (worker mode): skips DPT entirely. Returns
+        (196, 196, 3) uint8 + ego. Used in SubprocVecEnv worker processes;
+        the main process handles batched DPT for all N workers at once.
     """
 
     ACT_DIM = 2
@@ -49,11 +59,13 @@ class MetaDriveRLWrapper:
         show_perception: bool = False,
         image_size: int = 84,
         dpt_path: str = None,
+        use_depth_model: bool = True,
     ):
-        self.reward_cfg    = reward_cfg or RewardConfig()
+        self.reward_cfg      = reward_cfg or RewardConfig()
         self.show_perception = show_perception
-        self.image_size    = image_size
-        self.OBS_SHAPE     = (4, image_size, image_size)
+        self.image_size      = image_size
+        self.use_depth_model = use_depth_model
+        self.OBS_SHAPE       = (4, image_size, image_size)
 
         default_cfg = {
             "use_render": False,
@@ -82,17 +94,23 @@ class MetaDriveRLWrapper:
 
         self.env = MetaDriveEnv(default_cfg)
 
-        # IL-correct depth model: uses inverted depth so closer = higher value.
-        self.depth_model = DepthEstimationModel(finetuned_path=dpt_path)
+        if use_depth_model:
+            # IL-correct depth model: uses inverted depth so closer = higher value.
+            self.depth_model = DepthEstimationModel(finetuned_path=dpt_path)
+        else:
+            self.depth_model = None
 
         self._prev_route   = 0.0
         self._prev_action  = np.zeros(self.ACT_DIM, dtype=np.float32)
         self.last_steer    = 0.0
         self._step_count   = 0
 
-        # Fallback obs (returned on sensor failure)
-        self._last_img_np  = np.zeros((4, image_size, image_size), dtype=np.float32)
-        self._last_ego_np  = np.zeros(EGO_DIM, dtype=np.float32)
+        # Fallback obs shapes differ by mode
+        if use_depth_model:
+            self._last_img_np = np.zeros((4, image_size, image_size), dtype=np.float32)
+        else:
+            self._last_img_np = np.zeros((196, 196, 3), dtype=np.uint8)
+        self._last_ego_np = np.zeros(EGO_DIM, dtype=np.float32)
 
     # ── Gym-like interface ────────────────────────────────────────────────────
 
@@ -134,7 +152,15 @@ class MetaDriveRLWrapper:
         if self.show_perception:
             cv2.destroyAllWindows()
 
-    # ── Observation construction ──────────────────────────────────────────────
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _get_ego(self) -> np.ndarray:
+        """Read ego state [total_speed, last_steer, heading_delta]."""
+        try:
+            ego_reading = extract_ego_state(self.env.agent, self.last_steer)
+            return ego_reading.ego_model   # (EGO_DIM,) float32
+        except Exception:
+            return self._last_ego_np.copy()
 
     def _extract_rgb(self, raw_obs) -> np.ndarray | None:
         """
@@ -160,15 +186,53 @@ class MetaDriveRLWrapper:
         except Exception:
             return None
 
+    def _extract_raw_rgb(self, raw_obs=None) -> np.ndarray:
+        """
+        Return (196, 196, 3) uint8 RGB without running DPT.
+        Used in worker mode (use_depth_model=False).
+        Falls back to direct sensor read, then to the cached fallback.
+        """
+        rgb_uint8 = self._extract_rgb(raw_obs)
+        if rgb_uint8 is None:
+            try:
+                rgb_raw = self.env.engine.get_sensor("rgb").perceive(self.env.agent)
+                if hasattr(rgb_raw, "get"):
+                    rgb_raw = rgb_raw.get()
+                rgb_arr = np.array(rgb_raw)
+                if rgb_arr.ndim == 3 and rgb_arr.shape[2] >= 3:
+                    rgb3 = rgb_arr[..., :3]
+                    rgb_uint8 = (
+                        (rgb3 * 255).astype(np.uint8) if rgb3.max() <= 1.0
+                        else rgb3.astype(np.uint8)
+                    )
+            except Exception as e:
+                print(f"[WARNING] RGB sensor read failed: {e}")
+                rgb_uint8 = self._last_img_np.copy()
+        return rgb_uint8
+
     def _get_obs(self, raw_obs=None):
         """
-        Build observation tuple (img_np, ego_np).
+        Build observation tuple (img, ego).
 
-        img_np  : (4, image_size, image_size) float32
-                  ch0 = inverted depth (IL-correct)
-                  ch1-3 = RGB [0,1]
-        ego_np  : (EGO_DIM,) float32 = [total_speed, last_steer, heading_delta]
+        Worker mode (use_depth_model=False):
+            img  : (196, 196, 3) uint8
+            ego  : (EGO_DIM,) float32
+        Standard mode (use_depth_model=True):
+            img  : (4, image_size, image_size) float32
+                   ch0 = inverted depth (IL-correct)
+                   ch1-3 = RGB [0,1]
+            ego  : (EGO_DIM,) float32
         """
+        # ── Worker mode: skip DPT, return raw RGB ────────────────────────────
+        if not self.use_depth_model:
+            rgb_uint8 = self._extract_raw_rgb(raw_obs)
+            ego_np    = self._get_ego()
+            self._step_count += 1
+            self._last_img_np = rgb_uint8
+            self._last_ego_np = ego_np
+            return rgb_uint8, ego_np
+
+        # ── Standard mode: DPT depth + RGB ───────────────────────────────────
         rgb_uint8 = self._extract_rgb(raw_obs)
 
         # Fallback: read directly from the sensor
@@ -217,11 +281,7 @@ class MetaDriveRLWrapper:
         img_np = combined.squeeze(0).detach().cpu().float().numpy()  # (4, H, H)
 
         # ── Ego state ─────────────────────────────────────────────────────────
-        try:
-            ego_reading = extract_ego_state(self.env.agent, self.last_steer)
-            ego_np = ego_reading.ego_model  # (EGO_DIM,) float32
-        except Exception:
-            ego_np = self._last_ego_np.copy()
+        ego_np = self._get_ego()
 
         self._step_count += 1
 
