@@ -48,8 +48,11 @@ class ILActorCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 1),
         )
-        # Start close to deterministic IL behaviour (std ≈ 0.05); let PPO widen it if needed.
-        self.log_std = nn.Parameter(torch.ones(2) * -3.0)
+        # std ≈ 0.4: enough exploration to escape the IL-init basin,
+        # but not so wide that actions are random noise.
+        # -3.0 (std≈0.05) was effectively deterministic and prevented PPO from
+        # discovering that different accel values yield higher rewards.
+        self.log_std = nn.Parameter(torch.ones(2) * -0.9)
 
     # ------------------------------------------------------------------
     def _get_merged(self, image: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:

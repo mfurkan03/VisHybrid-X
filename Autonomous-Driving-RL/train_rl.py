@@ -113,8 +113,8 @@ def parse_args():
                    help="LR for value_head and log_std")
     p.add_argument("--backbone_lr",    type=float, default=1e-5,
                    help="LR for the IL backbone (much lower to avoid forgetting)")
-    p.add_argument("--warmup_updates", type=int,   default=5,
-                   help="Freeze backbone for this many PPO updates while critic warms up")
+    p.add_argument("--warmup_updates", type=int,   default=20,
+                   help="Freeze backbone+log_std for this many PPO updates (critic-only warmup)")
     p.add_argument("--rollout",        type=int,   default=2048,
                    help="Rollout steps *per env* per PPO update")
     p.add_argument("--batch",          type=int,   default=64)
@@ -243,11 +243,15 @@ def main():
         {"params": head_params,     "lr": args.lr},
     ])
 
-    # Freeze backbone during warmup so the value head gets sensible before
-    # backbone gradients flow (prevents corrupted advantages from damaging IL weights).
+    # During warmup: freeze backbone AND log_std, train only value_head.
+    # Reason: policy gradient (which flows through log_std) uses advantage estimates
+    # from the randomly-initialized value head. Those estimates are unreliable early on
+    # and can push log_std down (entropy collapse) before the critic is calibrated,
+    # causing the policy to become near-deterministic and degrade toward standing still.
     for p in backbone_params:
         p.requires_grad_(False)
-    print(f"[Warmup] Backbone frozen for first {args.warmup_updates} PPO updates.")
+    policy.log_std.requires_grad_(False)
+    print(f"[Warmup] Backbone + log_std frozen for first {args.warmup_updates} PPO updates (critic-only warmup).")
 
     total_params = sum(p.numel() for p in policy.parameters())
     print(f"Policy parameters: {total_params:,}\n")
@@ -423,7 +427,8 @@ def main():
         if update_count == args.warmup_updates:
             for p in backbone_params:
                 p.requires_grad_(True)
-            print(f"[Warmup] Backbone unfrozen at update {update_count} — fine-tuning with lr={args.backbone_lr}.")
+            policy.log_std.requires_grad_(True)
+            print(f"[Warmup] Backbone + log_std unfrozen at update {update_count} — fine-tuning with lr={args.backbone_lr}.")
 
         elapsed = time.time() - start_time
         fps     = global_step / max(elapsed, 1e-6)
