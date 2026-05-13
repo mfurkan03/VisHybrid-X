@@ -25,6 +25,7 @@ Simulation / test — compare against the reference:
 """
 
 import json
+import os
 import numpy as np
 
 _CH_NAMES = ("depth", "R", "G", "B")
@@ -95,6 +96,9 @@ class ObsVerifier:
     def save(self, path: str) -> None:
         """Write reference statistics to a JSON file."""
         stats = self.compute_stats()
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(path, "w") as f:
             json.dump(stats, f, indent=2)
         print(f"[ObsVerifier] Saved reference ({stats['n_samples']} frames) → {path}")
