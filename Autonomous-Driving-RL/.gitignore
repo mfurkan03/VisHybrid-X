@@ -1,0 +1,12 @@
+# Python Önbellekleri
+__pycache__/
+*.pyc
+
+# Eğitilen Modeller, Checkpointler ve Çıktılar
+checkpoints/
+episodes/
+rl/output.txt
+Depth_Anything_V2/
+
+# Depth Anything Modelleri ve Diğer Ağırlıklar
+*.pth

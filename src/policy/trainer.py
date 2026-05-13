@@ -218,7 +218,7 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
     actions_np = np.array(train_ds.actions)
     steer_mag  = np.abs(actions_np[:, 0])
 
-    bins        = np.digitize(steer_mag, [0.02, 0.2])  # 0: straight, 1: turning, 2: intersection
+    bins        = np.digitize(steer_mag, [0.05, 0.2])  # 0: straight, 1: turning, 2: intersection
     bin_targets = {0: 0.48, 1: 0.45, 2: 0.05}
     weights     = np.zeros(len(steer_mag), dtype=np.float64)
     for b in np.unique(bins):
