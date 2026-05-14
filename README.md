@@ -1,4 +1,4 @@
-# Metadrive Autonomous
+# VisHybrid-X
 
 An autonomous driving agent trained via **Behavioral Cloning (Imitation Learning)** on the [MetaDrive](https://github.com/metadriverse/metadrive) simulator. An expert policy collects driving demonstrations; a CNN policy network with depth estimation is trained offline to imitate it.
 
