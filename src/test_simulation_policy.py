@@ -74,7 +74,7 @@ def run_simulation(
         "use_render":        True,
         "image_observation": True,
         "sensors":           {rgb_name: sensors[rgb_name]},
-        "vehicle_config":    {"image_source": rgb_name},
+        "vehicle_config":    {"image_source": rgb_name, "show_navi_mark": False},
         "show_interface":    False,
         "image_on_cuda":     False,
         "start_seed":        316181,

@@ -48,11 +48,12 @@ class ILActorCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 1),
         )
-        # std ≈ 0.4: enough exploration to escape the IL-init basin,
-        # but not so wide that actions are random noise.
-        # -3.0 (std≈0.05) was effectively deterministic and prevented PPO from
-        # discovering that different accel values yield higher rewards.
-        self.log_std = nn.Parameter(torch.ones(2) * -0.9)
+        # Very tight init: std≈0.05 (log=-3.0).
+        # Sampled actions stay within ±0.10 of IL mean so early rollouts
+        # complete routes and give the critic real reward signal to learn from.
+        # PPO's policy gradient will push log_std up naturally once the critic
+        # is calibrated — don't let the entropy bonus race it upward first.
+        self.log_std = nn.Parameter(torch.ones(2) * -3.0)
 
     # ------------------------------------------------------------------
     def _get_merged(self, image: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
@@ -93,7 +94,7 @@ class ILActorCritic(nn.Module):
             value       (B,)    — critic estimate
         """
         action_mean, value = self.forward(image, ego)
-        std = self.log_std.exp().expand_as(action_mean)
+        std = self.log_std.clamp(-2.5, 0.5).exp().expand_as(action_mean)
         dist = Normal(action_mean, std)
 
         if action is None:

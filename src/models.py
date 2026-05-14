@@ -99,7 +99,6 @@ class DepthEstimationModel:
 # 2. EGO-STATE UTILITIES
 # ============================================================
 
-# Only total_speed and last_steer are passed to the policy network.
 EGO_DIM = 3  # [total_speed, last_steer, heading_delta]
 
 

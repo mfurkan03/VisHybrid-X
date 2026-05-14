@@ -25,8 +25,8 @@ class RewardConfig:
     route_progress_scale: float = 100.0
     harsh_steering_threshold: float = 0.2   # |steer| below this is normal cornering, not penalized
     harsh_steering_weight: float = -0.1     # applied to excess above threshold, speed-scaled
-    steering_diff_penalty: float = -0.05    # sudden steer change, speed-scaled (reduced: was -0.2, too strongly discouraged exploration)
-    speed_scale_ref: float = 40.0           # km/h reference for speed-scaling steering penalties
+    steering_diff_penalty: float = -0.01    # sudden steer change, speed-scaled (reduced: was -0.2, too strongly discouraged exploration)
+    speed_scale_ref: float = 30.0           # km/h reference for speed-scaling steering penalties
     speed_bonus_weight: float = 0.3         # increased from 0.1 to make movement more attractive
     speed_bonus_min: float = 3.0            # no bonus below this speed (km/h), lowered from 5.0
     standing_still_penalty: float = -0.3    # increased from -0.05; old value was too weak vs. steering penalties

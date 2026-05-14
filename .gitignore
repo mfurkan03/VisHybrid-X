@@ -11,3 +11,5 @@ dataset
 epoch_visualizations/*
 **/__pycache__
 CLAUDE.md
+visualizations/*
+wandb

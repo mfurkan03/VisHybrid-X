@@ -79,11 +79,13 @@ def main():
     policy.eval()
 
     # ── Environment ───────────────────────────────────────────────────────────
+    start_seed = 42
     env_config = {
         "use_render": args.render,
         "show_interface": args.render,
         "manual_control": False,
         "num_scenarios": args.scenarios,
+        "start_seed": start_seed,
     }
     env = MetaDriveRLWrapper(
         env_config=env_config,
@@ -100,7 +102,7 @@ def main():
 
     try:
         ep_count   = 1
-        obs        = env.reset(seed=0)
+        obs        = env.reset(seed=start_seed)
         ep_reward  = 0.0
         step_count = 0
 
@@ -135,7 +137,7 @@ def main():
                 if ep_count >= args.scenarios:
                     print("\nTest complete.")
                     break
-                obs        = env.reset(seed=ep_count)
+                obs        = env.reset(seed=start_seed + ep_count)
                 ep_reward  = 0.0
                 step_count = 0
                 ep_count  += 1

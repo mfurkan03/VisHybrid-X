@@ -27,7 +27,7 @@ device  = torch.device("cpu")
 indices = np.linspace(0, len(rgb_all) - 1, N_FRAMES, dtype=int)
 
 COLS = ["original", "white mask", "yellow mask", "colored mask", "masked RGB (α=0)"]
-fig, axes = plt.subplots(N_FRAMES, len(COLS), figsize=(4 * len(COLS), N_FRAMES * 3))
+fig, axes = plt.subplots(N_FRAMES, len(COLS), figsize=(5 * len(COLS), N_FRAMES * 4))
 fig.suptitle("Lane mask inspection", fontsize=14)
 
 for col, title in enumerate(COLS):
@@ -72,8 +72,9 @@ for row, idx in enumerate(indices):
         axes[row, col].axis("off")
     axes[row, 0].set_ylabel(f"frame {idx}", fontsize=8)
 
-plt.tight_layout()
-out = "lane_mask_check.png"
-plt.savefig(out, dpi=120)
+plt.tight_layout(pad=1.5)
+out = "visualizations/lane_mask_poster.png"
+pathlib.Path("visualizations").mkdir(exist_ok=True)
+plt.savefig(out, dpi=300, bbox_inches="tight")
 print(f"Saved → {out}")
 plt.show()

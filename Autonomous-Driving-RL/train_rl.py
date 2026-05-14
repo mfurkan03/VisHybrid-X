@@ -119,6 +119,9 @@ def parse_args():
                    help="Rollout steps *per env* per PPO update")
     p.add_argument("--batch",          type=int,   default=64)
     p.add_argument("--epochs",         type=int,   default=10)
+    p.add_argument("--target_kl",      type=float, default=0.05,
+                   help="Per-epoch avg KL early-stopping threshold. 0=disabled. "
+                        "~0.05 for IL->RL fine-tuning, ~0.01 for scratch PPO.")
     p.add_argument("--arch",           type=str,   default="impala",
                    choices=["simple", "impala", "impala_v2"])
     p.add_argument("--image_size",     type=int,   default=84)
@@ -144,6 +147,13 @@ def parse_args():
     p.add_argument("--save_obs_ref", type=str, default=None, metavar="PATH",
                    help="After the first rollout save per-channel obs stats to PATH (JSON). "
                         "Use verify_simulation.py --obs_ref PATH to check sim matches training.")
+    # ── Weights & Biases ──────────────────────────────────────────────────────
+    p.add_argument("--wandb",         action="store_true",
+                   help="Enable Weights & Biases logging")
+    p.add_argument("--wandb_project", type=str, default="metadrive-rl",
+                   help="W&B project name")
+    p.add_argument("--wandb_run_name", type=str, default="rl_run",
+                   help="W&B run display name (auto-generated if omitted)")
     return p.parse_args()
 
 
@@ -171,7 +181,7 @@ def main():
     print(f"  Envs         : {n_envs}  ({'SubprocVecEnv' if n_envs > 1 else 'DummyVecEnv'})")
     print(f"  Total steps  : {args.timesteps:,}")
     print(f"  Rollout/env  : {args.rollout}  (total/update = {args.rollout * n_envs:,})")
-    print(f"  Batch        : {args.batch}  epochs={args.epochs}")
+    print(f"  Batch        : {args.batch}  epochs={args.epochs}  target_kl={args.target_kl}")
     print(f"  Seed         : {args.seed}")
     print(f"  LR (heads)   : {args.lr}  backbone_lr={args.backbone_lr}  warmup={args.warmup_updates} updates")
     print(f"  AMP          : {args.amp}   compile={args.compile}")
@@ -204,6 +214,7 @@ def main():
             reward_cfg=reward_cfg,
             image_size=args.image_size,
             dpt_path=args.dpt_path,
+            render=(args.render and i == 0),
         )
         for i in range(n_envs)
     ]
@@ -227,12 +238,34 @@ def main():
     # Optionally resume a full RL checkpoint (overrides IL weights).
     start_global_step = 0
     best_avg_route    = 0.0
+    wandb_run_id      = None
     if args.rl_checkpoint and os.path.exists(args.rl_checkpoint):
-        rl_ckpt = torch.load(args.rl_checkpoint, map_location=device)
+        rl_ckpt = torch.load(args.rl_checkpoint, map_location=device, weights_only=False)
         policy.load_state_dict(rl_ckpt["policy"])
         start_global_step = rl_ckpt.get("global_step", 0)
         best_avg_route    = rl_ckpt.get("route", 0.0)
+        wandb_run_id      = rl_ckpt.get("wandb_run_id", None)
         print(f"[RL Resume] step={start_global_step:,}  best_route={best_avg_route*100:.1f}%")
+
+    # ── Weights & Biases ──────────────────────────────────────────────────────
+    wb_run = None
+    if args.wandb:
+        try:
+            import wandb
+            is_resume = wandb_run_id is not None
+            wb_run = wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                id=wandb_run_id,
+                resume="allow",
+                config=vars(args),
+            )
+            wandb_run_id = wb_run.id
+            print(f"[W&B] Run: {wb_run.name}  id={wb_run.id}  "
+                  f"({'resumed' if is_resume else 'new'})\n")
+        except ImportError:
+            print("[W&B] wandb not installed — logging disabled. pip install wandb\n")
+            wb_run = None
 
     # Separate LRs: critic/log_std get full LR; IL backbone gets much smaller LR
     # to avoid overwriting learned representations with early noisy gradients.
@@ -282,6 +315,7 @@ def main():
         lr=args.lr,
         total_timesteps=args.timesteps,
         use_amp=args.amp and device.type == "cuda",
+        target_kl=args.target_kl,
     )
 
     buffer = RolloutBuffer(
@@ -297,19 +331,25 @@ def main():
 
     # ── Training state ────────────────────────────────────────────────────────
     global_step    = start_global_step
-    update_count   = 0
+    update_count      = 0
+    backbone_unfrozen = False
     episode_count  = 0
     episode_rewards = []
     episode_lengths = []
     episode_routes  = []
 
-    # Per-env accumulators (N separate episode stats)
+    # Per-env persistent observation state — updated after every env step.
+    imgs_np = np.zeros((n_envs, 4, args.image_size, args.image_size), dtype=np.float32)
+    egos    = np.zeros((n_envs, EGO_DIM), dtype=np.float32)
+
+    # Initial reset — all workers start simultaneously.
+    raw_rgbs, egos_init = vec_env.reset()                              # (N,196,196,3), (N,3)
+    imgs_np[:] = build_obs_batch(raw_rgbs, depth_model, args.image_size)
+    egos[:]    = egos_init
+
+    # Per-env accumulators (reset at episode boundary, not at rollout boundary)
     ep_rewards = np.zeros(n_envs, dtype=np.float32)
     ep_lengths = np.zeros(n_envs, dtype=np.int32)
-
-    # Initial reset — get raw RGB from all workers
-    raw_rgbs, egos = vec_env.reset()                               # (N,196,196,3), (N,3)
-    imgs_np = build_obs_batch(raw_rgbs, depth_model, args.image_size)  # (N,4,H,W)
 
     obs_verifier  = ObsVerifier() if args.save_obs_ref else None
     obs_ref_saved = False
@@ -320,84 +360,143 @@ def main():
     while global_step < ppo_cfg.total_timesteps:
 
         # ── Rollout collection ────────────────────────────────────────────────
+        # Per-env buffer pointers: how many transitions each env has stored.
+        # The rollout ends when every env has contributed rollout_steps entries.
+        # Envs that reset slowly simply finish later; fast envs never pause.
         buffer.reset()
         policy.eval()
 
-        for step in range(ppo_cfg.rollout_steps):
-            global_step += n_envs   # each step advances all N envs simultaneously
+        env_ptrs           = [0] * n_envs
+        rollout_t0         = time.time()
+        rollout_transitions = 0
 
-            # Current obs → tensors
-            imgs_t = torch.from_numpy(imgs_np).to(device, non_blocking=True)  # (N,4,H,W)
-            egos_t = torch.from_numpy(egos).to(device, non_blocking=True)      # (N,3)
+        while min(env_ptrs) < ppo_cfg.rollout_steps:
+
+            # ── Non-blocking: pick up completed episode resets ────────────────
+            reset_obs = vec_env.poll_resets()   # {} when nothing is ready yet
+            if reset_obs:
+                r_idxs = sorted(reset_obs.keys())
+                r_rgbs = np.stack([reset_obs[i][0] for i in r_idxs])
+                r_imgs = build_obs_batch(r_rgbs, depth_model, args.image_size)
+                for j, i in enumerate(r_idxs):
+                    imgs_np[i] = r_imgs[j]
+                    egos[i]    = reset_obs[i][1]
+
+            # ── Determine which envs to step this iteration ───────────────────
+            # Ready = active (not resetting) AND still need more transitions.
+            ready = [i for i in vec_env.active_indices
+                     if env_ptrs[i] < ppo_cfg.rollout_steps]
+
+            if not ready:
+                # All active envs hit their quota; remaining ones are resetting.
+                if all(env_ptrs[i] >= ppo_cfg.rollout_steps for i in range(n_envs)):
+                    break   # everyone done — exit collection loop
+                # At least one env is still resetting; block until it's back.
+                reset_obs = vec_env.wait_any_reset()
+                r_idxs = sorted(reset_obs.keys())
+                r_rgbs = np.stack([reset_obs[i][0] for i in r_idxs])
+                r_imgs = build_obs_batch(r_rgbs, depth_model, args.image_size)
+                for j, i in enumerate(r_idxs):
+                    imgs_np[i] = r_imgs[j]
+                    egos[i]    = reset_obs[i][1]
+                continue
+
+            # ── Policy forward on the ready batch (variable size k ≤ N) ──────
+            imgs_batch = np.stack([imgs_np[i] for i in ready])   # (k, 4, H, W)
+            egos_batch = np.stack([egos[i]    for i in ready])   # (k, EGO_DIM)
+            imgs_t = torch.from_numpy(imgs_batch).to(device, non_blocking=True)
+            egos_t = torch.from_numpy(egos_batch).to(device, non_blocking=True)
 
             if obs_verifier is not None:
-                for i in range(n_envs):
+                for i in ready:
                     obs_verifier.record(imgs_np[i], egos[i])
 
             with torch.no_grad():
                 actions, log_probs, _, values = policy.get_action_and_value(imgs_t, egos_t)
-                # actions: (N,2)  log_probs: (N,)  values: (N,)
 
-            actions_np = np.clip(actions.cpu().numpy(), -1.0, 1.0)   # (N, 2)
+            actions_np = np.clip(actions.cpu().numpy(), -1.0, 1.0)   # (k, 2)
 
-            # Step all envs; workers auto-reset on done (SB3 convention)
-            raw_rgbs, next_egos, rewards, dones, infos = vec_env.step(actions_np)
+            # ── Step the ready envs — done workers dispatch RESET immediately ─
+            step_results = vec_env.step(ready, actions_np)
 
-            # Store the CURRENT obs (before overwriting with next obs)
-            buffer.store(
-                imgs_np,                        # (N, 4, H, W)
-                egos,                           # (N, 3)
-                actions_np,                     # (N, 2)
-                rewards,                        # (N,)
-                dones.astype(np.float32),       # (N,)
-                log_probs.cpu().numpy(),        # (N,)
-                values.cpu().numpy(),           # (N,)
-            )
+            # ── Batch DPT for non-done envs in one GPU call ───────────────────
+            cont_envs = [i for i in ready if not step_results[i][3]]
+            if cont_envs:
+                cont_rgbs = np.stack([step_results[i][0] for i in cont_envs])
+                cont_imgs = build_obs_batch(cont_rgbs, depth_model, args.image_size)
 
-            # Build next obs in main process (batched DPT)
-            imgs_np = build_obs_batch(raw_rgbs, depth_model, args.image_size)
-            egos    = next_egos
+            # ── Store transitions and update per-env state ────────────────────
+            cont_j = 0
+            for k, i in enumerate(ready):
+                _, ego_new, reward, done, info = step_results[i]
+                t = env_ptrs[i]
 
-            # Accumulate per-env episode stats
-            ep_rewards += rewards
-            ep_lengths += 1
+                # Write directly into the (T, N, ...) buffer arrays by env index.
+                buffer.imgs[t, i]      = imgs_np[i]       # obs that produced the action
+                buffer.egos[t, i]      = egos[i]
+                buffer.actions[t, i]   = actions_np[k]
+                buffer.rewards[t, i]   = reward
+                buffer.dones[t, i]     = float(done)
+                buffer.log_probs[t, i] = log_probs[k].item()
+                buffer.values[t, i]    = values[k].item()
+                env_ptrs[i]           += 1
+                global_step           += 1
+                rollout_transitions   += 1
+                ep_rewards[i]         += reward
+                ep_lengths[i]         += 1
 
-            # Live status line (env 0)
+                if not done:
+                    imgs_np[i] = cont_imgs[cont_j]
+                    egos[i]    = ego_new
+                    cont_j    += 1
+                else:
+                    # Episode ended — log stats before clearing accumulators.
+                    ep_r = float(ep_rewards[i])
+                    ep_l = int(ep_lengths[i])
+                    episode_count += 1
+                    episode_rewards.append(ep_r)
+                    episode_lengths.append(ep_l)
+                    route   = info.get("route_completion", 0)
+                    speed   = info.get("speed_km_h", 0)
+                    details = info.get("reward_details", {})
+                    episode_routes.append(route)
+                    ep_rewards[i] = 0.0
+                    ep_lengths[i] = 0
+                    # imgs_np[i] / egos[i] intentionally NOT updated here;
+                    # poll_resets() will fill them when the reset completes.
+
+                    pstr = " | ".join(
+                        f"{kk}: {v:+.2f}" for kk, v in details.items() if abs(v) > 0.001
+                    )
+                    print(
+                        f"\n  EP {episode_count:4d} [env{i}] | "
+                        f"R: {ep_r:+7.2f} | Len: {ep_l:4d} | "
+                        f"Route: {route*100:5.1f}% | Spd: {speed:5.1f} | {pstr}"
+                    )
+                    if wb_run is not None:
+                        ep_log = {
+                            "episode/reward":    ep_r,
+                            "episode/length":    ep_l,
+                            "episode/route_pct": route * 100,
+                            "episode/speed_kmh": speed,
+                        }
+                        ep_log.update({f"episode/reward_{kk}": v for kk, v in details.items()})
+                        wb_run.log(ep_log, step=global_step)
+
+            # ── Live status line ──────────────────────────────────────────────
             pct        = global_step / ppo_cfg.total_timesteps * 100
-            step_speed = infos[0].get("speed_km_h", 0)
-            step_route = infos[0].get("route_completion", 0)
+            fps_now    = rollout_transitions / max(time.time() - rollout_t0, 1e-6)
+            n_active   = len(vec_env.active_indices)
+            buf_min    = min(env_ptrs)
             sys.stdout.write(
                 f"\r  [{global_step:>8,}/{ppo_cfg.total_timesteps:,} {pct:4.1f}%] "
-                f"EP {episode_count+1:3d} [env0] | "
-                f"St:{actions_np[0,0]:+.2f} Th:{actions_np[0,1]:+.2f} | "
-                f"Spd:{step_speed:5.1f} | R:{ep_rewards[0]:+7.1f} | Rt:{step_route*100:4.1f}%"
+                f"EP {episode_count+1:3d} | "
+                f"Active:{n_active}/{n_envs} | "
+                f"FPS:{fps_now:6.1f} | "
+                f"Buf:{buf_min}/{ppo_cfg.rollout_steps}"
                 f"{'':10s}"
             )
             sys.stdout.flush()
-
-            # Log completed episodes (any env may finish at this step)
-            for env_idx in range(n_envs):
-                if dones[env_idx]:
-                    episode_count += 1
-                    episode_rewards.append(ep_rewards[env_idx])
-                    episode_lengths.append(ep_lengths[env_idx])
-
-                    route   = infos[env_idx].get("route_completion", 0)
-                    speed   = infos[env_idx].get("speed_km_h", 0)
-                    details = infos[env_idx].get("reward_details", {})
-                    episode_routes.append(route)
-
-                    penalty_str = " | ".join(
-                        f"{k}: {v:+.2f}" for k, v in details.items() if abs(v) > 0.001
-                    )
-                    print(
-                        f"\n  EP {episode_count:4d} [env{env_idx}] | "
-                        f"R: {ep_rewards[env_idx]:+7.2f} | Len: {ep_lengths[env_idx]:4d} | "
-                        f"Route: {route*100:5.1f}% | Spd: {speed:5.1f} | {penalty_str}"
-                    )
-
-                    ep_rewards[env_idx] = 0.0
-                    ep_lengths[env_idx] = 0
 
         # ── Save obs reference (first rollout only) ───────────────────────────
         if obs_verifier is not None and not obs_ref_saved:
@@ -405,14 +504,14 @@ def main():
             obs_ref_saved = True
 
         # ── GAE bootstrap ─────────────────────────────────────────────────────
-        # imgs_np / egos now hold the obs *after* the last rollout step.
-        # For envs that just reset, this is the first obs of the new episode.
-        last_imgs_t = torch.from_numpy(imgs_np).to(device)   # (N, 4, H, W)
-        last_egos_t = torch.from_numpy(egos).to(device)      # (N, 3)
+        # imgs_np[i] / egos[i] = obs after each env's last stored transition.
+        # For envs whose last step was done=True, the bootstrap value is
+        # automatically masked to 0 by compute_gae, so stale obs is harmless.
+        last_imgs_t = torch.from_numpy(imgs_np).to(device)
+        last_egos_t = torch.from_numpy(egos).to(device)
         with torch.no_grad():
-            last_values = policy.get_value(last_imgs_t, last_egos_t).cpu().numpy()   # (N,)
+            last_values = policy.get_value(last_imgs_t, last_egos_t).cpu().numpy()  # (N,)
 
-        # dones[T-1] already stored in buffer — compute_gae uses it to mask bootstrap
         buffer.compute_gae(last_values, ppo_cfg.gamma, ppo_cfg.gae_lambda)
 
         # ── PPO update ────────────────────────────────────────────────────────
@@ -424,7 +523,8 @@ def main():
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        if update_count == args.warmup_updates:
+        if update_count >= args.warmup_updates and not backbone_unfrozen:
+            backbone_unfrozen = True
             for p in backbone_params:
                 p.requires_grad_(True)
             policy.log_std.requires_grad_(True)
@@ -448,8 +548,20 @@ def main():
             f"Avg Len: {avg_length:.0f} | "
             f"P_loss: {losses['policy_loss']:.4f} | "
             f"V_loss: {losses['value_loss']:.4f} | "
-            f"Entropy: {losses['entropy']:.4f}\n"
+            f"Entropy: {losses['entropy']:.4f} | "
+            f"KL: {losses['approx_kl']:.5f}\n"
         )
+        if wb_run is not None:
+            wb_run.log({
+                "train/policy_loss":  losses["policy_loss"],
+                "train/value_loss":   losses["value_loss"],
+                "train/entropy":      losses["entropy"],
+                "train/approx_kl":    losses["approx_kl"],
+                "train/avg_reward":   avg_reward,
+                "train/avg_route_pct": avg_route * 100,
+                "train/avg_length":   avg_length,
+                "train/fps":          fps,
+            }, step=global_step)
 
         # ── Checkpoints ───────────────────────────────────────────────────────
         ckpt = {
@@ -461,6 +573,7 @@ def main():
             "route":         best_avg_route,
             "seed":          args.seed,
             "n_envs":        n_envs,
+            "wandb_run_id":  wandb_run_id,
         }
         torch.save(ckpt, os.path.join(args.save_dir, "policy_latest.pth"))
 
@@ -471,6 +584,8 @@ def main():
             print(f"  *** New best model (Avg Route: {best_avg_route*100:.1f}%)\n")
 
     # ── Done ──────────────────────────────────────────────────────────────────
+    if wb_run is not None:
+        wb_run.finish()
     vec_env.close()
     total_time = time.time() - start_time
     print(f"\n{'='*60}")

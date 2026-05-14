@@ -32,9 +32,9 @@ from utils.fps import FPSCounter
 # WORKER FUNCTION
 # ============================================================
 def _worker_collect(
-    worker_id, 
-    start_ep_idx, 
-    num_episodes, 
+    worker_id,
+    start_ep_idx,
+    num_episodes,
     total_episodes,
     seed,
     save_dir,
@@ -42,7 +42,8 @@ def _worker_collect(
     visualize,
     num_cameras,
     image_on_cuda,
-    split_ratios
+    split_ratios,
+    poster_path=None,
 ):
     """Worker process that handles a subset of the total episodes."""
     
@@ -150,7 +151,16 @@ def _worker_collect(
                       flush=True)
 
             if visualize:
-                quit_requested = show_cameras(raw_frames, rgb_cam_names, depth_cam_names, fps_counter)
+                ego_info = {
+                    "speed":         reading.total_speed,
+                    "steer":         reading.last_steer,
+                    "heading_delta": reading.heading_delta,
+                }
+                quit_requested = show_cameras(
+                    raw_frames, rgb_cam_names, depth_cam_names, fps_counter,
+                    ego_info=ego_info,
+                    poster_path=poster_path,
+                )
                 if quit_requested:
                     done = True
 
@@ -200,9 +210,10 @@ def collect_expert_data_parallel(
     save_dir       = "dataset",
     visualize      = True,
     num_cameras    = 2,
-    action_noise = 0.3,
+    action_noise   = 0.3,
     image_on_cuda  = True,
     split_ratios   = (0.8, 0.1, 0.1),
+    poster_path    = None,
 ):
     os.makedirs(os.path.join(save_dir, "train"), exist_ok=True)
     os.makedirs(os.path.join(save_dir, "val"),   exist_ok=True)
@@ -247,7 +258,8 @@ def collect_expert_data_parallel(
             visualize,                  # visualize
             num_cameras,                # num_cameras
             image_on_cuda,              # image_on_cuda
-            split_ratios                # split_ratios
+            split_ratios,               # split_ratios
+            poster_path,                # poster_path
         ))
         current_idx += worker_eps
 
@@ -280,6 +292,9 @@ if __name__ == "__main__":
     parser.add_argument("--act_noise",   type=float,  default=0.3)
     parser.add_argument("--no_vis",        action="store_true")
     parser.add_argument("--image_on_cuda", action="store_true", default=False)
+    parser.add_argument("--poster",        type=str, default=None,
+                        metavar="PATH",
+                        help="Save a high-res poster PNG to PATH, then exit")
     args = parser.parse_args()
 
     collect_expert_data_parallel(
@@ -287,8 +302,16 @@ if __name__ == "__main__":
         num_episodes  = args.episodes,
         num_workers   = args.num_workers,
         save_dir      = args.save_dir,
+
+
+
+
+
+
+        
         action_noise  = args.act_noise,
         visualize     = not args.no_vis,
         num_cameras   = args.num_cameras,
         image_on_cuda = args.image_on_cuda,
+        poster_path   = args.poster,
     )

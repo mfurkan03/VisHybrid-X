@@ -1,7 +1,8 @@
 """
 MetaDrive RL Environment Wrapper
 =================================
-Produces the same 4-channel observation format as the IL training pipeline:
+Produces the same 4-channel observation format as the IL training pipeline,
+using the same camera rig (build_cameras) and BGR→RGB conversion as IL:
   channel 0 : inverted depth  (closer = higher value)
   channels 1-3 : RGB
 
@@ -30,11 +31,11 @@ import torch.nn.functional as F
 from pathlib import Path
 
 from metadrive import MetaDriveEnv
-from metadrive.component.sensors.rgb_camera import RGBCamera
 
-# Import IL depth model and ego-state utilities from the parent repo.
+# Import IL depth model, ego-state utilities, and camera builder from the parent repo.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from src.models import DepthEstimationModel, extract_ego_state, EGO_DIM
+from src.data.cameras import build_cameras
 
 from rl.rewards import compute_reward, RewardConfig
 
@@ -60,24 +61,28 @@ class MetaDriveRLWrapper:
         image_size: int = 84,
         dpt_path: str = None,
         use_depth_model: bool = True,
+        render: bool = False,
     ):
         self.reward_cfg      = reward_cfg or RewardConfig()
         self.show_perception = show_perception
         self.image_size      = image_size
         self.use_depth_model = use_depth_model
+        self.render          = render
         self.OBS_SHAPE       = (4, image_size, image_size)
 
+        # Use the same camera rig as IL training so the model sees the same viewpoint.
+        _, il_sensors, rgb_cam_names, _ = build_cameras(1)
+        self.rgb_name = rgb_cam_names[0]  # "cam_0"
+
         default_cfg = {
-            "use_render": False,
+            "use_render": render,
             "show_interface": False,
             # image_observation must be True — otherwise MetaDrive never
             # initialises the RGB sensor and the model runs blind.
             "image_observation": True,
-            "sensors": {
-                "rgb": (RGBCamera, 196, 196),
-            },
+            "sensors": il_sensors,
             "vehicle_config": {
-                "image_source": "rgb",
+                "image_source": self.rgb_name,
                 "lidar": {"num_lasers": 0, "distance": 0},
                 "side_detector": {"num_lasers": 0},
                 "lane_line_detector": {"num_lasers": 0},
@@ -149,7 +154,7 @@ class MetaDriveRLWrapper:
 
     def close(self):
         self.env.close()
-        if self.show_perception:
+        if self.show_perception or self.render:
             cv2.destroyAllWindows()
 
     # ── Private helpers ───────────────────────────────────────────────────────
@@ -162,52 +167,34 @@ class MetaDriveRLWrapper:
         except Exception:
             return self._last_ego_np.copy()
 
-    def _extract_rgb(self, raw_obs) -> np.ndarray | None:
+    def _extract_rgb(self) -> np.ndarray | None:
         """
-        Pull a uint8 RGB (H, W, 3) array from MetaDrive's raw observation dict.
-        MetaDrive's RGBCamera already outputs RGB — no colour-channel swap needed.
-        Returns None on failure (caller falls back to sensor direct-read).
+        Pull a uint8 RGB (H, W, 3) array from the IL camera via perceive().
+        MetaDrive perceive() returns BGR — we flip to RGB to match IL training.
+        Returns None on failure.
         """
-        if raw_obs is None:
-            return None
         try:
-            if not (isinstance(raw_obs, dict) and "image" in raw_obs):
-                return None
-            img = raw_obs["image"]
-            # MetaDrive image shape: (H, W, C, stack) float [0,1]
-            if img.ndim == 4:
-                img = img[:, :, :, -1]   # take the latest frame
-            if img.ndim != 3:
-                return None
-            rgb = img[..., :3]
-            if rgb.max() <= 1.0:
-                return (rgb * 255).astype(np.uint8)
-            return rgb.astype(np.uint8)
-        except Exception:
+            rgb_raw = self.env.engine.get_sensor(self.rgb_name).perceive(
+                to_float=False, new_parent_node=self.env.agent.origin
+            )
+            if hasattr(rgb_raw, "get"):
+                rgb_raw = rgb_raw.get()
+            rgb_arr = np.array(rgb_raw, dtype=np.uint8)
+            # MetaDrive perceive() returns BGR; convert to RGB to match IL training.
+            return rgb_arr[..., ::-1].copy()
+        except Exception as e:
+            print(f"[WARNING] RGB sensor read failed: {e}")
             return None
 
-    def _extract_raw_rgb(self, raw_obs=None) -> np.ndarray:
+    def _extract_raw_rgb(self) -> np.ndarray:
         """
         Return (196, 196, 3) uint8 RGB without running DPT.
         Used in worker mode (use_depth_model=False).
-        Falls back to direct sensor read, then to the cached fallback.
+        Falls back to the cached fallback on failure.
         """
-        rgb_uint8 = self._extract_rgb(raw_obs)
+        rgb_uint8 = self._extract_rgb()
         if rgb_uint8 is None:
-            try:
-                rgb_raw = self.env.engine.get_sensor("rgb").perceive(self.env.agent)
-                if hasattr(rgb_raw, "get"):
-                    rgb_raw = rgb_raw.get()
-                rgb_arr = np.array(rgb_raw)
-                if rgb_arr.ndim == 3 and rgb_arr.shape[2] >= 3:
-                    rgb3 = rgb_arr[..., :3]
-                    rgb_uint8 = (
-                        (rgb3 * 255).astype(np.uint8) if rgb3.max() <= 1.0
-                        else rgb3.astype(np.uint8)
-                    )
-            except Exception as e:
-                print(f"[WARNING] RGB sensor read failed: {e}")
-                rgb_uint8 = self._last_img_np.copy()
+            rgb_uint8 = self._last_img_np.copy()
         return rgb_uint8
 
     def _get_obs(self, raw_obs=None):
@@ -225,29 +212,22 @@ class MetaDriveRLWrapper:
         """
         # ── Worker mode: skip DPT, return raw RGB ────────────────────────────
         if not self.use_depth_model:
-            rgb_uint8 = self._extract_raw_rgb(raw_obs)
+            rgb_uint8 = self._extract_raw_rgb()
             ego_np    = self._get_ego()
             self._step_count += 1
             self._last_img_np = rgb_uint8
             self._last_ego_np = ego_np
+
+            if self.render and self._step_count % 3 == 0:
+                self._show_info_panel(ego_np)
+
             return rgb_uint8, ego_np
 
         # ── Standard mode: DPT depth + RGB ───────────────────────────────────
-        rgb_uint8 = self._extract_rgb(raw_obs)
+        rgb_uint8 = self._extract_rgb()
 
-        # Fallback: read directly from the sensor
         if rgb_uint8 is None:
-            try:
-                rgb_raw = self.env.engine.get_sensor("rgb").perceive(self.env.agent)
-                if hasattr(rgb_raw, "get"):
-                    rgb_raw = rgb_raw.get()
-                rgb_arr = np.array(rgb_raw)
-                if rgb_arr.ndim == 3 and rgb_arr.shape[2] >= 3:
-                    rgb3 = rgb_arr[..., :3]
-                    rgb_uint8 = (rgb3 * 255).astype(np.uint8) if rgb3.max() <= 1.0 else rgb3.astype(np.uint8)
-            except Exception as e:
-                print(f"[WARNING] RGB sensor read failed: {e}")
-                return self._last_img_np, self._last_ego_np
+            return self._last_img_np, self._last_ego_np
 
         dev = self.depth_model.device
 
@@ -309,3 +289,30 @@ class MetaDriveRLWrapper:
         self._last_img_np = img_np
         self._last_ego_np = ego_np
         return img_np, ego_np
+
+    def _show_info_panel(self, ego_np: np.ndarray):
+        """Draw a CV2 overlay showing steer, throttle, and ego state."""
+        steer    = float(self._prev_action[0])
+        throttle = float(self._prev_action[1])
+        speed, last_steer, heading_delta = (float(ego_np[i]) for i in range(3))
+
+        W, H = 400, 220
+        panel = np.zeros((H, W, 3), dtype=np.uint8)
+
+        def _bar(y, label, val, lo, hi, color):
+            cv2.putText(panel, f"{label}: {val:+.3f}", (10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            bx, bw = 180, 180
+            frac = (val - lo) / max(hi - lo, 1e-6)
+            frac = max(0.0, min(1.0, frac))
+            cv2.rectangle(panel, (bx, y - 12), (bx + bw, y), (50, 50, 50), -1)
+            cv2.rectangle(panel, (bx, y - 12), (bx + int(bw * frac), y), color, -1)
+
+        _bar(30,  "Steer   ",    steer,    -1.0,  1.0, (0, 200, 255))
+        _bar(70,  "Throttle",    throttle, -1.0,  1.0, (0, 255, 100))
+        _bar(110, "Speed(kph)",  speed,     0.0, 60.0, (255, 180,  50))
+        _bar(150, "Heading Delta",   heading_delta, -1.0, 1.0, (200, 100, 255))
+        _bar(190, "Last steer",  last_steer,    -1.0, 1.0, (100, 200, 255))
+
+        cv2.imshow("RL Info Panel", panel)
+        cv2.waitKey(1)

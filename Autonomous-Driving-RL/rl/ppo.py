@@ -30,17 +30,22 @@ from dataclasses import dataclass
 @dataclass
 class PPOConfig:
     rollout_steps: int     = 2048
-    epochs_per_update: int = 10
+    epochs_per_update: int = 4
     mini_batch_size: int   = 64
     gamma: float           = 0.99
     gae_lambda: float      = 0.95
     clip_epsilon: float    = 0.2
-    entropy_coef: float    = 0.01
+    entropy_coef: float    = 0.001
     value_coef: float      = 0.5
     max_grad_norm: float   = 0.5
     lr: float              = 3e-4
     total_timesteps: int   = 200_000
     use_amp: bool          = False   # mixed-precision PPO update (CUDA only)
+    # Early stopping: halt the epoch loop if per-epoch avg KL exceeds this.
+    # Checked once per epoch (not per mini-batch) to avoid noisy early cuts.
+    # 0.05 suits IL→RL fine-tuning where initial KL is ~0.1–0.15.
+    # Set to 0 to disable early stopping entirely.
+    target_kl: float       = 0.05
 
 
 class RolloutBuffer:
@@ -206,9 +211,13 @@ def ppo_update(policy, optimizer, buffer: RolloutBuffer, cfg: PPOConfig,
     total_policy_loss = 0.0
     total_value_loss  = 0.0
     total_entropy     = 0.0
+    total_approx_kl   = 0.0
     num_updates = 0
 
-    for _ in range(cfg.epochs_per_update):
+    for epoch in range(cfg.epochs_per_update):
+        epoch_kl = 0.0
+        epoch_batches = 0
+
         for batch in buffer.get_batches(cfg.mini_batch_size):
             imgs        = batch["imgs"]
             egos        = batch["egos"]
@@ -218,13 +227,18 @@ def ppo_update(policy, optimizer, buffer: RolloutBuffer, cfg: PPOConfig,
             returns     = batch["returns"]
 
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            advantages = advantages.clamp(-5.0, 5.0)
 
             with torch.autocast("cuda", enabled=use_amp):
                 _, new_log_p, entropy, new_values = policy.get_action_and_value(
                     imgs, egos, old_actions
                 )
 
-                ratio = (new_log_p - old_log_p).exp()
+                log_ratio = new_log_p - old_log_p
+                ratio = log_ratio.exp()
+                # Schulman's approximation: KL ≈ (r-1) - log(r)
+                approx_kl = ((ratio - 1) - log_ratio).mean()
+
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1.0 - cfg.clip_epsilon, 1.0 + cfg.clip_epsilon) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
@@ -248,11 +262,23 @@ def ppo_update(policy, optimizer, buffer: RolloutBuffer, cfg: PPOConfig,
             total_policy_loss += policy_loss.item()
             total_value_loss  += value_loss.item()
             total_entropy     += entropy.mean().item()
-            num_updates += 1
+            total_approx_kl   += approx_kl.item()
+            num_updates      += 1
+            epoch_kl         += approx_kl.item()
+            epoch_batches    += 1
+
+        # Check per-epoch avg KL — more stable than per-mini-batch instantaneous KL.
+        if cfg.target_kl > 0 and epoch_batches > 0:
+            epoch_avg_kl = epoch_kl / epoch_batches
+            if epoch_avg_kl > cfg.target_kl:
+                print(f"[PPO] Early stopping after epoch {epoch + 1}/{cfg.epochs_per_update} "
+                      f"— epoch avg KL {epoch_avg_kl:.4f} > threshold {cfg.target_kl:.4f}")
+                break
 
     n = max(num_updates, 1)
     return {
         "policy_loss": total_policy_loss / n,
         "value_loss":  total_value_loss  / n,
         "entropy":     total_entropy     / n,
+        "approx_kl":   total_approx_kl   / n,
     }
