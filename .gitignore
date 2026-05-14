@@ -13,3 +13,4 @@ epoch_visualizations/*
 CLAUDE.md
 visualizations/*
 wandb
+rl_checkpoints/*
