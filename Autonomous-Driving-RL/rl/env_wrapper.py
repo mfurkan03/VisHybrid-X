@@ -268,13 +268,13 @@ class MetaDriveRLWrapper:
         # ── Optional visualisation (render mode, every 3 steps) ───────────────
         if self.show_perception and self._step_count % 3 == 0:
             sz = (250, 250)
-            rgb_disp   = cv2.resize(rgb_uint8, sz)
-            depth_vis  = (img_np[0] * 255).astype(np.uint8)
-            depth_col  = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
-            depth_disp = cv2.resize(depth_col, sz)
-            rgb_ch_disp = cv2.resize(
-                (img_np[1:4].transpose(1, 2, 0) * 255).astype(np.uint8), sz
-            )
+            # rgb_uint8 is RGB; cv2.imshow expects BGR — flip channels for display only.
+            rgb_disp    = cv2.resize(rgb_uint8[..., ::-1].copy(), sz)
+            depth_vis   = (img_np[0] * 255).astype(np.uint8)
+            depth_col   = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+            depth_disp  = cv2.resize(depth_col, sz)
+            rgb_model   = (img_np[1:4].transpose(1, 2, 0) * 255).astype(np.uint8)
+            rgb_ch_disp = cv2.resize(rgb_model[..., ::-1].copy(), sz)
             combined_vis = np.hstack([rgb_disp, depth_disp, rgb_ch_disp])
             cv2.imshow("RL View:  RGB  |  Depth  |  RGB (model input)", combined_vis)
             cv2.waitKey(1)

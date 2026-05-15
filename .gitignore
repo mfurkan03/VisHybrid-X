@@ -12,5 +12,6 @@ epoch_visualizations/*
 **/__pycache__
 CLAUDE.md
 visualizations/*
+!visualizations/poster.png
 wandb
 rl_checkpoints/*

@@ -239,13 +239,19 @@ def main():
     start_global_step = 0
     best_avg_route    = 0.0
     wandb_run_id      = None
+    resumed_optimizer_state = None
     if args.rl_checkpoint and os.path.exists(args.rl_checkpoint):
         rl_ckpt = torch.load(args.rl_checkpoint, map_location=device, weights_only=False)
         policy.load_state_dict(rl_ckpt["policy"])
-        start_global_step = rl_ckpt.get("global_step", 0)
-        best_avg_route    = rl_ckpt.get("route", 0.0)
-        wandb_run_id      = rl_ckpt.get("wandb_run_id", None)
-        print(f"[RL Resume] step={start_global_step:,}  best_route={best_avg_route*100:.1f}%")
+        start_global_step       = rl_ckpt.get("global_step", 0)
+        best_avg_route          = rl_ckpt.get("route", 0.0)
+        wandb_run_id            = rl_ckpt.get("wandb_run_id", None)
+        resumed_optimizer_state = rl_ckpt.get("optimizer", None)
+        if resumed_optimizer_state is None:
+            print(f"[RL Resume] step={start_global_step:,}  best_route={best_avg_route*100:.1f}%  "
+                  f"(no optimizer state in checkpoint — Adam starts cold)")
+        else:
+            print(f"[RL Resume] step={start_global_step:,}  best_route={best_avg_route*100:.1f}%")
 
     # ── Weights & Biases ──────────────────────────────────────────────────────
     wb_run = None
@@ -275,6 +281,9 @@ def main():
         {"params": backbone_params, "lr": args.backbone_lr},
         {"params": head_params,     "lr": args.lr},
     ])
+    if resumed_optimizer_state is not None:
+        optimizer.load_state_dict(resumed_optimizer_state)
+        print("[RL Resume] Optimizer state restored.")
 
     # During warmup: freeze backbone AND log_std, train only value_head.
     # Reason: policy gradient (which flows through log_std) uses advantage estimates
@@ -566,6 +575,7 @@ def main():
         # ── Checkpoints ───────────────────────────────────────────────────────
         ckpt = {
             "policy":        policy.state_dict(),
+            "optimizer":     optimizer.state_dict(),
             "il_model_arch": args.arch,
             "image_size":    args.image_size,
             "global_step":   global_step,
