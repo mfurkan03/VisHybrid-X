@@ -1,4 +1,4 @@
-# MetaDrive Autonomous
+# VisHybrid-X
 
 > Autonomous driving via **Behavioral Cloning + PPO fine-tuning** in the [MetaDrive](https://github.com/metadriverse/metadrive) simulator.
 > An expert collects demonstrations → a CNN policy learns to imitate → PPO fine-tunes it with environment rewards.
