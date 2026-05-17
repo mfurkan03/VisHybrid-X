@@ -203,13 +203,15 @@ def train_dpt(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  collate_fn=collate_fn)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-    # Fixed validation batch for per-epoch visualisation
+    # Fixed single frame from the middle of the val set for per-epoch visualisation.
+    # Middle index avoids episode starts/ends and is more likely to have a lead vehicle.
     vis_dir = "epoch_visualizations"
     os.makedirs(vis_dir, exist_ok=True)
-    fixed_vis_rgbs, fixed_vis_depths = next(iter(val_loader))
-    fixed_vis_rgbs   = fixed_vis_rgbs[:4]
-    fixed_vis_depths = fixed_vis_depths[:4]
-    print(f"[INFO] Visualizations will be saved to ./{vis_dir}/")
+    mid_idx              = len(val_ds) // 2
+    vis_rgb, vis_depth   = val_ds[mid_idx]          # (H,W,3), (1,H,W)
+    vis_rgb_batch        = np.stack([vis_rgb])       # (1,H,W,3)
+    vis_depth_batch      = torch.tensor(np.stack([vis_depth]), dtype=torch.float32)
+    print(f"[INFO] Visualizations will be saved to ./{vis_dir}/  (val frame {mid_idx})")
 
     optimizer = optim.AdamW(depth_estimator.model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-7)
@@ -275,11 +277,11 @@ def train_dpt(
                 print(f"[INFO] Early stopping triggered after {patience} epochs without improvement.")
                 break
 
-        # Save visualisation grid
+        # Save single-frame visualisation with edge overlay
         with torch.no_grad():
-            pred_vis = depth_estimator.predict_batch_with_grad(fixed_vis_rgbs)
-        _save_vis_grid(fixed_vis_rgbs, fixed_vis_depths, pred_vis,
-                       os.path.join(vis_dir, f"epoch_{epoch+1:03d}.jpg"))
+            pred_vis = depth_estimator.predict_batch_with_grad(vis_rgb_batch)
+        _save_single_vis(vis_rgb_batch[0], vis_depth_batch[0], pred_vis[0],
+                         os.path.join(vis_dir, f"epoch_{epoch+1:03d}.jpg"))
 
 
 def _save_vis_grid(fixed_vis_rgbs, fixed_vis_depths, pred_vis, out_file):
@@ -305,6 +307,56 @@ def _save_vis_grid(fixed_vis_rgbs, fixed_vis_depths, pred_vis, out_file):
         vis_rows.append(np.hstack((rgb_bgr, gt_d_color, pred_d_color)))
 
     cv2.imwrite(out_file, np.vstack(vis_rows))
+
+
+def _save_single_vis(rgb_np: np.ndarray, gt_depth: torch.Tensor,
+                     pred_depth: torch.Tensor, out_file: str, size: int = 320):
+    """
+    Save a 4-panel image for one frame:
+      [RGB | GT depth | Predicted depth | Predicted edges (Sobel)]
+
+    The edge panel makes blurriness vs. sharpness immediately visible across epochs.
+    rgb_np:    (H, W, 3) uint8
+    gt_depth:  (1, H, W) tensor
+    pred_depth:(1, H, W) tensor
+    """
+    # --- RGB ---
+    rgb = rgb_np.copy()
+    if rgb.max() <= 1.0:
+        rgb = (rgb * 255).astype(np.uint8)
+    rgb_bgr = cv2.cvtColor(cv2.resize(rgb, (size, size)), cv2.COLOR_RGB2BGR)
+
+    # --- GT depth ---
+    gt = gt_depth[0].cpu().numpy()
+    gt = cv2.resize(gt, (size, size), interpolation=cv2.INTER_NEAREST)
+    gt = (gt - gt.min()) / (gt.max() - gt.min() + 1e-6)
+    gt_color = cv2.applyColorMap((gt * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+
+    # --- Predicted depth ---
+    pred = pred_depth[0].cpu().numpy()
+    pred = cv2.resize(pred, (size, size), interpolation=cv2.INTER_NEAREST)
+    pred = (pred - pred.min()) / (pred.max() - pred.min() + 1e-6)
+    pred = 1.0 - pred  # invert: closer = brighter
+    pred_color = cv2.applyColorMap((pred * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+
+    # --- Sobel edge map on predicted depth ---
+    pred_u8  = (pred * 255).astype(np.uint8)
+    sobel_x  = cv2.Sobel(pred_u8, cv2.CV_32F, 1, 0, ksize=3)
+    sobel_y  = cv2.Sobel(pred_u8, cv2.CV_32F, 0, 1, ksize=3)
+    edges    = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+    edges    = (edges / (edges.max() + 1e-6) * 255).astype(np.uint8)
+    edges_color = cv2.applyColorMap(edges, cv2.COLORMAP_HOT)
+
+    panel = np.hstack((rgb_bgr, gt_color, pred_color, edges_color))
+
+    # Burn a thin label strip at the top
+    label_h = 22
+    label_strip = np.zeros((label_h, panel.shape[1], 3), dtype=np.uint8)
+    for col_idx, text in enumerate(["RGB", "GT depth", "Pred depth", "Pred edges"]):
+        x = col_idx * size + 4
+        cv2.putText(label_strip, text, (x, 15), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.imwrite(out_file, np.vstack((label_strip, panel)))
 
 
 # ============================================================
