@@ -197,9 +197,10 @@ class DrivingPolicyNet(nn.Module):
             nn.Linear(64, 32),      nn.ReLU(),
         )
 
-        self.fc_out = nn.Linear(512 + 32, out_dim)
+        self.alpha_head = nn.Sequential(nn.Linear(512 + 32, 2), nn.Softplus())
+        self.beta_head  = nn.Sequential(nn.Linear(512 + 32, 2), nn.Softplus())
 
-    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         v = F.relu(self.conv1(x))
         v = F.relu(self.conv2(v))
         v = F.relu(self.conv3(v))
@@ -210,7 +211,7 @@ class DrivingPolicyNet(nn.Module):
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
-        return self.fc_out(merged)
+        return self.alpha_head(merged) + 1.0, self.beta_head(merged) + 1.0
 
 class _ImpalaResBlock(nn.Module):
     """Pre-activation residual block used inside the IMPALA CNN."""
@@ -284,22 +285,16 @@ class ImpalaNet(nn.Module):
         )
 
         merged_dim = 512 + 32
-        self.steer_head = nn.Sequential(
-            nn.Linear(merged_dim, 128), nn.ReLU(), nn.Dropout(p),
-            nn.Linear(128, 1),
-        )
-        self.accel_head = nn.Sequential(
-            nn.Linear(merged_dim, 128), nn.ReLU(), nn.Dropout(p),
-            nn.Linear(128, 1),
-        )
+        self.alpha_head = nn.Sequential(nn.Linear(merged_dim, 2), nn.Softplus())
+        self.beta_head  = nn.Sequential(nn.Linear(merged_dim, 2), nn.Softplus())
 
-    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         v = self.vis_proj(self.cnn(x))
         e = self.ego_fc(ego)
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
-        return torch.cat([self.steer_head(merged), self.accel_head(merged)], dim=1)
+        return self.alpha_head(merged) + 1.0, self.beta_head(merged) + 1.0
 
 
 # ============================================================
@@ -397,16 +392,10 @@ class ImpalaNetV2(nn.Module):
         )
 
         merged_dim = 512 + 32
-        self.steer_head = nn.Sequential(
-            nn.Linear(merged_dim, 256), nn.ReLU(), nn.Dropout(p),
-            nn.Linear(256, 1),
-        )
-        self.accel_head = nn.Sequential(
-            nn.Linear(merged_dim, 256), nn.ReLU(), nn.Dropout(p),
-            nn.Linear(256, 1),
-        )
+        self.alpha_head = nn.Sequential(nn.Linear(merged_dim, 2), nn.Softplus())
+        self.beta_head  = nn.Sequential(nn.Linear(merged_dim, 2), nn.Softplus())
 
-    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         x = torch.cat([
             x[:, :1],
             (x[:, 1:] - self.rgb_mean) / self.rgb_std,
@@ -416,7 +405,7 @@ class ImpalaNetV2(nn.Module):
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
-        return torch.cat([self.steer_head(merged), self.accel_head(merged)], dim=1)
+        return self.alpha_head(merged) + 1.0, self.beta_head(merged) + 1.0
 
 
 def build_policy(arch: str = "simple", image_size: int = None) -> nn.Module:

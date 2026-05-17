@@ -2,10 +2,18 @@
 IL Actor-Critic Wrapper
 =======================
 Wraps any IL policy (ImpalaNet, ImpalaNetV2, DrivingPolicyNet) as a PPO
-actor-critic by adding a value head and a learnable log_std on top of the
-shared 544-d feature vector that the IL backbone already computes.
+actor-critic using a Beta action distribution.
 
-IL→RL workflow:
+Beta distribution rationale
+---------------------------
+Gaussian (Normal) is unbounded: samples can fall outside [-1, 1], and
+clamping corrupts log-prob / reward attribution.  Beta is naturally
+supported on (0, 1).  We sample in [0, 1] and map to [-1, 1] only when
+stepping the environment; the buffer stores raw [0, 1] samples so
+log-prob re-evaluation during the PPO update is exact.
+
+IL→RL workflow
+--------------
     il_model = build_policy("impala", image_size=84)
     policy   = ILActorCritic(il_model).to(device)
     policy.load_from_il_checkpoint("models/policy_model_best.pth", device)
@@ -14,12 +22,12 @@ IL→RL workflow:
 import sys
 from pathlib import Path
 
-# Allow importing from the parent IL repo regardless of CWD.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
+import torch.nn.functional as F
+from torch.distributions import Beta
 
 
 class ILActorCritic(nn.Module):
@@ -27,13 +35,20 @@ class ILActorCritic(nn.Module):
     PPO actor-critic that uses an IL backbone for feature extraction.
 
     The IL backbone exposes a 544-d merged feature (512 visual + 32 ego)
-    via forward(..., return_features=True).  We add:
-      - value_head : Linear(544→128→1)  — critic
-      - log_std    : learnable (2,) parameter — action distribution width
+    via forward(..., return_features=True).  On top of that we add:
 
-    The actor output reuses the IL model's existing steer_head / accel_head
-    (ImpalaNet / ImpalaNetV2) or fc_out (DrivingPolicyNet), so IL-learned
-    action weights are preserved and fine-tuned during RL.
+      alpha_head : Sequential(Linear(544, 2), Softplus) → Beta α > 1
+      beta_head  : Sequential(Linear(544, 2), Softplus) → Beta β > 1
+      value_head : Linear(544 → 128 → 1)                → critic
+
+    Actions are sampled from Beta(α, β) ∈ (0, 1) and scaled to [-1, 1]
+    before being sent to the environment.  The buffer stores the raw [0, 1]
+    samples so log-prob re-evaluation during the PPO update is exact.
+
+    All three new heads start from random init when loading an IL checkpoint
+    (value_head, alpha_head, beta_head are not present in IL checkpoints).
+    The IL backbone weights (backbone CNN + ego_fc) are loaded with
+    strict=False and fine-tuned during RL.
     """
 
     MERGED_DIM = 544  # 512 (visual) + 32 (ego) — fixed across all IL archs
@@ -41,42 +56,31 @@ class ILActorCritic(nn.Module):
     def __init__(self, il_model: nn.Module):
         super().__init__()
         self.il_model = il_model
-        self._has_dual_heads = hasattr(il_model, "steer_head") and hasattr(il_model, "accel_head")
 
         self.value_head = nn.Sequential(
             nn.Linear(self.MERGED_DIM, 128),
             nn.ReLU(),
             nn.Linear(128, 1),
         )
-        # Very tight init: std≈0.05 (log=-3.0).
-        # Sampled actions stay within ±0.10 of IL mean so early rollouts
-        # complete routes and give the critic real reward signal to learn from.
-        # PPO's policy gradient will push log_std up naturally once the critic
-        # is calibrated — don't let the entropy bonus race it upward first.
-        self.log_std = nn.Parameter(torch.ones(2) * -3.0)
+        self.alpha_head = nn.Sequential(nn.Linear(self.MERGED_DIM, 2), nn.Softplus())
+        self.beta_head  = nn.Sequential(nn.Linear(self.MERGED_DIM, 2), nn.Softplus())
 
     # ------------------------------------------------------------------
     def _get_merged(self, image: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
         """Return 544-d shared feature from the IL backbone."""
         return self.il_model(image, ego, return_features=True)
 
-    def _get_actor_output(self, merged: torch.Tensor) -> torch.Tensor:
-        """Map 544-d features → (B, 2) action mean."""
-        if self._has_dual_heads:
-            steer = self.il_model.steer_head(merged)   # (B, 1)
-            accel = self.il_model.accel_head(merged)   # (B, 1)
-            return torch.cat([steer, accel], dim=1)    # (B, 2)
-        else:
-            # DrivingPolicyNet uses a single fc_out(544→2)
-            return self.il_model.fc_out(merged)        # (B, 2)
+    def _get_dist(self, merged: torch.Tensor) -> Beta:
+        """Build Beta distribution from merged features. α, β > 1 (unimodal)."""
+        alpha = self.alpha_head(merged) + 1.0   # (B, 2), > 1
+        beta  = self.beta_head(merged)  + 1.0   # (B, 2), > 1
+        return Beta(alpha, beta)
 
     # ------------------------------------------------------------------
     def forward(self, image: torch.Tensor, ego: torch.Tensor):
-        """Return (action_mean (B,2), value (B,))."""
+        """Return (dist, value (B,)) — used internally."""
         merged = self._get_merged(image, ego)
-        action_mean = self._get_actor_output(merged)
-        value = self.value_head(merged).squeeze(-1)
-        return action_mean, value
+        return self._get_dist(merged), self.value_head(merged).squeeze(-1)
 
     def get_action_and_value(
         self,
@@ -87,20 +91,25 @@ class ILActorCritic(nn.Module):
         """
         Sample an action (or evaluate a given one) and return PPO quantities.
 
-        Returns:
-            action      (B, 2)  — sampled or provided
-            log_prob    (B,)    — sum of log-probs over action dimensions
-            entropy     (B,)    — sum of entropies over action dimensions
-            value       (B,)    — critic estimate
+        action — if provided, must be in [0, 1] (as stored in the buffer).
+                 When None, a fresh sample is drawn from Beta.
+
+        Returns
+        -------
+        action      (B, 2)  in [0, 1] — sampled or provided
+        log_prob    (B,)    — sum of log-probs over action dimensions
+        entropy     (B,)    — sum of entropies over action dimensions
+        value       (B,)    — critic estimate
         """
-        action_mean, value = self.forward(image, ego)
-        std = self.log_std.clamp(-2.5, 0.5).exp().expand_as(action_mean)
-        dist = Normal(action_mean, std)
+        merged = self._get_merged(image, ego)
+        dist   = self._get_dist(merged)
+        value  = self.value_head(merged).squeeze(-1)
 
         if action is None:
-            action = dist.sample()
+            action = dist.sample()   # (B, 2) in (0, 1)
 
-        log_prob = dist.log_prob(action).sum(dim=-1)
+        # Clamp stored actions away from boundaries before log_prob
+        log_prob = dist.log_prob(action.clamp(1e-6, 1.0 - 1e-6)).sum(dim=-1)
         entropy  = dist.entropy().sum(dim=-1)
         return action, log_prob, entropy, value
 
@@ -109,13 +118,26 @@ class ILActorCritic(nn.Module):
         merged = self._get_merged(image, ego)
         return self.value_head(merged).squeeze(-1)
 
+    def act_deterministic(self, image: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
+        """
+        Return the Beta mode mapped to [-1, 1] — for deterministic inference.
+
+        mode = (α - 1) / (α + β - 2),  valid because α, β > 1.
+        """
+        merged = self._get_merged(image, ego)
+        dist   = self._get_dist(merged)
+        alpha  = dist.concentration1   # (B, 2)
+        beta_  = dist.concentration0   # (B, 2)
+        mode   = (alpha - 1.0) / (alpha + beta_ - 2.0).clamp(min=1e-6)
+        return mode * 2.0 - 1.0        # (B, 2) in [-1, 1]
+
     # ------------------------------------------------------------------
     def load_from_il_checkpoint(self, path: str, device: str = "cpu"):
         """
         Load IL model weights from an IL training checkpoint into self.il_model.
 
-        The value_head and log_std are NOT in the IL checkpoint, so they keep
-        their random initialisation — that's expected and correct for IL→RL.
+        value_head, alpha_head, and beta_head are NOT in the IL checkpoint,
+        so they keep their random initialisation — that's correct for IL→RL.
         strict=False prevents a crash on those missing keys.
         """
         ckpt = torch.load(path, map_location=device)
@@ -142,4 +164,4 @@ class ILActorCritic(nn.Module):
             print(f"[IL→RL] Missing (randomly init'd): {result.missing_keys}")
         if result.unexpected_keys:
             print(f"[IL→RL] Unexpected (ignored):      {result.unexpected_keys}")
-        print("[IL→RL] value_head and log_std start from random init — this is correct.\n")
+        print("[IL→RL] value_head, alpha_head, beta_head start from random init — this is correct.\n")

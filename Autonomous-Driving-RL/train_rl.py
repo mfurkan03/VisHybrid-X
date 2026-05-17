@@ -110,11 +110,11 @@ def parse_args():
     p = argparse.ArgumentParser(description="MetaDrive RL Training (PPO)")
     p.add_argument("--timesteps",      type=int,   default=200_000)
     p.add_argument("--lr",             type=float, default=3e-4,
-                   help="LR for value_head and log_std")
+                   help="LR for value_head, alpha_head and beta_head")
     p.add_argument("--backbone_lr",    type=float, default=1e-5,
                    help="LR for the IL backbone (much lower to avoid forgetting)")
     p.add_argument("--warmup_updates", type=int,   default=20,
-                   help="Freeze backbone+log_std for this many PPO updates (critic-only warmup)")
+                   help="Freeze backbone + action heads for this many PPO updates (critic-only warmup)")
     p.add_argument("--rollout",        type=int,   default=2048,
                    help="Rollout steps *per env* per PPO update")
     p.add_argument("--batch",          type=int,   default=64)
@@ -273,10 +273,12 @@ def main():
             print("[W&B] wandb not installed — logging disabled. pip install wandb\n")
             wb_run = None
 
-    # Separate LRs: critic/log_std get full LR; IL backbone gets much smaller LR
+    # Separate LRs: new heads get full LR; IL backbone gets much smaller LR
     # to avoid overwriting learned representations with early noisy gradients.
     backbone_params = list(policy.il_model.parameters())
-    head_params     = list(policy.value_head.parameters()) + [policy.log_std]
+    head_params     = (list(policy.value_head.parameters())
+                       + list(policy.alpha_head.parameters())
+                       + list(policy.beta_head.parameters()))
     optimizer = torch.optim.Adam([
         {"params": backbone_params, "lr": args.backbone_lr},
         {"params": head_params,     "lr": args.lr},
@@ -285,15 +287,17 @@ def main():
         optimizer.load_state_dict(resumed_optimizer_state)
         print("[RL Resume] Optimizer state restored.")
 
-    # During warmup: freeze backbone AND log_std, train only value_head.
-    # Reason: policy gradient (which flows through log_std) uses advantage estimates
-    # from the randomly-initialized value head. Those estimates are unreliable early on
-    # and can push log_std down (entropy collapse) before the critic is calibrated,
-    # causing the policy to become near-deterministic and degrade toward standing still.
+    # During warmup: freeze backbone AND action heads, train only value_head.
+    # Policy gradient uses advantage estimates from the randomly-initialized critic;
+    # those estimates are unreliable early on and can corrupt alpha/beta heads before
+    # the critic is calibrated, causing distribution collapse or explosion.
     for p in backbone_params:
         p.requires_grad_(False)
-    policy.log_std.requires_grad_(False)
-    print(f"[Warmup] Backbone + log_std frozen for first {args.warmup_updates} PPO updates (critic-only warmup).")
+    for p in policy.alpha_head.parameters():
+        p.requires_grad_(False)
+    for p in policy.beta_head.parameters():
+        p.requires_grad_(False)
+    print(f"[Warmup] Backbone + action heads frozen for first {args.warmup_updates} PPO updates (critic-only warmup).")
 
     total_params = sum(p.numel() for p in policy.parameters())
     print(f"Policy parameters: {total_params:,}\n")
@@ -423,10 +427,11 @@ def main():
             with torch.no_grad():
                 actions, log_probs, _, values = policy.get_action_and_value(imgs_t, egos_t)
 
-            actions_np = np.clip(actions.cpu().numpy(), -1.0, 1.0)   # (k, 2)
+            actions_01  = actions.cpu().numpy()          # (k, 2) in [0, 1] — stored in buffer
+            actions_env = actions_01 * 2.0 - 1.0         # (k, 2) in [-1, 1] — sent to env
 
             # ── Step the ready envs — done workers dispatch RESET immediately ─
-            step_results = vec_env.step(ready, actions_np)
+            step_results = vec_env.step(ready, actions_env)
 
             # ── Batch DPT for non-done envs in one GPU call ───────────────────
             cont_envs = [i for i in ready if not step_results[i][3]]
@@ -443,7 +448,7 @@ def main():
                 # Write directly into the (T, N, ...) buffer arrays by env index.
                 buffer.imgs[t, i]      = imgs_np[i]       # obs that produced the action
                 buffer.egos[t, i]      = egos[i]
-                buffer.actions[t, i]   = actions_np[k]
+                buffer.actions[t, i]   = actions_01[k]
                 buffer.rewards[t, i]   = reward
                 buffer.dones[t, i]     = float(done)
                 buffer.log_probs[t, i] = log_probs[k].item()
@@ -536,8 +541,11 @@ def main():
             backbone_unfrozen = True
             for p in backbone_params:
                 p.requires_grad_(True)
-            policy.log_std.requires_grad_(True)
-            print(f"[Warmup] Backbone + log_std unfrozen at update {update_count} — fine-tuning with lr={args.backbone_lr}.")
+            for p in policy.alpha_head.parameters():
+                p.requires_grad_(True)
+            for p in policy.beta_head.parameters():
+                p.requires_grad_(True)
+            print(f"[Warmup] Backbone + action heads unfrozen at update {update_count} — fine-tuning with lr={args.backbone_lr}.")
 
         elapsed = time.time() - start_time
         fps     = global_step / max(elapsed, 1e-6)

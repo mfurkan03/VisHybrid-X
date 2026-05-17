@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from models import EGO_DIM
 from policy.datasets import MetaDriveRGBDataset, PrecomputedDepthDataset
-from policy.losses import (custom_driving_loss, compute_offline_metrics,
+from policy.losses import (custom_driving_loss_beta, compute_offline_metrics,
                            compute_predictive_metrics, compute_heading_metrics)
 from utils.checkpoints import save_checkpoint
 from utils.seed import worker_init_fn
@@ -284,21 +284,25 @@ def run_epoch(policy_model, loader, optimizer, device,
                     prob_grayscale=prob_grayscale,
                 )
 
-            actions_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
-            ego_t     = torch.tensor(ego_np,     dtype=torch.float32, device=device)
+            actions_t  = torch.tensor(actions_np, dtype=torch.float32, device=device)
+            ego_t      = torch.tensor(ego_np,     dtype=torch.float32, device=device)
+            actions_01 = (actions_t + 1.0) / 2.0   # expert actions mapped to [0, 1] for Beta NLL
 
             if is_train:
                 optimizer.zero_grad()
 
-            pred = policy_model(combined, ego_t)
-            loss = custom_driving_loss(pred, actions_t)
+            pred_alpha, pred_beta = policy_model(combined, ego_t)
+            loss = custom_driving_loss_beta(pred_alpha, pred_beta, actions_01)
 
             if is_train:
                 loss.backward()
                 optimizer.step()
 
             total_loss += loss.item()
-            all_pred.append(pred.detach().cpu().numpy())
+            with torch.no_grad():
+                mode_01   = (pred_alpha - 1.0) / (pred_alpha + pred_beta - 2.0).clamp(min=1e-6)
+                pred_mode = (mode_01 * 2.0 - 1.0).cpu().numpy()   # back to [-1, 1]
+            all_pred.append(pred_mode)
             all_true.append(actions_np)
             all_ego.append(ego_np)
             all_ego_full.append(ego_full_np)

@@ -4,11 +4,36 @@ policy/losses.py – loss functions and offline evaluation metrics.
 
 import numpy as np
 import torch
-from scipy.stats import pearsonr
-
-
-import torch
 import torch.nn as nn
+from scipy.stats import pearsonr
+from torch.distributions import Beta
+
+
+def custom_driving_loss_beta(alpha: torch.Tensor, beta: torch.Tensor, target_01: torch.Tensor) -> torch.Tensor:
+    """
+    NLL loss for Beta-distributed policy output.
+
+    alpha, beta : (B, 2) concentration parameters (both > 1)
+    target_01   : (B, 2) expert actions mapped to [0, 1]
+
+    Weighted the same way as the original smooth-L1 loss:
+      - Turn weight : proportional to |steer| magnitude
+      - 2× weight on braking events (accel_01 < 0.45 ↔ accel < -0.1)
+    """
+    dist = Beta(alpha, beta)
+    t    = target_01.clamp(1e-6, 1.0 - 1e-6)
+    nll  = -dist.log_prob(t)                              # (B, 2), positive
+
+    steer_mag   = (target_01[:, 0] - 0.5).abs() * 2.0    # |steer| in [0,1]
+    turn_weight = 1.0 + 1.5 * steer_mag
+    weighted    = nll.clone()
+    weighted[:, 0] = nll[:, 0] * turn_weight
+
+    brake_weight   = 1.0 + (target_01[:, 1] < 0.45).float() * 1.0
+    weighted[:, 1] = nll[:, 1] * brake_weight
+
+    return weighted.mean()
+
 
 def custom_driving_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     smooth_l1    = nn.functional.smooth_l1_loss(pred, target, reduction='none')

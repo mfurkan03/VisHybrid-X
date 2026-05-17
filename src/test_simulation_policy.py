@@ -144,7 +144,9 @@ def run_simulation(
                 ego_t = torch.tensor(ego_reading.ego_model, dtype=torch.float32, device=device).unsqueeze(0)
 
                 with torch.no_grad():
-                    pred_action = policy_model(combined_tensor, ego_t).cpu().numpy()[0]
+                    alpha, beta = policy_model(combined_tensor, ego_t)
+                    mode_01     = (alpha - 1.0) / (alpha + beta - 2.0).clamp(min=1e-6)
+                    pred_action = (mode_01 * 2.0 - 1.0).cpu().numpy()[0]
                 pred_action[0] = steer_momentum * last_steer + (1.0 - steer_momentum) * pred_action[0]
                 last_steer = float(pred_action[0])
 

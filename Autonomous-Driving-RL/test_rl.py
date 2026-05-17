@@ -126,10 +126,7 @@ def main():
             obs_ego = torch.from_numpy(ego).unsqueeze(0).to(device)
 
             with torch.inference_mode():
-                action_mean, _ = policy(obs_img, obs_ego)
-
-            # Deterministic + clipped (BUG FIX: original test_rl.py forgot to clip)
-            action = np.clip(action_mean.squeeze(0).cpu().numpy(), -1.0, 1.0)
+                action = policy.act_deterministic(obs_img, obs_ego).squeeze(0).cpu().numpy()
 
             obs, reward, done, info = env.step(action)
             ep_reward  += reward
