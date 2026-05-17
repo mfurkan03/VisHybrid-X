@@ -120,31 +120,59 @@ def _augment(rgb: np.ndarray, depth: np.ndarray):
 # ============================================================
 # 2. LOSS
 # ============================================================
-def scale_shift_invariant_loss(prediction, target, mask=None):
+def _multiscale_gradient_loss(pred: torch.Tensor, target: torch.Tensor, scales: int = 4) -> torch.Tensor:
     """
-    Scale and Shift Invariant Loss (SSIL).
-    Aligns prediction to target via least-squares scale/shift before computing L1.
+    Multi-scale edge gradient loss.
+    Computes finite-difference gradients at multiple scales and penalises mismatches,
+    forcing the model to reproduce sharp depth edges rather than blurry averages.
     """
+    import torch.nn.functional as F
+    loss = torch.tensor(0.0, device=pred.device)
+    for s in range(scales):
+        step = 2 ** s
+        pred_dx  = pred[:, :, :, step:]    - pred[:, :, :, :-step]
+        pred_dy  = pred[:, :, step:, :]    - pred[:, :, :-step, :]
+        tgt_dx   = target[:, :, :, step:]  - target[:, :, :, :-step]
+        tgt_dy   = target[:, :, step:, :]  - target[:, :, :-step, :]
+        loss = loss + F.l1_loss(pred_dx, tgt_dx) + F.l1_loss(pred_dy, tgt_dy)
+    return loss / scales
+
+
+def scale_shift_invariant_loss(prediction: torch.Tensor, target: torch.Tensor,
+                                mask=None, grad_weight: float = 0.5) -> torch.Tensor:
+    """
+    Scale-Shift Invariant Loss (SSIL) + multi-scale gradient sharpness term.
+
+    The gradient term penalises blurry edges directly, improving spatial sharpness
+    without affecting the overall scale/shift alignment.
+    grad_weight: relative weight of the gradient term (0 = SSIL only).
+    """
+    import torch.nn.functional as F
 
     if mask is None:
         mask = target > 0
 
-    prediction = prediction[mask]
-    target     = target[mask]
+    flat_pred = prediction[mask]
+    flat_tgt  = target[mask]
 
-    if prediction.numel() < 10:
+    if flat_pred.numel() < 10:
         return torch.tensor(0.0, device=prediction.device, requires_grad=True)
 
-    target_mean = target.mean()
-    pred_mean   = prediction.mean()
-    target_var  = target     - target_mean
-    pred_var    = prediction - pred_mean
+    target_mean = flat_tgt.mean()
+    pred_mean   = flat_pred.mean()
+    target_var  = flat_tgt  - target_mean
+    pred_var    = flat_pred - pred_mean
 
-    scale           = (target_var * pred_var).sum() / (pred_var.pow(2).sum() + 1e-6)
-    shift           = target_mean - scale * pred_mean
-    aligned_pred    = scale * prediction + shift
+    scale = (target_var * pred_var).sum() / (pred_var.pow(2).sum() + 1e-6)
+    shift = target_mean - scale * pred_mean
 
-    return torch.nn.functional.l1_loss(aligned_pred, target)
+    # Apply alignment spatially so we can compute spatial gradient loss
+    aligned_pred = scale * prediction + shift
+
+    l1   = F.l1_loss(aligned_pred[mask], flat_tgt)
+    grad = _multiscale_gradient_loss(aligned_pred, target) if grad_weight > 0 else 0.0
+
+    return l1 + grad_weight * grad
 
 
 # ============================================================
@@ -158,6 +186,7 @@ def train_dpt(
     lr:             float = 1e-5,
     train_subset:   float = 1.0,
     patience:       int   = 5,
+    grad_weight:    float = 0.5,
 ):
     print("--- Phase 1: Training Depth Model (DPT) ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -199,7 +228,8 @@ def train_dpt(
             optimizer.zero_grad()
             with torch.amp.autocast("cuda"):
                 pred_depth = depth_estimator.predict_batch_with_grad(rgb_np)
-                loss       = scale_shift_invariant_loss(pred_depth, gt_depth)
+                loss       = scale_shift_invariant_loss(pred_depth, gt_depth,
+                                                        grad_weight=grad_weight)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(depth_estimator.model.parameters(), max_norm=1.0)
@@ -213,7 +243,8 @@ def train_dpt(
             for rgb_np, gt_depth in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
                 gt_depth  = gt_depth.to(device)
                 val_loss += scale_shift_invariant_loss(
-                    depth_estimator.predict_batch_with_grad(rgb_np), gt_depth
+                    depth_estimator.predict_batch_with_grad(rgb_np), gt_depth,
+                    grad_weight=grad_weight,
                 ).item()
 
         avg_train = train_loss / len(train_loader)
@@ -395,6 +426,8 @@ if __name__ == "__main__":
                         help="Fraction of training data to use (e.g. 0.2 for 20%%)")
     parser.add_argument("--patience",     type=int,   default=5,
                         help="Early stopping patience (epochs without val improvement)")
+    parser.add_argument("--grad_weight",  type=float, default=0.5,
+                        help="Weight of multi-scale gradient sharpness loss (0 = SSIL only)")
     parser.add_argument("--out_dir",      type=str,   default="data/processed/dpt_pred",
                         help="Destination for cached DPT predictions (--mode precompute)")
     parser.add_argument("--splits",       type=str,   nargs="+", default=["train", "val", "test"])
@@ -404,7 +437,8 @@ if __name__ == "__main__":
 
     if args.mode == "train":
         train_dpt(args.epochs, args.batch_size, args.model_path,
-                  args.data_dir, args.lr, args.train_subset, args.patience)
+                  args.data_dir, args.lr, args.train_subset, args.patience,
+                  args.grad_weight)
     elif args.mode == "precompute":
         precompute_dpt_predictions(
             dpt_path    = args.model_path,
