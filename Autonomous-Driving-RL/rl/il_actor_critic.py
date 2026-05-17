@@ -62,8 +62,15 @@ class ILActorCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 1),
         )
-        self.alpha_head = nn.Sequential(nn.Linear(self.MERGED_DIM, 2), nn.Softplus())
-        self.beta_head  = nn.Sequential(nn.Linear(self.MERGED_DIM, 2), nn.Softplus())
+        # Steer: Beta alpha/beta heads (output 1 dimension)
+        self.alpha_head = nn.Sequential(nn.Linear(self.MERGED_DIM, 1), nn.Softplus())
+        self.beta_head  = nn.Sequential(nn.Linear(self.MERGED_DIM, 1), nn.Softplus())
+        # Throttle: mu/nu reparameterization — mu is mean ∈ (0,1), nu is precision > 2
+        self.throttle_mu_head = nn.Sequential(nn.Linear(self.MERGED_DIM, 1), nn.Sigmoid())
+        self.throttle_nu_head = nn.Sequential(nn.Linear(self.MERGED_DIM, 1), nn.Softplus())
+        # Bias throttle mu toward braking: sigmoid(-1) ≈ 0.27
+        with torch.no_grad():
+            nn.init.constant_(self.throttle_mu_head[-2].bias, -1.0)
 
     # ------------------------------------------------------------------
     def _get_merged(self, image: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
@@ -71,9 +78,23 @@ class ILActorCritic(nn.Module):
         return self.il_model(image, ego, return_features=True)
 
     def _get_dist(self, merged: torch.Tensor) -> Beta:
-        """Build Beta distribution from merged features. α, β > 2 (safely unimodal)."""
-        alpha = self.alpha_head(merged) + 2.0   # (B, 2), > 2
-        beta  = self.beta_head(merged)  + 2.0   # (B, 2), > 2
+        """Build Beta distribution from merged features.
+
+        Steer  : α, β > 2 via direct Softplus heads (safely unimodal).
+        Throttle: mu/nu reparameterization — α = mu*nu, β = (1-mu)*nu.
+        """
+        # Steer
+        steer_alpha = self.alpha_head(merged) + 2.0   # (B, 1), > 2
+        steer_beta  = self.beta_head(merged)  + 2.0   # (B, 1), > 2
+
+        # Throttle
+        mu             = self.throttle_mu_head(merged)        # (B, 1)
+        nu             = self.throttle_nu_head(merged) + 2.0  # (B, 1), > 2
+        throttle_alpha = mu * nu
+        throttle_beta  = (1.0 - mu) * nu
+
+        alpha = torch.cat([steer_alpha, throttle_alpha], dim=-1)  # (B, 2)
+        beta  = torch.cat([steer_beta,  throttle_beta],  dim=-1)  # (B, 2)
         return Beta(alpha, beta)
 
     # ------------------------------------------------------------------
@@ -137,8 +158,9 @@ class ILActorCritic(nn.Module):
         """
         Load IL model weights from an IL training checkpoint into self.il_model.
 
-        value_head, alpha_head, and beta_head are NOT in the IL checkpoint,
-        so they keep their random initialisation — that's correct for IL→RL.
+        value_head, alpha_head, beta_head, throttle_mu_head, and
+        throttle_nu_head are NOT in the IL checkpoint, so they keep their
+        random initialisation — that's correct for IL→RL.
         strict=False prevents a crash on those missing keys.
         """
         ckpt = torch.load(path, map_location=device)
@@ -165,4 +187,5 @@ class ILActorCritic(nn.Module):
             print(f"[IL→RL] Missing (randomly init'd): {result.missing_keys}")
         if result.unexpected_keys:
             print(f"[IL→RL] Unexpected (ignored):      {result.unexpected_keys}")
-        print("[IL→RL] value_head, alpha_head, beta_head start from random init — this is correct.\n")
+        print("[IL→RL] value_head, alpha_head, beta_head, throttle_mu_head, throttle_nu_head "
+              "start from random init — this is correct.\n")
