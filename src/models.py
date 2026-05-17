@@ -202,6 +202,8 @@ class DrivingPolicyNet(nn.Module):
         self.steer_beta_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
         self.throttle_alpha_head = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
         self.throttle_beta_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
+        # Bias beta > alpha initially → Beta mode ≈ 0.40 in [0,1] (accel ≈ -0.20) — mild brake prior.
+        nn.init.constant_(self.throttle_beta_head[0].bias, 1.4)
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         v = F.relu(self.conv1(x))
@@ -294,6 +296,7 @@ class ImpalaNet(nn.Module):
         self.steer_beta_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
         self.throttle_alpha_head = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
         self.throttle_beta_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
+        nn.init.constant_(self.throttle_beta_head[0].bias, 1.4)
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         v = self.vis_proj(self.cnn(x))
@@ -405,6 +408,7 @@ class ImpalaNetV2(nn.Module):
         self.steer_beta_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
         self.throttle_alpha_head = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
         self.throttle_beta_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
+        nn.init.constant_(self.throttle_beta_head[0].bias, 1.4)
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         x = torch.cat([
