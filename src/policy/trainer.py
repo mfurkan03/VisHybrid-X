@@ -302,8 +302,8 @@ def run_epoch(policy_model, loader, optimizer, device,
 
             total_loss += loss.item()
             with torch.no_grad():
-                mode_01    = (pred_alpha - 1.0) / (pred_alpha + pred_beta - 2.0)  # Beta mode, valid since alpha,beta >= 2
-                pred_mean  = (mode_01 * 2.0 - 1.0).cpu().numpy()    # back to [-1, 1]
+                mean_01    = pred_alpha / (pred_alpha + pred_beta)   # Beta mean; exact for throttle (= mu), close to mode for steer
+                pred_mean  = (mean_01 * 2.0 - 1.0).cpu().numpy()   # back to [-1, 1]
             all_pred.append(pred_mean)
             all_true.append(actions_np)
             all_ego.append(ego_np)
