@@ -71,9 +71,9 @@ class ILActorCritic(nn.Module):
         return self.il_model(image, ego, return_features=True)
 
     def _get_dist(self, merged: torch.Tensor) -> Beta:
-        """Build Beta distribution from merged features. α, β > 1 (unimodal)."""
-        alpha = self.alpha_head(merged) + 1.0   # (B, 2), > 1
-        beta  = self.beta_head(merged)  + 1.0   # (B, 2), > 1
+        """Build Beta distribution from merged features. α, β > 2 (safely unimodal)."""
+        alpha = self.alpha_head(merged) + 2.0   # (B, 2), > 2
+        beta  = self.beta_head(merged)  + 2.0   # (B, 2), > 2
         return Beta(alpha, beta)
 
     # ------------------------------------------------------------------
@@ -120,16 +120,17 @@ class ILActorCritic(nn.Module):
 
     def act_deterministic(self, image: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
         """
-        Return the Beta mode mapped to [-1, 1] — for deterministic inference.
+        Return the Beta mean mapped to [-1, 1] — for deterministic inference.
 
-        mode = (α - 1) / (α + β - 2),  valid because α, β > 1.
+        mean = α / (α + β).  Less extreme than mode; matches the behaviour of
+        the old smooth-L1 regression which also learned the conditional mean.
         """
         merged = self._get_merged(image, ego)
         dist   = self._get_dist(merged)
         alpha  = dist.concentration1   # (B, 2)
         beta_  = dist.concentration0   # (B, 2)
-        mode   = (alpha - 1.0) / (alpha + beta_ - 2.0).clamp(min=1e-6)
-        return mode * 2.0 - 1.0        # (B, 2) in [-1, 1]
+        mean   = alpha / (alpha + beta_)
+        return mean * 2.0 - 1.0        # (B, 2) in [-1, 1]
 
     # ------------------------------------------------------------------
     def load_from_il_checkpoint(self, path: str, device: str = "cpu"):

@@ -211,7 +211,7 @@ class DrivingPolicyNet(nn.Module):
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
-        return self.alpha_head(merged) + 1.0, self.beta_head(merged) + 1.0
+        return self.alpha_head(merged) + 2.0, self.beta_head(merged) + 2.0
 
 class _ImpalaResBlock(nn.Module):
     """Pre-activation residual block used inside the IMPALA CNN."""
@@ -294,7 +294,7 @@ class ImpalaNet(nn.Module):
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
-        return self.alpha_head(merged) + 1.0, self.beta_head(merged) + 1.0
+        return self.alpha_head(merged) + 2.0, self.beta_head(merged) + 2.0
 
 
 # ============================================================
@@ -405,7 +405,7 @@ class ImpalaNetV2(nn.Module):
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
-        return self.alpha_head(merged) + 1.0, self.beta_head(merged) + 1.0
+        return self.alpha_head(merged) + 2.0, self.beta_head(merged) + 2.0
 
 
 def build_policy(arch: str = "simple", image_size: int = None) -> nn.Module:

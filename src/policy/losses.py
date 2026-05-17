@@ -20,16 +20,22 @@ def custom_driving_loss_beta(alpha: torch.Tensor, beta: torch.Tensor, target_01:
       - Turn weight : proportional to |steer| magnitude
       - 2× weight on braking events (accel_01 < 0.45 ↔ accel < -0.1)
     """
+    # Clip to (0.01, 0.99) — not just 1e-6.  Expert actions occasionally exceed
+    # [-1,1] (MetaDrive raw output); after (a+1)/2 mapping they land outside [0,1]
+    # and a 1e-6 clamp silently treats them as boundary samples.  Boundary samples
+    # produce NLL gradients ~16× larger than interior ones, collapsing β → 1.0
+    # and pinning the mode to exactly 1.0 (float underflow in Softplus).
+    t = target_01.clamp(0.01, 0.99)
+
     dist = Beta(alpha, beta)
-    t    = target_01.clamp(1e-6, 1.0 - 1e-6)
     nll  = -dist.log_prob(t)                              # (B, 2), positive
 
-    steer_mag   = (target_01[:, 0] - 0.5).abs() * 2.0    # |steer| in [0,1]
+    steer_mag   = (t[:, 0] - 0.5).abs() * 2.0            # |steer| in [0,1]
     turn_weight = 1.0 + 1.5 * steer_mag
     weighted    = nll.clone()
     weighted[:, 0] = nll[:, 0] * turn_weight
 
-    brake_weight   = 1.0 + (target_01[:, 1] < 0.45).float() * 1.0
+    brake_weight   = 1.0 + (t[:, 1] < 0.45).float() * 1.0
     weighted[:, 1] = nll[:, 1] * brake_weight
 
     return weighted.mean()

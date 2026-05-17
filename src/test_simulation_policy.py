@@ -145,8 +145,8 @@ def run_simulation(
 
                 with torch.no_grad():
                     alpha, beta = policy_model(combined_tensor, ego_t)
-                    mode_01     = (alpha - 1.0) / (alpha + beta - 2.0).clamp(min=1e-6)
-                    pred_action = (mode_01 * 2.0 - 1.0).cpu().numpy()[0]
+                    mean_01     = alpha / (alpha + beta)   # conditional mean, less extreme than mode
+                    pred_action = (mean_01 * 2.0 - 1.0).cpu().numpy()[0]
                 pred_action[0] = steer_momentum * last_steer + (1.0 - steer_momentum) * pred_action[0]
                 last_steer = float(pred_action[0])
 

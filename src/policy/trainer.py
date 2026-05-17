@@ -286,7 +286,8 @@ def run_epoch(policy_model, loader, optimizer, device,
 
             actions_t  = torch.tensor(actions_np, dtype=torch.float32, device=device)
             ego_t      = torch.tensor(ego_np,     dtype=torch.float32, device=device)
-            actions_01 = (actions_t + 1.0) / 2.0   # expert actions mapped to [0, 1] for Beta NLL
+            # Map [-1,1] → [0,1]; clip raw MetaDrive actions that fall outside [-1,1]
+            actions_01 = ((actions_t.clamp(-1.0, 1.0) + 1.0) / 2.0)
 
             if is_train:
                 optimizer.zero_grad()
@@ -300,9 +301,9 @@ def run_epoch(policy_model, loader, optimizer, device,
 
             total_loss += loss.item()
             with torch.no_grad():
-                mode_01   = (pred_alpha - 1.0) / (pred_alpha + pred_beta - 2.0).clamp(min=1e-6)
-                pred_mode = (mode_01 * 2.0 - 1.0).cpu().numpy()   # back to [-1, 1]
-            all_pred.append(pred_mode)
+                mean_01    = pred_alpha / (pred_alpha + pred_beta)   # conditional mean
+                pred_mean  = (mean_01 * 2.0 - 1.0).cpu().numpy()    # back to [-1, 1]
+            all_pred.append(pred_mean)
             all_true.append(actions_np)
             all_ego.append(ego_np)
             all_ego_full.append(ego_full_np)
@@ -397,6 +398,12 @@ def train_loop(
         val_m  = compute_offline_metrics(val_pred, val_true) if not val_empty else {k: 0.0 for k in ["steering_mae","accel_mae","steering_mse","accel_mse","steering_dir_acc","direction_acc","brake_acc","steering_corr"]}
         val_pm = compute_predictive_metrics(val_pred, val_true, val_ego) if not val_empty else {k: 0.0 for k in ["steer_p95_error","active_turn_mae","critical_turn_mae","jitter_ratio","out_of_bounds_rate","speed_weighted_steer_mae","pre_brake_anticipation"]}
         val_hm = compute_heading_metrics(val_pred, val_true, val_ego_full) if not val_empty else {}
+
+        # ── Per-epoch mean output vs expert (diagnose collapsed/biased predictions) ──
+        tr_pred_accel  = tr_pred[:, 1];  tr_true_accel  = tr_true[:, 1]
+        val_pred_accel = val_pred[:, 1] if not val_empty else np.array([])
+        val_true_accel = val_true[:, 1] if not val_empty else np.array([])
+        tr_brake_mask  = tr_true_accel < -0.05
         print(
             f"[{tag}] Epoch [{epoch+1:02d}] "
             f"Loss Tr/Val: {avg_train:.4f}/{avg_val:.4f} | "
@@ -405,6 +412,24 @@ def train_loop(
             f"Brake Acc: {val_m['brake_acc']:.3f} | "
             f"LR: {scheduler.get_last_lr()[0]:.2e}"
         )
+        print(
+            f"         [ACCEL]  Expert mean: {tr_true_accel.mean():+.4f}  "
+            f"Pred mean: {tr_pred_accel.mean():+.4f}  "
+            f"Pred min/max: {tr_pred_accel.min():+.4f}/{tr_pred_accel.max():+.4f}  "
+            f"Pred<-0.05: {(tr_pred_accel<-0.05).mean()*100:.1f}%  "
+            f"(expert brake samples: {tr_brake_mask.sum()}/{len(tr_brake_mask)})"
+        )
+        if tr_brake_mask.any():
+            print(
+                f"         [BRAKE]  On brake obs: expert={tr_true_accel[tr_brake_mask].mean():+.4f}  "
+                f"pred={tr_pred_accel[tr_brake_mask].mean():+.4f}"
+            )
+        if not val_empty and len(val_pred_accel):
+            print(
+                f"         [VAL]    Expert mean: {val_true_accel.mean():+.4f}  "
+                f"Pred mean: {val_pred_accel.mean():+.4f}  "
+                f"Pred<-0.05: {(val_pred_accel<-0.05).mean()*100:.1f}%"
+            )
         print(
             f"         P95 Steer Err: {val_pm['steer_p95_error']:.4f} | "
             f"Turn MAE: {val_pm['active_turn_mae']:.4f} | "
