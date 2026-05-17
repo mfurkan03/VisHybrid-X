@@ -74,6 +74,7 @@ class MetaDriveDepthDataset(Dataset):
         return len(self.gt_depths)
 
     def __getitem__(self, idx):
+        rgb   = np.array(self.rgb_frames[idx], dtype=np.uint8).copy()
         depth = np.array(self.gt_depths[idx], dtype=np.float32).copy()
         depth = np.expand_dims(depth, axis=0)
 
