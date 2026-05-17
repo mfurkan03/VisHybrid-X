@@ -35,7 +35,9 @@ def custom_driving_loss_beta(alpha: torch.Tensor, beta: torch.Tensor, target_01:
     weighted    = nll.clone()
     weighted[:, 0] = nll[:, 0] * turn_weight
 
-    brake_weight   = 1.0 + (t[:, 1] < 0.45).float() * 1.0
+    # 10x on braking (accel_01 < 0.45 == accel < -0.1 in [-1,1]).
+    # Data is ~10% brake; 9x extra = inverse-frequency weight (equal effective share).
+    brake_weight   = 1.0 + (t[:, 1] < 0.45).float() * 9.0
     weighted[:, 1] = nll[:, 1] * brake_weight
 
     return weighted.mean()

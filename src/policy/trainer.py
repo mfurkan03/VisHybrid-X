@@ -301,8 +301,8 @@ def run_epoch(policy_model, loader, optimizer, device,
 
             total_loss += loss.item()
             with torch.no_grad():
-                mean_01    = pred_alpha / (pred_alpha + pred_beta)   # conditional mean
-                pred_mean  = (mean_01 * 2.0 - 1.0).cpu().numpy()    # back to [-1, 1]
+                mode_01    = (pred_alpha - 1.0) / (pred_alpha + pred_beta - 2.0)  # Beta mode, valid since alpha,beta >= 2
+                pred_mean  = (mode_01 * 2.0 - 1.0).cpu().numpy()    # back to [-1, 1]
             all_pred.append(pred_mean)
             all_true.append(actions_np)
             all_ego.append(ego_np)
@@ -416,7 +416,7 @@ def train_loop(
             f"         [ACCEL]  Expert mean: {tr_true_accel.mean():+.4f}  "
             f"Pred mean: {tr_pred_accel.mean():+.4f}  "
             f"Pred min/max: {tr_pred_accel.min():+.4f}/{tr_pred_accel.max():+.4f}  "
-            f"Pred<-0.05: {(tr_pred_accel<-0.05).mean()*100:.1f}%  "
+            f"Pred<-0.05: {(tr_pred_accel<-0.05).mean()*100:.3f}%  "
             f"(expert brake samples: {tr_brake_mask.sum()}/{len(tr_brake_mask)})"
         )
         if tr_brake_mask.any():
@@ -428,7 +428,7 @@ def train_loop(
             print(
                 f"         [VAL]    Expert mean: {val_true_accel.mean():+.4f}  "
                 f"Pred mean: {val_pred_accel.mean():+.4f}  "
-                f"Pred<-0.05: {(val_pred_accel<-0.05).mean()*100:.1f}%"
+                f"Pred<-0.05: {(val_pred_accel<-0.05).mean()*100:.3f}%"
             )
         print(
             f"         P95 Steer Err: {val_pm['steer_p95_error']:.4f} | "
