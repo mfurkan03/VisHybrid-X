@@ -225,11 +225,6 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
         mask          = bins == b
         weights[mask] = bin_targets[b] / mask.sum()
 
-    # Brake events (~10% of data) get 4x weight → ~31% of each batch.
-    # Loss no longer applies an extra brake multiplier; this sampler handles the imbalance.
-    brake_mask = actions_np[:, 1] < -0.1
-    weights[brake_mask] *= 4.0
-
     sampler = WeightedRandomSampler(
         torch.tensor(weights, dtype=torch.float64),
         num_samples=len(train_ds),
