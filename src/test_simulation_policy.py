@@ -50,7 +50,7 @@ def run_simulation(
 
     if not use_expert:
         policy_model = build_policy(arch, image_size).to(device)
-        ckpt = torch.load(model_path, map_location=device)
+        ckpt = torch.load(model_path, map_location=device, weights_only=False)
         if isinstance(ckpt, dict):
             if "model" in ckpt:
                 # Standard IL checkpoint

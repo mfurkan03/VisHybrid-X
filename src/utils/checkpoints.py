@@ -28,7 +28,7 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, device="cpu"):
     Returns:
         start_epoch (int), best_val_loss (float)
     """
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
 
     if isinstance(ckpt, dict):
         if "model" in ckpt:

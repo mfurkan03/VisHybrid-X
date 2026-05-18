@@ -39,7 +39,7 @@ def getDepth(img):
     if not hasattr(getDepth, "model"):
         model_configs = {'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}}
         model = DepthAnythingV2(**model_configs['vits'])
-        model.load_state_dict(torch.load("Depth_Anything_V2/depth_anything_v2_vits.pth", map_location=DEVICE))
+        model.load_state_dict(torch.load("Depth_Anything_V2/depth_anything_v2_vits.pth", map_location=DEVICE, weights_only=False))
         
         if DEVICE == 'cuda':
             model = model.to(DEVICE).half().eval()

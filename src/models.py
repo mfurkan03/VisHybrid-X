@@ -51,12 +51,12 @@ class DepthEstimationModel:
         self.model  = DepthAnythingV2(**self._CONFIGS[encoder])
 
         if finetuned_path and os.path.exists(finetuned_path):
-            self.model.load_state_dict(torch.load(finetuned_path, map_location="cpu"))
+            self.model.load_state_dict(torch.load(finetuned_path, map_location="cpu", weights_only=False))
             print(f"[INFO] Fine-tuned DPT loaded: {finetuned_path}")
         else:
             ckpt_path = f"{target_folder}/checkpoints/depth_anything_v2_{encoder}.pth"
             if os.path.exists(ckpt_path):
-                self.model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+                self.model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=False))
                 print(f"[INFO] Base DepthAnythingV2 loaded: {ckpt_path}")
 
         self.model     = self.model.to(self.device)

@@ -101,7 +101,7 @@ class ActorCritic(nn.Module):
 
     def load_pretrained_actor(self, path: str, device='cpu'):
         """IL ile eğitilmiş DrivingPolicyNet ağırlıklarını yükler (sadece actor kısmı)."""
-        state = torch.load(path, map_location=device, weights_only=True)
+        state = torch.load(path, map_location=device, weights_only=False)
         own = self.state_dict()
 
         loaded = 0

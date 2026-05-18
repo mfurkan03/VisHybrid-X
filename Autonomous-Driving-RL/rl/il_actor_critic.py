@@ -167,7 +167,7 @@ class ILActorCritic(nn.Module):
         keeps its random initialisation — that is correct for IL→RL.
         strict=False prevents a crash on that missing key.
         """
-        ckpt = torch.load(path, map_location=device)
+        ckpt = torch.load(path, map_location=device, weights_only=False)
 
         if isinstance(ckpt, dict):
             if "model" in ckpt:

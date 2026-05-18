@@ -230,7 +230,7 @@ def test_policy(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     policy_model = build_policy(arch, image_size).to(device)
-    ckpt = torch.load(model_path, map_location=device)
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
     if isinstance(ckpt, dict):
         key = "model" if "model" in ckpt else ("policy" if "policy" in ckpt else None)
         policy_model.load_state_dict(ckpt[key] if key else ckpt)
