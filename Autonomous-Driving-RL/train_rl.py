@@ -119,6 +119,8 @@ def parse_args():
                    help="Rollout steps *per env* per PPO update")
     p.add_argument("--batch",          type=int,   default=256)
     p.add_argument("--epochs",         type=int,   default=10)
+    p.add_argument("--force_lr",        action="store_true",
+                   help="Override LRs in restored optimizer state (use when resuming with new --lr / --backbone_lr)")
     p.add_argument("--target_kl",      type=float, default=0.05,
                    help="Per-epoch avg KL early-stopping threshold. 0=disabled. "
                         "~0.05 for IL->RL fine-tuning, ~0.01 for scratch PPO.")
@@ -236,22 +238,24 @@ def main():
         print(f"[WARNING] IL checkpoint not found: {args.il_checkpoint}")
 
     # Optionally resume a full RL checkpoint (overrides IL weights).
-    start_global_step = 0
-    best_avg_route    = 0.0
-    wandb_run_id      = None
+    start_global_step  = 0
+    start_update_count = 0
+    best_avg_route     = 0.0
+    wandb_run_id       = None
     resumed_optimizer_state = None
     if args.rl_checkpoint and os.path.exists(args.rl_checkpoint):
         rl_ckpt = torch.load(args.rl_checkpoint, map_location=device, weights_only=False)
         policy.load_state_dict(rl_ckpt["policy"])
         start_global_step       = rl_ckpt.get("global_step", 0)
+        start_update_count      = rl_ckpt.get("update", 0)
         best_avg_route          = rl_ckpt.get("route", 0.0)
         wandb_run_id            = rl_ckpt.get("wandb_run_id", None)
         resumed_optimizer_state = rl_ckpt.get("optimizer", None)
         if resumed_optimizer_state is None:
-            print(f"[RL Resume] step={start_global_step:,}  best_route={best_avg_route*100:.1f}%  "
+            print(f"[RL Resume] step={start_global_step:,}  update={start_update_count}  best_route={best_avg_route*100:.1f}%  "
                   f"(no optimizer state in checkpoint — Adam starts cold)")
         else:
-            print(f"[RL Resume] step={start_global_step:,}  best_route={best_avg_route*100:.1f}%")
+            print(f"[RL Resume] step={start_global_step:,}  update={start_update_count}  best_route={best_avg_route*100:.1f}%")
 
     # ── Weights & Biases ──────────────────────────────────────────────────────
     wb_run = None
@@ -273,26 +277,45 @@ def main():
             print("[W&B] wandb not installed — logging disabled. pip install wandb\n")
             wb_run = None
 
-    # Separate LRs: value_head gets full LR (random init, must learn fast);
-    # IL backbone (including distribution heads) gets much smaller LR to avoid
-    # overwriting learned representations with early noisy gradients.
-    backbone_params = list(policy.il_model.parameters())
-    head_params     = list(policy.value_head.parameters())
+    # Three LR groups:
+    #   cnn_params       — CNN backbone + projection + ego MLP: backbone_lr (preserve visual features)
+    #   dist_head_params — Beta distribution heads: full lr (must move so KL stays non-zero)
+    #   head_params      — value_head: full lr (random init, must learn fast)
+    _DIST_HEAD_NAMES = {"steer_alpha_head", "steer_beta_head", "throttle_mu_head", "throttle_nu_head"}
+    dist_head_params = []
+    cnn_params       = []
+    for name, param in policy.il_model.named_parameters():
+        if name.split(".")[0] in _DIST_HEAD_NAMES:
+            dist_head_params.append(param)
+        else:
+            cnn_params.append(param)
+    il_params   = cnn_params + dist_head_params   # all il_model params, used for warmup freeze/unfreeze
+    head_params = list(policy.value_head.parameters())
+
     optimizer = torch.optim.Adam([
-        {"params": backbone_params, "lr": args.backbone_lr},
-        {"params": head_params,     "lr": args.lr},
+        {"params": cnn_params,       "lr": args.backbone_lr},
+        {"params": dist_head_params, "lr": args.lr},
+        {"params": head_params,      "lr": args.lr},
     ])
     if resumed_optimizer_state is not None:
         optimizer.load_state_dict(resumed_optimizer_state)
-        print("[RL Resume] Optimizer state restored.")
+        if args.force_lr:
+            optimizer.param_groups[0]["lr"] = args.backbone_lr   # cnn_params
+            optimizer.param_groups[1]["lr"] = args.lr            # dist_head_params
+            optimizer.param_groups[2]["lr"] = args.lr            # value_head
+            print(f"[RL Resume] Optimizer state restored + LRs overridden: backbone={args.backbone_lr}, heads={args.lr}")
+        else:
+            print("[RL Resume] Optimizer state restored.")
 
-    # During warmup: freeze the entire IL backbone (including its distribution heads),
-    # train only value_head.  Policy gradient uses advantage estimates from the
-    # randomly-initialized critic; those estimates are unreliable early on and can
-    # corrupt IL-learned representations before the critic is calibrated.
-    for p in backbone_params:
-        p.requires_grad_(False)
-    print(f"[Warmup] IL backbone frozen for first {args.warmup_updates} PPO updates (critic-only warmup).")
+    # During warmup: freeze the entire IL model (CNN + distribution heads)
+    # so the policy doesn't move while the critic calibrates on noisy early advantages.
+    warmup_already_done = start_update_count >= args.warmup_updates
+    if not warmup_already_done:
+        for p in il_params:
+            p.requires_grad_(False)
+        print(f"[Warmup] IL model frozen for first {args.warmup_updates} PPO updates (critic-only warmup).")
+    else:
+        print(f"[Warmup] Skipped — warmup already completed at update {start_update_count} (IL model stays unfrozen).")
 
     total_params = sum(p.numel() for p in policy.parameters())
     print(f"Policy parameters: {total_params:,}\n")
@@ -338,9 +361,9 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
 
     # ── Training state ────────────────────────────────────────────────────────
-    global_step    = start_global_step
-    update_count      = 0
-    backbone_unfrozen = False
+    global_step       = start_global_step
+    update_count      = start_update_count
+    backbone_unfrozen = warmup_already_done
     episode_count  = 0
     episode_rewards = []
     episode_lengths = []
@@ -534,9 +557,10 @@ def main():
 
         if update_count >= args.warmup_updates and not backbone_unfrozen:
             backbone_unfrozen = True
-            for p in backbone_params:
+            for p in il_params:
                 p.requires_grad_(True)
-            print(f"[Warmup] IL backbone unfrozen at update {update_count} — fine-tuning with lr={args.backbone_lr}.")
+            print(f"[Warmup] IL model unfrozen at update {update_count} "
+                  f"— CNN at lr={args.backbone_lr}, dist heads at lr={args.lr}.")
 
         elapsed = time.time() - start_time
         fps     = global_step / max(elapsed, 1e-6)
