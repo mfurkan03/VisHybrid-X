@@ -18,6 +18,14 @@ IL→RL workflow
     policy   = ILActorCritic(il_model).to(device)
     policy.load_from_il_checkpoint("models/policy_model_best.pth", device)
     # Then fine-tune with PPO as normal.
+
+Distribution heads
+------------------
+The IL model owns the Beta distribution heads (steer_alpha_head,
+steer_beta_head, throttle_mu_head, throttle_nu_head) and outputs (alpha, beta)
+directly.  ILActorCritic delegates distribution computation to those trained
+heads via _get_dist(), and only adds a new value_head for the RL critic.
+This ensures IL-trained distribution knowledge is preserved at the start of RL.
 """
 import sys
 from pathlib import Path
@@ -26,7 +34,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Beta
 
 
@@ -35,42 +42,39 @@ class ILActorCritic(nn.Module):
     PPO actor-critic that uses an IL backbone for feature extraction.
 
     The IL backbone exposes a 544-d merged feature (512 visual + 32 ego)
-    via forward(..., return_features=True).  On top of that we add:
+    via forward(..., return_features=True).  Its distribution heads
+    (steer_alpha_head, steer_beta_head, throttle_mu_head, throttle_nu_head)
+    are reused directly — they carry trained IL weights and are fine-tuned
+    during RL at backbone_lr.
 
-      alpha_head : Sequential(Linear(544, 2), Softplus) → Beta α > 1
-      beta_head  : Sequential(Linear(544, 2), Softplus) → Beta β > 1
-      value_head : Linear(544 → 128 → 1)                → critic
+    ILActorCritic adds only:
+      value_head : Linear(544 → 128 → ReLU → 1) — new, random init (RL critic)
 
     Actions are sampled from Beta(α, β) ∈ (0, 1) and scaled to [-1, 1]
     before being sent to the environment.  The buffer stores the raw [0, 1]
     samples so log-prob re-evaluation during the PPO update is exact.
 
-    All three new heads start from random init when loading an IL checkpoint
-    (value_head, alpha_head, beta_head are not present in IL checkpoints).
-    The IL backbone weights (backbone CNN + ego_fc) are loaded with
-    strict=False and fine-tuned during RL.
+    CONCENTRATION_SCALE multiplies alpha and beta in _get_dist() to reduce
+    sampling variance without changing the distribution mean.  Applied
+    identically during rollout sampling and PPO log-prob evaluation so the
+    policy gradient remains correct.  Throttle needs this more than steer
+    because its concentration (= nu) can be as low as 2.0 at IL init,
+    yielding std ≈ 0.5 in [-1, 1] — too noisy for consistent forward motion.
     """
 
     MERGED_DIM = 544  # 512 (visual) + 32 (ego) — fixed across all IL archs
+    CONCENTRATION_SCALE = 1.0  # tighter distribution; mean unchanged, std / sqrt(3)
 
     def __init__(self, il_model: nn.Module):
         super().__init__()
         self.il_model = il_model
 
+        # Only new head — not present in IL checkpoints, starts from random init.
         self.value_head = nn.Sequential(
             nn.Linear(self.MERGED_DIM, 128),
             nn.ReLU(),
             nn.Linear(128, 1),
         )
-        # Steer: Beta alpha/beta heads (output 1 dimension)
-        self.alpha_head = nn.Sequential(nn.Linear(self.MERGED_DIM, 1), nn.Softplus())
-        self.beta_head  = nn.Sequential(nn.Linear(self.MERGED_DIM, 1), nn.Softplus())
-        # Throttle: mu/nu reparameterization — mu is mean ∈ (0,1), nu is precision > 2
-        self.throttle_mu_head = nn.Sequential(nn.Linear(self.MERGED_DIM, 1), nn.Sigmoid())
-        self.throttle_nu_head = nn.Sequential(nn.Linear(self.MERGED_DIM, 1), nn.Softplus())
-        # Bias throttle mu toward braking: sigmoid(-1) ≈ 0.27
-        with torch.no_grad():
-            nn.init.constant_(self.throttle_mu_head[-2].bias, -1.0)
 
     # ------------------------------------------------------------------
     def _get_merged(self, image: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
@@ -78,23 +82,22 @@ class ILActorCritic(nn.Module):
         return self.il_model(image, ego, return_features=True)
 
     def _get_dist(self, merged: torch.Tensor) -> Beta:
-        """Build Beta distribution from merged features.
+        """Build Beta distribution by delegating to the IL model's trained heads.
 
-        Steer  : α, β > 2 via direct Softplus heads (safely unimodal).
+        Steer  : α, β > 2 via steer_alpha_head / steer_beta_head.
         Throttle: mu/nu reparameterization — α = mu*nu, β = (1-mu)*nu.
         """
-        # Steer
-        steer_alpha = self.alpha_head(merged) + 2.0   # (B, 1), > 2
-        steer_beta  = self.beta_head(merged)  + 2.0   # (B, 1), > 2
+        il = self.il_model
+        steer_alpha = il.steer_alpha_head(merged) + 2.0   # (B, 1), > 2
+        steer_beta  = il.steer_beta_head(merged)  + 2.0   # (B, 1), > 2
 
-        # Throttle
-        mu             = self.throttle_mu_head(merged)        # (B, 1)
-        nu             = self.throttle_nu_head(merged) + 2.0  # (B, 1), > 2
+        mu             = il.throttle_mu_head(merged)        # (B, 1)
+        nu             = il.throttle_nu_head(merged) + 2.0  # (B, 1), > 2
         throttle_alpha = mu * nu
         throttle_beta  = (1.0 - mu) * nu
 
-        alpha = torch.cat([steer_alpha, throttle_alpha], dim=-1)  # (B, 2)
-        beta  = torch.cat([steer_beta,  throttle_beta],  dim=-1)  # (B, 2)
+        alpha = torch.cat([steer_alpha, throttle_alpha], dim=-1) * self.CONCENTRATION_SCALE  # (B, 2)
+        beta  = torch.cat([steer_beta,  throttle_beta],  dim=-1) * self.CONCENTRATION_SCALE  # (B, 2)
         return Beta(alpha, beta)
 
     # ------------------------------------------------------------------
@@ -158,10 +161,11 @@ class ILActorCritic(nn.Module):
         """
         Load IL model weights from an IL training checkpoint into self.il_model.
 
-        value_head, alpha_head, beta_head, throttle_mu_head, and
-        throttle_nu_head are NOT in the IL checkpoint, so they keep their
-        random initialisation — that's correct for IL→RL.
-        strict=False prevents a crash on those missing keys.
+        The IL checkpoint contains the full il_model state (backbone CNN,
+        ego_fc, steer_alpha_head, steer_beta_head, throttle_mu_head,
+        throttle_nu_head).  value_head is NOT in the IL checkpoint, so it
+        keeps its random initialisation — that is correct for IL→RL.
+        strict=False prevents a crash on that missing key.
         """
         ckpt = torch.load(path, map_location=device)
 
@@ -187,5 +191,4 @@ class ILActorCritic(nn.Module):
             print(f"[IL→RL] Missing (randomly init'd): {result.missing_keys}")
         if result.unexpected_keys:
             print(f"[IL→RL] Unexpected (ignored):      {result.unexpected_keys}")
-        print("[IL→RL] value_head, alpha_head, beta_head, throttle_mu_head, throttle_nu_head "
-              "start from random init — this is correct.\n")
+        print("[IL→RL] value_head starts from random init — this is correct.\n")

@@ -35,8 +35,8 @@ def custom_driving_loss_beta(alpha: torch.Tensor, beta: torch.Tensor, target_01:
     weighted    = nll.clone()
     weighted[:, 0] = nll[:, 0] * turn_weight
 
-    # Accel channel: uniform weight — brake oversampling is handled by the data sampler.
-    weighted[:, 1] = nll[:, 1]
+    brake_weight = 1.0 + (t[:, 1] < 0.45).float() * 2.0   # 3x on braking events (accel_01 < 0.45 ↔ accel < -0.1)
+    weighted[:, 1] = nll[:, 1] * brake_weight
 
     return weighted.mean()
 
@@ -44,9 +44,8 @@ def custom_driving_loss_beta(alpha: torch.Tensor, beta: torch.Tensor, target_01:
 def custom_driving_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     smooth_l1    = nn.functional.smooth_l1_loss(pred, target, reduction='none')
     weighted_loss = smooth_l1.clone()
-    # 3x weight on braking events
-    brake_weight = 1.0 + (target[:, 1] < -0.1).float() * 1.0
-    weighted_loss[:, 1] = smooth_l1[:, 1] * brake_weight  # matches original 2x brake penalty (1+1)
+    brake_weight = 1.0 + (target[:, 1] < -0.1).float() * 3.0  # 4x on braking events
+    weighted_loss[:, 1] = smooth_l1[:, 1] * brake_weight
     return weighted_loss.mean()
 
 def compute_predictive_metrics(

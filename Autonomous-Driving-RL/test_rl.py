@@ -82,7 +82,7 @@ def main():
     policy.eval()
 
     # ── Environment ───────────────────────────────────────────────────────────
-    start_seed = 316181
+    start_seed = 42
     env_config = {
         "use_render": args.render,
         "show_interface": args.render,
