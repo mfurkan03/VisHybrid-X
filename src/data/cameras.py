@@ -58,7 +58,7 @@ def build_cameras(num_cameras: int):
 # ============================================================
 # PER-FRAME PROCESSING  (GPU / CPU)
 # ============================================================
-def process_gpu(env, rgb_name: str, depth_name: str, observations: dict):
+def process_gpu(env, rgb_name: str, depth_name: str, observations: dict, save: bool = True):
     """Process one camera pair using CUDA tensors."""
     rgb_cupy = env.engine.get_sensor(rgb_name).perceive(
         to_float=False, new_parent_node=env.agent.origin
@@ -73,23 +73,24 @@ def process_gpu(env, rgb_name: str, depth_name: str, observations: dict):
         to_float=True, new_parent_node=env.agent.origin
     )
 
-    rgb_np_uint8 = rgb_cupy.get() if hasattr(rgb_cupy, "get") else np.array(rgb_cupy)
-    observations[f"{rgb_name}_rgb"].append(rgb_np_uint8.astype(np.uint8))
+    if save:
+        rgb_np_uint8 = rgb_cupy.get() if hasattr(rgb_cupy, "get") else np.array(rgb_cupy)
+        observations[f"{rgb_name}_rgb"].append(rgb_np_uint8.astype(np.uint8))
 
-    d_np_float32 = d_cupy.get() if hasattr(d_cupy, "get") else np.array(d_cupy)
-    observations[f"{rgb_name}_depth"].append(d_np_float32.astype(np.float32))
+        d_np_float32 = d_cupy.get() if hasattr(d_cupy, "get") else np.array(d_cupy)
+        observations[f"{rgb_name}_depth"].append(d_np_float32.astype(np.float32))
 
     return rgb_cupy, d_cupy
 
 
-def process_cpu(env, rgb_name: str, depth_name: str, observations: dict):
+def process_cpu(env, rgb_name: str, depth_name: str, observations: dict, save: bool = True):
     """Process one camera pair using NumPy on CPU."""
     rgb_img = env.engine.get_sensor(rgb_name).perceive(
         to_float=False, new_parent_node=env.agent.origin
     )
     if hasattr(rgb_img, "get"):
         rgb_img = rgb_img.get()
-    
+
     # MetaDrive returns BGR, we convert to RGB
     rgb_img = rgb_img[..., ::-1].copy()
 
@@ -99,7 +100,8 @@ def process_cpu(env, rgb_name: str, depth_name: str, observations: dict):
     if hasattr(d_img, "get"):
         d_img = d_img.get()
 
-    observations[f"{rgb_name}_depth"].append(np.array(d_img, dtype=np.float32))
-    observations[f"{rgb_name}_rgb"].append(np.array(rgb_img, dtype=np.uint8))
+    if save:
+        observations[f"{rgb_name}_depth"].append(np.array(d_img, dtype=np.float32))
+        observations[f"{rgb_name}_rgb"].append(np.array(rgb_img, dtype=np.uint8))
 
     return rgb_img, d_img

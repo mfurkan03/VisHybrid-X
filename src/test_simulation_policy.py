@@ -87,7 +87,7 @@ def run_simulation(
         "start_seed":        start_seed,
         "num_scenarios":     num_episodes,
         "horizon":           max_steps,
-        "traffic_density": 0
+        "traffic_density": 0.15
     }
     env = MetaDriveEnv(config)
 

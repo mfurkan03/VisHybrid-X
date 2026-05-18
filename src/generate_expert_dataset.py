@@ -43,6 +43,8 @@ def _worker_collect(
     num_cameras,
     image_on_cuda,
     split_ratios,
+    decision_repeat=1,
+    save_every_n=20,
     poster_path=None,
 ):
     """Worker process that handles a subset of the total episodes."""
@@ -59,7 +61,7 @@ def _worker_collect(
         "image_observation": True,
         "show_interface":    False,
         "preload_models":    True,
-        "decision_repeat":   1,
+        "decision_repeat":   decision_repeat,  # 100 Hz physics / 5 = 20 FPS
         "sensors":           sensors,
         "vehicle_config":    dict(image_source=rgb_cam_names[0]),
         "start_seed":        seed, # Unique start seed per worker to avoid duplicate maps
@@ -120,22 +122,26 @@ def _worker_collect(
                 applied_action[0] += random.uniform(-action_noise, action_noise)
 
             reading = extract_ego_state(env.agent, last_steer=last_steer)
-            ego_states.append(reading.ego_model)
-            ego_states_full.append([
-                reading.total_speed,
-                reading.last_steer,
-                reading.forward_speed,
-                reading.lateral_speed,
-                reading.heading_delta,
-            ])
-            frame_timestamps.append(reading.timestamp)
+
+            save_this_frame = (ep_steps % save_every_n == 0)
+            if save_this_frame:
+                ego_states.append(reading.ego_model)
+                ego_states_full.append([
+                    reading.total_speed,
+                    reading.last_steer,
+                    reading.forward_speed,
+                    reading.lateral_speed,
+                    reading.heading_delta,
+                ])
+                frame_timestamps.append(reading.timestamp)
 
             raw_frames = {}
             for rgb_name, depth_name in zip(rgb_cam_names, depth_cam_names):
-                rgb_raw, depth_raw = process_fn(env, rgb_name, depth_name, observations)
+                rgb_raw, depth_raw = process_fn(env, rgb_name, depth_name, observations, save=save_this_frame)
                 raw_frames[rgb_name] = (rgb_raw, depth_raw)
 
-            actions.append(expert_action.copy())
+            if save_this_frame:
+                actions.append(expert_action.copy())
             last_steer = float(expert_action[0])
 
             obs, reward, terminated, truncated, info = env.step(applied_action)
@@ -205,15 +211,17 @@ def _worker_collect(
 # ============================================================
 def collect_expert_data_parallel(
     seed,
-    num_episodes   = 10,
-    num_workers    = 1,
-    save_dir       = "dataset",
-    visualize      = True,
-    num_cameras    = 2,
-    action_noise   = 0.3,
-    image_on_cuda  = True,
-    split_ratios   = (0.8, 0.1, 0.1),
-    poster_path    = None,
+    num_episodes    = 10,
+    num_workers     = 1,
+    save_dir        = "dataset",
+    visualize       = True,
+    num_cameras     = 2,
+    action_noise    = 0.3,
+    image_on_cuda   = True,
+    split_ratios    = (0.8, 0.1, 0.1),
+    decision_repeat = 5,
+    save_every_n    = 20,
+    poster_path     = None,
 ):
     os.makedirs(os.path.join(save_dir, "train"), exist_ok=True)
     os.makedirs(os.path.join(save_dir, "val"),   exist_ok=True)
@@ -232,6 +240,7 @@ def collect_expert_data_parallel(
     print(f"  Processing Mode : {mode_str}")
     print(f"  Saving to       : '{save_dir}' (Split into train/val/test)")
     print(f"  Camera Count    : {num_cameras}")
+    print(f"  Sim FPS         : {100 // decision_repeat} Hz  (decision_repeat={decision_repeat}, save_every_n={save_every_n})")
     print(f"{'='*55}\n")
 
     # Chunk the episodes for each worker
@@ -259,6 +268,8 @@ def collect_expert_data_parallel(
             num_cameras,                # num_cameras
             image_on_cuda,              # image_on_cuda
             split_ratios,               # split_ratios
+            decision_repeat,            # decision_repeat
+            save_every_n,               # save_every_n
             poster_path,                # poster_path
         ))
         current_idx += worker_eps
@@ -291,7 +302,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_cameras",   type=int,  default=1)
     parser.add_argument("--act_noise",   type=float,  default=0.3)
     parser.add_argument("--no_vis",        action="store_true")
-    parser.add_argument("--image_on_cuda", action="store_true", default=False)
+    parser.add_argument("--image_on_cuda",    action="store_true", default=False)
+    parser.add_argument("--decision_repeat",  type=int, default=1,
+                        help="Physics steps per decision (default 1 = 100Hz)")
+    parser.add_argument("--save_every_n",     type=int, default=20,
+                        help="Save 1 frame every N steps (default 20)")
     parser.add_argument("--poster",        type=str, default=None,
                         metavar="PATH",
                         help="Save a high-res poster PNG to PATH, then exit")
@@ -309,7 +324,9 @@ if __name__ == "__main__":
 
 
         
-        action_noise  = args.act_noise,
+        action_noise    = args.act_noise,
+        decision_repeat = args.decision_repeat,
+        save_every_n    = args.save_every_n,
         visualize     = not args.no_vis,
         num_cameras   = args.num_cameras,
         image_on_cuda = args.image_on_cuda,
