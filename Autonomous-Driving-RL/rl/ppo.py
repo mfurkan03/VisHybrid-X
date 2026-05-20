@@ -36,16 +36,16 @@ class PPOConfig:
     gae_lambda: float      = 0.95
     clip_epsilon: float    = 0.2
     entropy_coef: float    = 0.001
-    value_coef: float      = 0.5
+    value_coef: float      = 0.25
     max_grad_norm: float   = 0.5
     lr: float              = 3e-4
     total_timesteps: int   = 200_000
     use_amp: bool          = False   # mixed-precision PPO update (CUDA only)
     # Early stopping: halt the epoch loop if per-epoch avg KL exceeds this.
     # Checked once per epoch (not per mini-batch) to avoid noisy early cuts.
-    # 0.05 suits IL→RL fine-tuning where initial KL is ~0.1–0.15.
+    # 0.15 allows more gradient steps per rollout; tighten to 0.05 once rewards stabilise.
     # Set to 0 to disable early stopping entirely.
-    target_kl: float       = 0.05
+    target_kl: float       = 0.15
 
 
 class RolloutBuffer:
@@ -243,7 +243,7 @@ def ppo_update(policy, optimizer, buffer: RolloutBuffer, cfg: PPOConfig,
                 surr2 = torch.clamp(ratio, 1.0 - cfg.clip_epsilon, 1.0 + cfg.clip_epsilon) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                value_loss = nn.functional.mse_loss(new_values, returns)
+                value_loss = nn.functional.huber_loss(new_values, returns, delta=10.0)
 
                 loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy.mean()
 

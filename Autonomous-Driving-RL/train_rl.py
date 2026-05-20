@@ -111,7 +111,7 @@ def parse_args():
     p.add_argument("--timesteps",      type=int,   default=200_000)
     p.add_argument("--lr",             type=float, default=3e-4,
                    help="LR for value_head (random-init RL critic)")
-    p.add_argument("--backbone_lr",    type=float, default=1e-5,
+    p.add_argument("--backbone_lr",    type=float, default=5e-6,
                    help="LR for the IL backbone (much lower to avoid forgetting)")
     p.add_argument("--warmup_updates", type=int,   default=20,
                    help="Freeze backbone + action heads for this many PPO updates (critic-only warmup)")

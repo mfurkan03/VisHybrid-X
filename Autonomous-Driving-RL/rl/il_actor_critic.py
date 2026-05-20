@@ -91,13 +91,18 @@ class ILActorCritic(nn.Module):
         steer_alpha = il.steer_alpha_head(merged) + 2.0   # (B, 1), > 2
         steer_beta  = il.steer_beta_head(merged)  + 2.0   # (B, 1), > 2
 
-        mu             = il.throttle_mu_head(merged)        # (B, 1)
+        mu             = il.throttle_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)  # (B, 1); clamp prevents sigmoid saturation → exact 0/1 → zero concentration
         nu             = il.throttle_nu_head(merged) + 2.0  # (B, 1), > 2
         throttle_alpha = mu * nu
         throttle_beta  = (1.0 - mu) * nu
 
         alpha = torch.cat([steer_alpha, throttle_alpha], dim=-1) * self.CONCENTRATION_SCALE  # (B, 2)
         beta  = torch.cat([steer_beta,  throttle_beta],  dim=-1) * self.CONCENTRATION_SCALE  # (B, 2)
+        # Clamp concentration to [1e-4, 50]: prevents float32 lgamma overflow at high values
+        # and ensures Beta log_prob is numerically stable. Values above ~50 are near-deterministic
+        # anyway — clamping here doesn't meaningfully restrict policy expressiveness.
+        alpha = alpha.clamp(1e-4, 50.0)
+        beta  = beta.clamp(1e-4, 50.0)
         return Beta(alpha, beta)
 
     # ------------------------------------------------------------------

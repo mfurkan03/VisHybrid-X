@@ -22,18 +22,22 @@ class RewardConfig:
     arrive_dest_bonus: float = 50.0
 
     # Continuous rewards / penalties
-    route_progress_scale: float = 100.0
+    route_progress_scale: float = 10.0
     harsh_steering_threshold: float = 0.3   # |steer| below this is normal cornering, not penalized
     harsh_steering_weight: float = -0.1     # applied to excess above threshold, speed-scaled
     steering_diff_penalty: float = -0.01    # sudden steer change, speed-scaled (reduced: was -0.2, too strongly discouraged exploration)
     speed_scale_ref: float = 50.0           # km/h reference for speed-scaling steering penalties
-    speed_bonus_weight: float = 0.3         # increased from 0.1 to make movement more attractive
-    speed_bonus_min: float = 3.0            # no bonus below this speed (km/h), lowered from 5.0
-    standing_still_penalty: float = -0.3    # increased from -0.05; old value was too weak vs. steering penalties
+    speed_bonus_weight: float = 0.1         # reduced from 0.3; was too strong and encouraged reckless speed
+    speed_bonus_min: float = 3.0            # no bonus below this speed (km/h)
+    standing_still_penalty: float = -0.1    # softened from -0.3; was competing too hard vs. steering penalties
+
+    # Heading alignment — fires every step, dense signal even when route_progress ≈ 0
+    heading_alignment_weight: float = 0.03  # max reward per step when perfectly aligned with road
+    heading_alignment_max_diff: float = 0.5 # radians — beyond this the reward is zero
 
     # Speed limit
-    speed_limit: float = 40.0              # km/h — raised from 30; 30 was too low and -0.2/km/h made speed dangerous
-    speed_limit_weight: float = -0.1       # per km/h over the limit, reduced from -0.2
+    speed_limit: float = 60.0              # km/h — raised to match IL model's trained operating speed
+    speed_limit_weight: float = -0.05      # per km/h over the limit; -0.2 was drowning route progress signal
 
     # Lane-keeping
     lateral_offset_threshold: float = 0.5   # metres from lane centre — free zone, no penalty
@@ -50,7 +54,8 @@ def compute_reward(info: dict,
                    prev_route_completion: float,
                    speed: float,
                    cfg: RewardConfig = None,
-                   prev_action=None) -> tuple[float, dict]:
+                   prev_action=None,
+                   heading_diff: float = 0.0) -> tuple[float, dict]:
     """
     Toplam ödülü ve detaylı döküm sözlüğünü döndürür.
 
@@ -139,6 +144,11 @@ def compute_reward(info: dict,
     speed_limit_pen = cfg.speed_limit_weight * overspeed
     reward += speed_limit_pen
     details["speed_limit"] = speed_limit_pen
+
+    # 11. Heading alignment — dense signal for staying pointed along the road
+    align_reward = cfg.heading_alignment_weight * max(0.0, 1.0 - abs(heading_diff) / cfg.heading_alignment_max_diff)
+    reward += align_reward
+    details["heading_alignment"] = align_reward
 
     # ──────────────────────────────────────────────
     #  YENİ CEZA EKLEMEK İÇİN BURAYA YAZ

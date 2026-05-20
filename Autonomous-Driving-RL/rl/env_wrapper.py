@@ -117,9 +117,19 @@ class MetaDriveRLWrapper:
             self._last_img_np = np.zeros((196, 196, 3), dtype=np.uint8)
         self._last_ego_np = np.zeros(EGO_DIM, dtype=np.float32)
 
+    # Traffic density curriculum: low most of the time, rarely high.
+    # Approximate targets: ~86.9% → 0.1, ~10% → 0.3, ~2% → 0.6, ~1% → 1.0, ~0.1% → 0.0
+    # Traffic density curriculum: low most of the time, rarely high.
+    # Approximate targets: ~10% → 0.0, ~80% → 0.1, ~8% → 0.3, ~1.5% → 0.6, ~0.5% → 1.0
+    _TRAFFIC_DENSITY_LEVELS = np.array([0.0, 0.1, 0.3, 0.6, 1.0], dtype=np.float32)
+    _TRAFFIC_DENSITY_PROBS  = np.array([0.10, 0.80, 0.08, 0.015, 0.005], dtype=np.float64)
+
     # ── Gym-like interface ────────────────────────────────────────────────────
 
     def reset(self, seed: int | None = None):
+        density = float(np.random.choice(self._TRAFFIC_DENSITY_LEVELS, p=self._TRAFFIC_DENSITY_PROBS))
+        self.env.config["traffic_density"] = density
+
         kwargs = {} if seed is None else {"seed": seed}
         raw_obs, _ = self.env.reset(**kwargs)
         self._prev_route  = 0.0
@@ -138,8 +148,10 @@ class MetaDriveRLWrapper:
             pass
 
         reward, reward_details = compute_reward(
-            info, action, self._prev_route, speed, self.reward_cfg, self._prev_action
+            info, action, self._prev_route, speed, self.reward_cfg, self._prev_action,
+            heading_diff=float(info.get("heading_diff", 0.0)),
         )
+        reward = float(np.clip(reward, -10.0, 10.0))
         self._prev_route  = info.get("route_completion", 0.0)
         self._prev_action = action.copy()
         self.last_steer   = float(action[0])
