@@ -113,6 +113,9 @@ def parse_args():
                    help="LR for value_head (random-init RL critic)")
     p.add_argument("--backbone_lr",    type=float, default=5e-6,
                    help="LR for the IL backbone (much lower to avoid forgetting)")
+    p.add_argument("--dist_head_lr",   type=float, default=3e-5,
+                   help="LR for Beta distribution heads (steer/throttle mu/nu). "
+                        "Lower than value_head lr to prevent entropy collapse after warmup.")
     p.add_argument("--warmup_updates", type=int,   default=20,
                    help="Freeze backbone + action heads for this many PPO updates (critic-only warmup)")
     p.add_argument("--rollout",        type=int,   default=2048,
@@ -234,6 +237,8 @@ def main():
 
     if args.il_checkpoint and os.path.exists(args.il_checkpoint):
         policy.load_from_il_checkpoint(args.il_checkpoint, device)
+        # Reset nu heads to maximum entropy state before PPO fine-tuning
+        policy.reset_nu_heads_for_ppo()
     elif args.il_checkpoint:
         print(f"[WARNING] IL checkpoint not found: {args.il_checkpoint}")
 
@@ -277,10 +282,11 @@ def main():
             print("[W&B] wandb not installed — logging disabled. pip install wandb\n")
             wb_run = None
 
-    # Three LR groups:
+    # Four LR groups:
     #   cnn_params       — CNN backbone + projection + ego MLP: backbone_lr (preserve visual features)
-    #   dist_head_params — Beta distribution heads: full lr (must move so KL stays non-zero)
-    #   head_params      — value_head: full lr (random init, must learn fast)
+    #   dist_head_params — Beta distribution heads: dist_head_lr (IL-trained, must update slowly
+    #                      to avoid entropy collapse; much lower than value_head lr)
+    #   head_params      — value_head: lr (random init, must learn fast)
     _DIST_HEAD_NAMES = {"steer_alpha_head", "steer_beta_head", "throttle_mu_head", "throttle_nu_head"}
     dist_head_params = []
     cnn_params       = []
@@ -294,16 +300,17 @@ def main():
 
     optimizer = torch.optim.Adam([
         {"params": cnn_params,       "lr": args.backbone_lr},
-        {"params": dist_head_params, "lr": args.lr},
+        {"params": dist_head_params, "lr": args.dist_head_lr},
         {"params": head_params,      "lr": args.lr},
     ])
     if resumed_optimizer_state is not None:
         optimizer.load_state_dict(resumed_optimizer_state)
         if args.force_lr:
             optimizer.param_groups[0]["lr"] = args.backbone_lr   # cnn_params
-            optimizer.param_groups[1]["lr"] = args.lr            # dist_head_params
+            optimizer.param_groups[1]["lr"] = args.dist_head_lr  # dist_head_params
             optimizer.param_groups[2]["lr"] = args.lr            # value_head
-            print(f"[RL Resume] Optimizer state restored + LRs overridden: backbone={args.backbone_lr}, heads={args.lr}")
+            print(f"[RL Resume] Optimizer state restored + LRs overridden: "
+                  f"backbone={args.backbone_lr}, dist_heads={args.dist_head_lr}, value_head={args.lr}")
         else:
             print("[RL Resume] Optimizer state restored.")
 
@@ -364,6 +371,7 @@ def main():
     global_step       = start_global_step
     update_count      = start_update_count
     backbone_unfrozen = warmup_already_done
+    _dist_diag_done   = False   # one-shot distribution diagnostic before first PPO update
     episode_count  = 0
     episode_rewards = []
     episode_lengths = []
@@ -545,6 +553,40 @@ def main():
             last_values = policy.get_value(last_imgs_t, last_egos_t).cpu().numpy()  # (N,)
 
         buffer.compute_gae(last_values, ppo_cfg.gamma, ppo_cfg.gae_lambda)
+
+        # ── One-shot distribution diagnostic (real obs, before first PPO update) ─
+        if not _dist_diag_done:
+            _dist_diag_done = True
+            _n = min(64, buffer._total)
+            _imgs_d = torch.from_numpy(
+                buffer.imgs.reshape(buffer._total, *buffer.imgs.shape[2:])[:_n].copy()
+            ).to(device)
+            _egos_d = torch.from_numpy(
+                buffer.egos.reshape(buffer._total, buffer.egos.shape[2])[:_n].copy()
+            ).to(device)
+            policy.eval()
+            with torch.no_grad():
+                _merged = policy._get_merged(_imgs_d, _egos_d)
+                _mu = policy.il_model.throttle_mu_head(_merged)          # (N, 1), Sigmoid output
+                _nu = torch.clamp(
+                    policy.il_model.throttle_nu_head(_merged) + 2.0,
+                    min=2.0, max=10.0,
+                )                                                         # (N, 1), clamped
+                _mu_c  = _mu.clamp(1e-6, 1.0 - 1e-6)
+                _alpha = (_mu_c * _nu)
+                _beta  = ((1.0 - _mu_c) * _nu)
+                _ent   = torch.distributions.Beta(_alpha, _beta).entropy()
+            print("\n" + "─" * 55)
+            print("[DiagDist] throttle_mu  "
+                  f"mean={_mu.mean().item():.4f}  std={_mu.std().item():.4f}  "
+                  f"min={_mu.min().item():.4f}  max={_mu.max().item():.4f}")
+            print("[DiagDist] throttle_nu  "
+                  f"mean={_nu.mean().item():.4f}  max={_nu.max().item():.4f}")
+            print("[DiagDist] Beta entropy "
+                  f"mean={_ent.mean().item():.4f}  "
+                  f"(batch={_n}, before update {update_count + 1})")
+            print("─" * 55 + "\n")
+            del _imgs_d, _egos_d, _merged, _mu, _nu, _mu_c, _alpha, _beta, _ent
 
         # ── PPO update ────────────────────────────────────────────────────────
         policy.train()

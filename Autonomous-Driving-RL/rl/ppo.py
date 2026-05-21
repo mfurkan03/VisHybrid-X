@@ -32,10 +32,10 @@ class PPOConfig:
     rollout_steps: int     = 2048
     epochs_per_update: int = 4
     mini_batch_size: int   = 64
-    gamma: float           = 0.99
+    gamma: float           = 0.97
     gae_lambda: float      = 0.95
     clip_epsilon: float    = 0.2
-    entropy_coef: float    = 0.001
+    entropy_coef: float    = 0.03   # IL→RL fine-tuning: 0.03 balances exploration vs reward; raise to 0.05 if entropy still collapses after warmup
     value_coef: float      = 0.25
     max_grad_norm: float   = 0.5
     lr: float              = 3e-4
