@@ -11,32 +11,14 @@ from torch.utils.data import Dataset
 from models import EGO_DIM, EGO_MOTION_DIM, NAVI_DIM
 
 
-def _load_navi(data, nav_dir: str, split: str, episode_basename: str, n_frames: int) -> np.ndarray:
-    """
-    Return (n_frames, NAVI_DIM) navigation array.
-
-    Priority:
-    1. `navi_state` key in the file itself (new datasets)
-    2. Separate nav_dir folder matched by filename (legacy datasets)
-    3. Zeros (= forward command) for old data with no nav at all
-    """
+def _load_navi(data, n_frames: int) -> np.ndarray:
+    """Return (n_frames, NAVI_DIM) from the file's navi_state key, or zeros."""
     if "navi_state" in data.files:
         navi = data["navi_state"].astype(np.float32)
-        m = min(len(navi), n_frames)
-        out = np.zeros((n_frames, NAVI_DIM), dtype=np.float32)
+        m    = min(len(navi), n_frames)
+        out  = np.zeros((n_frames, NAVI_DIM), dtype=np.float32)
         out[:m] = navi[:m, :NAVI_DIM]
         return out
-    if nav_dir:
-        nav_path = os.path.join(nav_dir, split, episode_basename)
-        if os.path.exists(nav_path):
-            try:
-                navi = np.load(nav_path, allow_pickle=True)["navi_state"].astype(np.float32)
-                m = min(len(navi), n_frames)
-                out = np.zeros((n_frames, NAVI_DIM), dtype=np.float32)
-                out[:m] = navi[:m, :NAVI_DIM]
-                return out
-            except Exception as e:
-                print(f"[WARNING] Could not read nav file {nav_path}: {e}")
     return np.zeros((n_frames, NAVI_DIM), dtype=np.float32)
 
 
@@ -49,7 +31,7 @@ class MetaDriveRGBDataset(Dataset):
     [total_speed, last_steer, heading_delta, navi_left, navi_right].
     """
 
-    def __init__(self, data_dir: str, split: str = "train", nav_dir: str = None):
+    def __init__(self, data_dir: str, split: str = "train"):
         split_dir  = os.path.join(data_dir, split)
         files      = glob.glob(os.path.join(split_dir, "*.npz"))
         self.rgb_frames: list = []
@@ -67,7 +49,7 @@ class MetaDriveRGBDataset(Dataset):
             n   = len(data["action"])
             ego = (data["ego_state"][:, :EGO_MOTION_DIM] if "ego_state" in data.files
                    else np.zeros((n, EGO_MOTION_DIM), dtype=np.float32))
-            navi = _load_navi(data, nav_dir, split, os.path.basename(f), n)
+            navi = _load_navi(data, n)
             ego5 = np.concatenate([ego[:n], navi[:n]], axis=1)   # (n, EGO_DIM)
             self.rgb_frames.extend(data[rgb_keys[0]])
             self.actions.extend(data["action"])
@@ -100,15 +82,12 @@ class PrecomputedDepthDataset(Dataset):
             ego_state_full : float32  (N, 5)   ← motion state; zeros if missing
             navi_state     : float32  (N, 2)   ← [navi_left, navi_right]; zeros if missing
 
-    nav_dir is a legacy fallback for old datasets where navi_state was stored
-    in a separate folder. New datasets have navi_state inline in each file.
-
     Note: older files that contain a `lane_mask` key instead of `rgb` are
     skipped with a warning — re-run train_dpt.py --mode precompute to
     regenerate them.
     """
 
-    def __init__(self, pred_dir: str, split: str = "train", nav_dir: str = None):
+    def __init__(self, pred_dir: str, split: str = "train"):
         split_dir         = os.path.join(pred_dir, split)
         files             = sorted(glob.glob(os.path.join(split_dir, "*.npz")))
         self.depth_frames:    list = []
@@ -143,8 +122,8 @@ class PrecomputedDepthDataset(Dataset):
             n       = min(len(depths), len(rgbs), len(actions))
             ego_full = (data["ego_state_full"][:n] if "ego_state_full" in data.files
                         else np.zeros((n, 5), dtype=np.float32))
-            navi = _load_navi(data, nav_dir, split, os.path.basename(f), n)
-            if "navi_state" in data.files or (nav_dir and os.path.exists(os.path.join(nav_dir, split, os.path.basename(f)))):
+            navi = _load_navi(data, n)
+            if "navi_state" in data.files:
                 n_nav_loaded += 1
 
             self.depth_frames.extend(depths[:n])
@@ -158,9 +137,9 @@ class PrecomputedDepthDataset(Dataset):
                   f"Delete data/processed/dpt_pred and re-run: "
                   f"python src/train_dpt.py --mode precompute")
 
-        nav_note = (f"+nav ({n_nav_loaded} episodes)" if nav_dir else "nav=zeros")
         print(f"[INFO] PrecomputedDepthDataset ({split}): "
-              f"{len(self.actions)} samples from {split_dir} [{nav_note}].")
+              f"{len(self.actions)} samples from {split_dir} "
+              f"[{n_nav_loaded}/{len(files) - skipped} episodes with nav].")
 
     def __len__(self):
         return len(self.actions)

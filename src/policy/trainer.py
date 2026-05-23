@@ -195,10 +195,10 @@ def extract_features_frozen(
 # pickling when num_workers > 0 on Windows spawn)
 # ============================================================
 def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_estimator,
-                  seed: int = 0, nav_dir: str = None):
+                  seed: int = 0):
     if use_precomputed:
-        train_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="train", nav_dir=nav_dir)
-        val_ds   = PrecomputedDepthDataset(pred_dir=pred_dir, split="val",   nav_dir=nav_dir)
+        train_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="train")
+        val_ds   = PrecomputedDepthDataset(pred_dir=pred_dir, split="val")
 
         def collate_fn(batch):
             depths, rgbs, actions, egos, ego_fulls = zip(*batch)
@@ -210,8 +210,8 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
                 np.stack(ego_fulls),
             )
     else:
-        train_ds = MetaDriveRGBDataset(data_dir=data_dir, split="train", nav_dir=nav_dir)
-        val_ds   = MetaDriveRGBDataset(data_dir=data_dir, split="val",   nav_dir=nav_dir)
+        train_ds = MetaDriveRGBDataset(data_dir=data_dir, split="train")
+        val_ds   = MetaDriveRGBDataset(data_dir=data_dir, split="val")
 
         def collate_fn(batch):
             rgbs, actions, egos = zip(*batch)
