@@ -11,13 +11,21 @@ from torch.utils.data import Dataset
 from models import EGO_DIM, EGO_MOTION_DIM, NAVI_DIM
 
 
-def _load_navi_for_episode(nav_dir: str, split: str, episode_basename: str, n_frames: int) -> np.ndarray:
+def _load_navi(data, nav_dir: str, split: str, episode_basename: str, n_frames: int) -> np.ndarray:
     """
-    Load the (n_frames, NAVI_DIM) navigation array for one episode from the
-    SEPARATE nav/ folder, matched by episode filename. Returns zeros (= forward
-    command) when nav_dir is None or the matching file is absent, so datasets
-    collected before navigation existed still train without modification.
+    Return (n_frames, NAVI_DIM) navigation array.
+
+    Priority:
+    1. `navi_state` key in the file itself (new datasets)
+    2. Separate nav_dir folder matched by filename (legacy datasets)
+    3. Zeros (= forward command) for old data with no nav at all
     """
+    if "navi_state" in data.files:
+        navi = data["navi_state"].astype(np.float32)
+        m = min(len(navi), n_frames)
+        out = np.zeros((n_frames, NAVI_DIM), dtype=np.float32)
+        out[:m] = navi[:m, :NAVI_DIM]
+        return out
     if nav_dir:
         nav_path = os.path.join(nav_dir, split, episode_basename)
         if os.path.exists(nav_path):
@@ -59,14 +67,13 @@ class MetaDriveRGBDataset(Dataset):
             n   = len(data["action"])
             ego = (data["ego_state"][:, :EGO_MOTION_DIM] if "ego_state" in data.files
                    else np.zeros((n, EGO_MOTION_DIM), dtype=np.float32))
-            navi = _load_navi_for_episode(nav_dir, split, os.path.basename(f), n)
+            navi = _load_navi(data, nav_dir, split, os.path.basename(f), n)
             ego5 = np.concatenate([ego[:n], navi[:n]], axis=1)   # (n, EGO_DIM)
             self.rgb_frames.extend(data[rgb_keys[0]])
             self.actions.extend(data["action"])
             self.ego_states.extend(ego5)
 
-        print(f"[INFO] PolicyDataset-RGB ({split}): {len(self.actions)} samples from {split_dir}"
-              f"{' (+nav)' if nav_dir else ' (nav=zeros)'}.")
+        print(f"[INFO] PolicyDataset-RGB ({split}): {len(self.actions)} samples from {split_dir}.")
 
     def __len__(self):
         return len(self.actions)
@@ -87,16 +94,14 @@ class PrecomputedDepthDataset(Dataset):
 
     Expected file layout:
         <pred_dir>/<split>/episode_N.npz
-            depth_pred : float32  (N, 1, 196, 196)
-            rgb        : uint8    (N, H, W, 3)
-            action     : float32  (N, 2)
-            ego_state_full : float32  (N, 5)  ← motion state; zeros if missing
-        <nav_dir>/<split>/episode_N.npz          (SEPARATE folder, optional)
-            navi_state : float32  (N, NAVI_DIM)  ← [navi_left, navi_right]
+            depth_pred     : float32  (N, 1, 196, 196)
+            rgb            : uint8    (N, H, W, 3)
+            action         : float32  (N, 2)
+            ego_state_full : float32  (N, 5)   ← motion state; zeros if missing
+            navi_state     : float32  (N, 2)   ← [navi_left, navi_right]; zeros if missing
 
-    Navigation is joined by matching episode filename. When nav_dir is None or
-    a file is absent, navigation defaults to zeros (= forward command) so older
-    datasets train unchanged.
+    nav_dir is a legacy fallback for old datasets where navi_state was stored
+    in a separate folder. New datasets have navi_state inline in each file.
 
     Note: older files that contain a `lane_mask` key instead of `rgb` are
     skipped with a warning — re-run train_dpt.py --mode precompute to
@@ -138,8 +143,8 @@ class PrecomputedDepthDataset(Dataset):
             n       = min(len(depths), len(rgbs), len(actions))
             ego_full = (data["ego_state_full"][:n] if "ego_state_full" in data.files
                         else np.zeros((n, 5), dtype=np.float32))
-            navi = _load_navi_for_episode(nav_dir, split, os.path.basename(f), n)
-            if nav_dir and os.path.exists(os.path.join(nav_dir, split, os.path.basename(f))):
+            navi = _load_navi(data, nav_dir, split, os.path.basename(f), n)
+            if "navi_state" in data.files or (nav_dir and os.path.exists(os.path.join(nav_dir, split, os.path.basename(f)))):
                 n_nav_loaded += 1
 
             self.depth_frames.extend(depths[:n])

@@ -46,17 +46,17 @@ def _worker_collect(
     decision_repeat=1,
     save_every_n=20,
     poster_path=None,
+    traffic_density_min=0.1,
+    traffic_density_max=0.7,
 ):
     """
     Worker process that handles a subset of the total episodes.
 
     Navigation is collected in the SAME loop that captures the images (the only
     reliable way — MetaDrive episodes are not reproducible across runs, so a
-    separate replay pass would misalign nav with the saved frames) and written
-    to its OWN folder <save_dir>/nav/<split>/episode_N.npz, which holds only
-    navi_state — no RGB/depth. This keeps navigation a separate, self-contained
-    data type that the depth-precompute step ignores and the dataset loader
-    joins back by episode filename.
+    separate replay pass would misalign nav with the saved frames) and saved
+    as the `navi_state` key inside the main episode .npz file alongside RGB,
+    depth, action, and ego_state.
     """
 
     angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(num_cameras)
@@ -65,7 +65,8 @@ def _worker_collect(
     train_count = int(total_episodes * split_ratios[0])
     val_count   = int(total_episodes * split_ratios[1])
     rng = np.random.default_rng(seed)
-    traffic_density = 0.4
+    traffic_density = (traffic_density_min if traffic_density_min == traffic_density_max
+                       else float(rng.uniform(traffic_density_min, traffic_density_max)))
     config = {
         "use_render":        False,
         "image_observation": True,
@@ -182,27 +183,14 @@ def _worker_collect(
                 if quit_requested:
                     done = True
 
-        # ── Navigation episode (always saved, to the SEPARATE nav/ folder) ──────
-        nav_dict = {
-            "navi_state":       np.array(navi_states,      dtype=np.float32),  # (N, NAVI_DIM)
-            "frame_timestamps": np.array(frame_timestamps, dtype=np.float64),
-        }
-        nav_path = os.path.join(save_dir, "nav", current_split, f"episode_{global_ep_id}.npz")
-
         save_threads = []
-        nav_t = threading.Thread(
-            target=lambda p, d: np.savez_compressed(p, **d),
-            args=(nav_path, nav_dict),
-            daemon=True,
-        )
-        nav_t.start()
-        save_threads.append(nav_t)
 
-        # ── Main episode (RGB/depth/action/ego) ─────────────────────────────────
+        # ── Main episode (RGB/depth/action/ego/nav) ──────────────────────────────
         save_dict = {
             "action":           np.array(actions),
             "ego_state":        np.array(ego_states,      dtype=np.float32),
             "ego_state_full":   np.array(ego_states_full, dtype=np.float32),
+            "navi_state":       np.array(navi_states,     dtype=np.float32),  # (N, NAVI_DIM)
             "frame_timestamps": np.array(frame_timestamps, dtype=np.float64),
         }
         for rgb_name in rgb_cam_names:
@@ -212,7 +200,11 @@ def _worker_collect(
             save_dict[f"{rgb_name}_depth"] = np.array(depth_list, dtype=np.float32)
             save_dict[f"{rgb_name}_rgb"] = np.array(rgb_list, dtype=np.uint8)
 
-        save_path = os.path.join(save_dir, current_split, f"episode_{global_ep_id}.npz")
+        td_str = (f"td{traffic_density_min:.2f}"
+                  if traffic_density_min == traffic_density_max
+                  else f"td{traffic_density_min:.2f}-{traffic_density_max:.2f}")
+        ep_prefix = f"s{seed}_n{action_noise:.2f}_{td_str}_dr{decision_repeat}"
+        save_path = os.path.join(save_dir, current_split, f"{ep_prefix}_ep{global_ep_id}.npz")
         main_t = threading.Thread(
             target=lambda p, d: np.savez_compressed(p, **d),
             args=(save_path, save_dict),
@@ -221,7 +213,7 @@ def _worker_collect(
         main_t.start()
         save_threads.append(main_t)
 
-        print(f"\n  --> [Worker {worker_id}] Saving Global Episode {global_ep_id} to '{current_split}' (+ nav)")
+        print(f"\n  --> [Worker {worker_id}] Saving Global Episode {global_ep_id} to '{current_split}'")
 
         ep += 1
         for t in save_threads:
@@ -240,23 +232,22 @@ def _worker_collect(
 # ============================================================
 def collect_expert_data_parallel(
     seed,
-    num_episodes    = 10,
-    num_workers     = 1,
-    save_dir        = "dataset",
-    visualize       = True,
-    num_cameras     = 2,
-    action_noise    = 0.3,
-    image_on_cuda   = True,
-    split_ratios    = (0.8, 0.1, 0.1),
-    decision_repeat = 5,
-    save_every_n    = 20,
-    poster_path     = None,
+    num_episodes         = 10,
+    num_workers          = 1,
+    save_dir             = "dataset",
+    visualize            = True,
+    num_cameras          = 2,
+    action_noise         = 0.3,
+    image_on_cuda        = True,
+    split_ratios         = (0.8, 0.1, 0.1),
+    decision_repeat      = 5,
+    save_every_n         = 20,
+    poster_path          = None,
+    traffic_density_min  = 0.1,
+    traffic_density_max  = 0.7,
 ):
-    # Navigation is written to a SEPARATE nav/ folder (only navi_state, no
-    # images) so it stays a self-contained data type in the pipeline.
     for split in ("train", "val", "test"):
         os.makedirs(os.path.join(save_dir, split), exist_ok=True)
-        os.makedirs(os.path.join(save_dir, "nav", split), exist_ok=True)
 
     mode_str = "GPU (CUDA)" if image_on_cuda else "CPU (NumPy)"
 
@@ -269,9 +260,12 @@ def collect_expert_data_parallel(
     print(f"  Parallel Processing : {num_workers} Workers")
     print(f"  Total Episodes  : {num_episodes}")
     print(f"  Processing Mode : {mode_str}")
-    print(f"  Saving to       : '{save_dir}' (+ separate nav/ folder)")
+    print(f"  Saving to       : '{save_dir}'")
     print(f"  Camera Count    : {num_cameras}")
     print(f"  Sim FPS         : {100 // decision_repeat} Hz  (decision_repeat={decision_repeat}, save_every_n={save_every_n})")
+    density_str = (f"{traffic_density_min:.2f}" if traffic_density_min == traffic_density_max
+                   else f"random [{traffic_density_min:.2f}, {traffic_density_max:.2f}]")
+    print(f"  Traffic Density : {density_str}")
     print(f"{'='*55}\n")
 
     # Chunk the episodes for each worker
@@ -302,6 +296,8 @@ def collect_expert_data_parallel(
             decision_repeat,            # decision_repeat
             save_every_n,               # save_every_n
             poster_path,                # poster_path
+            traffic_density_min,        # traffic_density_min
+            traffic_density_max,        # traffic_density_max
         ))
         current_idx += worker_eps
 
@@ -341,21 +337,29 @@ if __name__ == "__main__":
     parser.add_argument("--poster",        type=str, default=None,
                         metavar="PATH",
                         help="Save a high-res poster PNG to PATH, then exit")
+    parser.add_argument("--traffic_density", type=float, default=None,
+                        help="Fixed traffic density [0, 1]. Omit to use random range.")
+    parser.add_argument("--traffic_density_min", type=float, default=0.1,
+                        help="Min traffic density for random range (default 0.1)")
+    parser.add_argument("--traffic_density_max", type=float, default=0.7,
+                        help="Max traffic density for random range (default 0.7)")
     args = parser.parse_args()
 
+    td_min = args.traffic_density if args.traffic_density is not None else args.traffic_density_min
+    td_max = args.traffic_density if args.traffic_density is not None else args.traffic_density_max
+
     collect_expert_data_parallel(
-        seed          = args.start_seed,
-        num_episodes  = args.episodes,
-        num_workers   = args.num_workers,
-        save_dir      = args.save_dir,
-
-
-        
-        action_noise    = args.act_noise,
-        decision_repeat = args.decision_repeat,
-        save_every_n    = args.save_every_n,
-        visualize     = not args.no_vis,
-        num_cameras   = args.num_cameras,
-        image_on_cuda = args.image_on_cuda,
-        poster_path   = args.poster,
+        seed                = args.start_seed,
+        num_episodes        = args.episodes,
+        num_workers         = args.num_workers,
+        save_dir            = args.save_dir,
+        action_noise        = args.act_noise,
+        decision_repeat     = args.decision_repeat,
+        save_every_n        = args.save_every_n,
+        visualize           = not args.no_vis,
+        num_cameras         = args.num_cameras,
+        image_on_cuda       = args.image_on_cuda,
+        poster_path         = args.poster,
+        traffic_density_min = td_min,
+        traffic_density_max = td_max,
     )

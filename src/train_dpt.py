@@ -326,6 +326,8 @@ def _process_episode(ep_path: str, out_path: str, dpt_path: str, batch_size: int
         save_dict["ego_state"] = data["ego_state"]
     if "ego_state_full" in data.files:
         save_dict["ego_state_full"] = data["ego_state_full"]
+    if "navi_state" in data.files:
+        save_dict["navi_state"] = data["navi_state"]
     if actions is not None:
         save_dict["action"] = actions
 
