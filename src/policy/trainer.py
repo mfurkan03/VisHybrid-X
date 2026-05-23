@@ -112,7 +112,9 @@ def apply_augmentations(
     Per-sample stochastic augmentations applied to the combined (4, H, W) tensor.
 
     - Pixel noise  : Gaussian noise (std=0.05) on 10 % of pixels, RGB channels only.
-    - Horizontal flip : flips image + negates steer, last_steer, heading_delta.
+    - Horizontal flip : flips image + negates steer, last_steer, heading_delta,
+                        and swaps the navi_left/navi_right command (a left turn
+                        in the mirrored frame becomes a right turn).
     - Grayscale    : RGB → luminance, depth channel untouched.
 
     prob_* is the per-sample probability; 0.0 disables the augmentation entirely.
@@ -143,6 +145,9 @@ def apply_augmentations(
                 ego_out[i, 1] *= -1   # last_steer
             if ego_out.shape[1] > 2:
                 ego_out[i, 2] *= -1   # heading_delta
+            if ego_out.shape[1] > 4:
+                # swap navi_left (idx 3) <-> navi_right (idx 4)
+                ego_out[i, 3], ego_out[i, 4] = ego_out[i, 4], ego_out[i, 3]
 
         if prob_grayscale > 0.0 and np.random.random() < prob_grayscale:
             gray   = 0.299 * img[1] + 0.587 * img[2] + 0.114 * img[3]
@@ -190,10 +195,10 @@ def extract_features_frozen(
 # pickling when num_workers > 0 on Windows spawn)
 # ============================================================
 def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_estimator,
-                  seed: int = 0):
+                  seed: int = 0, nav_dir: str = None):
     if use_precomputed:
-        train_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="train")
-        val_ds   = PrecomputedDepthDataset(pred_dir=pred_dir, split="val")
+        train_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="train", nav_dir=nav_dir)
+        val_ds   = PrecomputedDepthDataset(pred_dir=pred_dir, split="val",   nav_dir=nav_dir)
 
         def collate_fn(batch):
             depths, rgbs, actions, egos, ego_fulls = zip(*batch)
@@ -205,8 +210,8 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
                 np.stack(ego_fulls),
             )
     else:
-        train_ds = MetaDriveRGBDataset(data_dir=data_dir, split="train")
-        val_ds   = MetaDriveRGBDataset(data_dir=data_dir, split="val")
+        train_ds = MetaDriveRGBDataset(data_dir=data_dir, split="train", nav_dir=nav_dir)
+        val_ds   = MetaDriveRGBDataset(data_dir=data_dir, split="val",   nav_dir=nav_dir)
 
         def collate_fn(batch):
             rgbs, actions, egos = zip(*batch)

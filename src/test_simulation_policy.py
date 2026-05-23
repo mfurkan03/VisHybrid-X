@@ -161,12 +161,13 @@ def run_simulation(
                     depth_color = cv2.resize(cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO), (400, 400))
                     rgb_color   = cv2.resize(blended_bgr, (400, 400))
 
+                    nav_cmd = ("LEFT" if ego_reading.navi_left else
+                               "RIGHT" if ego_reading.navi_right else "FWD")
                     hud = np.zeros((40, 800, 3), dtype=np.uint8)
                     cv2.putText(
                         hud,
-                        f"spd:{ego_reading.total_speed:+.2f}  fwd:{ego_reading.forward_speed:+.2f}  "
-                        f"lat:{ego_reading.lateral_speed:+.2f}  hdg:{ego_reading.heading_delta:+.2f}  "
-                        f"str:{ego_reading.last_steer:+.2f}  "
+                        f"spd:{ego_reading.total_speed:+.2f}  hdg:{ego_reading.heading_delta:+.2f}  "
+                        f"str:{ego_reading.last_steer:+.2f}  nav:{nav_cmd:<5s}  "
                         f"->  steer:{pred_action[0]:+.2f}  throt:{pred_action[1]:+.2f}",
                         (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 200), 1,
                     )
@@ -249,7 +250,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str,   default=None,
                         help="Path to trained policy checkpoint. Not required when --arch expert.")
-    parser.add_argument("--dpt_path",   type=str,   default="models/dpt_finetuned.pth")
+    parser.add_argument("--dpt_path",   type=str,   default="models/dpt_finetuned_ep17.pth")
     parser.add_argument("--episodes",   type=int,   default=1)
     parser.add_argument("--image_size",         type=int,   default=84)
     parser.add_argument("--arch",               type=str,   default="simple",
