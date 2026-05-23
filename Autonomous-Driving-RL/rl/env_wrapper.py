@@ -172,7 +172,7 @@ class MetaDriveRLWrapper:
     # ── Private helpers ───────────────────────────────────────────────────────
 
     def _get_ego(self) -> np.ndarray:
-        """Read ego state [total_speed, last_steer, heading_delta]."""
+        """Read ego state [total_speed, last_steer, heading_delta, navi_left, navi_right]."""
         try:
             ego_reading = extract_ego_state(self.env.agent, self.last_steer)
             return ego_reading.ego_model   # (EGO_DIM,) float32

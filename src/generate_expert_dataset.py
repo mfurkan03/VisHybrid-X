@@ -65,7 +65,7 @@ def _worker_collect(
     train_count = int(total_episodes * split_ratios[0])
     val_count   = int(total_episodes * split_ratios[1])
     rng = np.random.default_rng(seed)
-    traffic_density = float(rng.uniform(0.1, 0.7))
+    traffic_density = 0.4
     config = {
         "use_render":        False,
         "image_observation": True,
