@@ -287,7 +287,7 @@ def main():
     #   dist_head_params — Beta distribution heads: dist_head_lr (IL-trained, must update slowly
     #                      to avoid entropy collapse; much lower than value_head lr)
     #   head_params      — value_head: lr (random init, must learn fast)
-    _DIST_HEAD_NAMES = {"steer_alpha_head", "steer_beta_head", "throttle_mu_head", "throttle_nu_head"}
+    _DIST_HEAD_NAMES = {"steer_mu_head", "steer_nu_head", "throttle_mu_head", "throttle_nu_head"}
     dist_head_params = []
     cnn_params       = []
     for name, param in policy.il_model.named_parameters():
@@ -567,26 +567,25 @@ def main():
             policy.eval()
             with torch.no_grad():
                 _merged = policy._get_merged(_imgs_d, _egos_d)
-                _mu = policy.il_model.throttle_mu_head(_merged)          # (N, 1), Sigmoid output
-                _nu = torch.clamp(
-                    policy.il_model.throttle_nu_head(_merged) + 2.0,
-                    min=2.0, max=10.0,
-                )                                                         # (N, 1), clamped
-                _mu_c  = _mu.clamp(1e-6, 1.0 - 1e-6)
-                _alpha = (_mu_c * _nu)
-                _beta  = ((1.0 - _mu_c) * _nu)
-                _ent   = torch.distributions.Beta(_alpha, _beta).entropy()
-            print("\n" + "─" * 55)
-            print("[DiagDist] throttle_mu  "
-                  f"mean={_mu.mean().item():.4f}  std={_mu.std().item():.4f}  "
-                  f"min={_mu.min().item():.4f}  max={_mu.max().item():.4f}")
-            print("[DiagDist] throttle_nu  "
-                  f"mean={_nu.mean().item():.4f}  max={_nu.max().item():.4f}")
-            print("[DiagDist] Beta entropy "
-                  f"mean={_ent.mean().item():.4f}  "
-                  f"(batch={_n}, before update {update_count + 1})")
-            print("─" * 55 + "\n")
-            del _imgs_d, _egos_d, _merged, _mu, _nu, _mu_c, _alpha, _beta, _ent
+                _il = policy.il_model
+                _mu_s = _il.steer_mu_head(_merged)
+                _nu_s = torch.clamp(_il.steer_nu_head(_merged) + 2.0, 2.0, 10.0)
+                _mu_t = _il.throttle_mu_head(_merged)
+                _nu_t = torch.clamp(_il.throttle_nu_head(_merged) + 2.0, 2.0, 10.0)
+                _mu_sc = _mu_s.clamp(1e-6, 1.0 - 1e-6)
+                _mu_tc = _mu_t.clamp(1e-6, 1.0 - 1e-6)
+                _ent_s = torch.distributions.Beta(_mu_sc * _nu_s, (1 - _mu_sc) * _nu_s).entropy()
+                _ent_t = torch.distributions.Beta(_mu_tc * _nu_t, (1 - _mu_tc) * _nu_t).entropy()
+            print("\n" + "-" * 57)
+            print(f"[DiagDist] steer_mu    mean={_mu_s.mean():.4f}  std={_mu_s.std():.4f}  min={_mu_s.min():.4f}  max={_mu_s.max():.4f}")
+            print(f"[DiagDist] steer_nu    mean={_nu_s.mean():.4f}  max={_nu_s.max():.4f}")
+            print(f"[DiagDist] throttle_mu mean={_mu_t.mean():.4f}  std={_mu_t.std():.4f}  min={_mu_t.min():.4f}  max={_mu_t.max():.4f}")
+            print(f"[DiagDist] throttle_nu mean={_nu_t.mean():.4f}  max={_nu_t.max():.4f}")
+            print(f"[DiagDist] entropy     steer={_ent_s.mean():.4f}  throttle={_ent_t.mean():.4f}  "
+                  f"total={(_ent_s + _ent_t).mean():.4f}  (batch={_n}, before update {update_count + 1})")
+            print("-" * 57 + "\n")
+            del _merged, _il, _mu_s, _nu_s, _mu_t, _nu_t, _mu_sc, _mu_tc, _ent_s, _ent_t
+            del _imgs_d, _egos_d
 
         # ── PPO update ────────────────────────────────────────────────────────
         policy.train()

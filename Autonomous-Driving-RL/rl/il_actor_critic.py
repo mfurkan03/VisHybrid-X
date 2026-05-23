@@ -82,26 +82,26 @@ class ILActorCritic(nn.Module):
         return self.il_model(image, ego, return_features=True)
 
     def _get_dist(self, merged: torch.Tensor) -> Beta:
-        """Build Beta distribution by delegating to the IL model's trained heads.
+        """Build Beta distribution from mu/nu heads for both steer and throttle.
 
-        Steer  : α, β > 2 via steer_alpha_head / steer_beta_head.
-        Throttle: mu/nu reparameterization — α = mu*nu, β = (1-mu)*nu.
+        Both actions use mu/nu reparameterization: α = mu*nu, β = (1-mu)*nu.
+        This decouples direction (mu) from concentration (nu), allowing
+        reset_nu_heads_for_ppo() to maximize entropy without losing IL-learned
+        directional knowledge.
         """
         il = self.il_model
-        steer_alpha = il.steer_alpha_head(merged) + 2.0   # (B, 1), > 2
-        steer_beta  = il.steer_beta_head(merged)  + 2.0   # (B, 1), > 2
 
-        mu             = il.throttle_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)  # (B, 1); clamp prevents sigmoid saturation → exact 0/1 → zero concentration
+        mu_s = il.steer_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)     # (B, 1)
         # TODO: gradually relax max clamp (e.g. to 50.0) after ~100k PPO steps
-        nu             = torch.clamp(il.throttle_nu_head(merged) + 2.0, min=2.0, max=10.0)  # (B, 1)
-        throttle_alpha = mu * nu
-        throttle_beta  = (1.0 - mu) * nu
+        nu_s = torch.clamp(il.steer_nu_head(merged) + 2.0, min=2.0, max=10.0)  # (B, 1)
 
-        alpha = torch.cat([steer_alpha, throttle_alpha], dim=-1) * self.CONCENTRATION_SCALE  # (B, 2)
-        beta  = torch.cat([steer_beta,  throttle_beta],  dim=-1) * self.CONCENTRATION_SCALE  # (B, 2)
+        mu_t = il.throttle_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)   # (B, 1)
+        nu_t = torch.clamp(il.throttle_nu_head(merged) + 2.0, min=2.0, max=10.0)  # (B, 1)
+
+        alpha = torch.cat([mu_s * nu_s, mu_t * nu_t], dim=-1) * self.CONCENTRATION_SCALE  # (B, 2)
+        beta  = torch.cat([(1.0 - mu_s) * nu_s, (1.0 - mu_t) * nu_t], dim=-1) * self.CONCENTRATION_SCALE  # (B, 2)
         # Clamp concentration to [1e-4, 50]: prevents float32 lgamma overflow at high values
-        # and ensures Beta log_prob is numerically stable. Values above ~50 are near-deterministic
-        # anyway — clamping here doesn't meaningfully restrict policy expressiveness.
+        # and ensures Beta log_prob is numerically stable.
         alpha = alpha.clamp(1e-4, 50.0)
         beta  = beta.clamp(1e-4, 50.0)
         return Beta(alpha, beta)
@@ -165,65 +165,52 @@ class ILActorCritic(nn.Module):
     # ------------------------------------------------------------------
     def reset_nu_heads_for_ppo(self):
         """
-        Reset distribution heads to maximum-entropy state before PPO fine-tuning.
+        Reset all nu heads to maximum-entropy state before PPO fine-tuning.
 
-        Diagnostic on the IL checkpoint revealed two problems:
-          1. throttle_nu_head — already fixed: nu reset to ~2.69 (near-minimum
-             concentration), giving a broad Beta.
-          2. throttle_mu_head — IL training drove the mean to ~0.84 (heavy
-             forward-throttle bias).  At nu=2 this gives Beta(1.68, 0.32),
-             which is extremely right-skewed with entropy ≈ -8.5.  PPO cannot
-             explore braking or coasting from this starting point.
+        With the new mu/nu parameterization for both steer and throttle, this
+        is now clean and symmetric: nu heads control concentration only, mu
+        heads control direction only.
 
-        Fix for mu_head
-        ---------------
-        Only the LAST Linear layer is reset (weight → N(0, 0.01), bias → 0.0).
-        sigmoid(0) = 0.5, so the output centres at 0.5 after reset.
-        Earlier layers in the Sequential are left untouched: they may encode
-        useful IL feature projections.  (In practice throttle_mu_head is a
-        single Linear+Sigmoid, so this resets the whole head anyway.)
+        Nu heads (steer_nu_head, throttle_nu_head)
+        -------------------------------------------
+        Reset to zeros: linear_output = 0 → Softplus(0) = ln(2) ≈ 0.693
+        → nu = 2.693 (minimum reachable given the +2.0 floor).
+        Gives Beta(mu*2.69, (1-mu)*2.69) ≈ near-uniform, entropy ≈ -0.23.
 
-        WHY steer_alpha_head / steer_beta_head are NOT reset
-        -----------------------------------------------------
-        Steer has no separate mu/nu split — alpha_head and beta_head jointly
-        encode both mean steering direction AND concentration.  Resetting them
-        would erase IL-learned directional behaviour, which must be preserved.
+        Mu heads (steer_mu_head, throttle_mu_head)
+        -------------------------------------------
+        Also reset to zeros: sigmoid(0) = 0.5 exactly for any input.
+        IL-learned directional knowledge is deliberately discarded here —
+        it was encoded in high concentration (nu >> 2), not in mu.  With
+        the old alpha/beta parameterization this was a problem; with mu/nu
+        the directional info lives in mu which PPO will re-learn quickly
+        from the backbone features (which ARE preserved).
 
-        Expected state after reset (any input batch)
-        --------------------------------------------
-          mu  ≈ 0.50  (std ~0.05)
-          nu  ≈ 2.69  (just above the +2.0 minimum floor)
-          Beta(~1, ~1) → entropy ≈ 0.0  (maximum for this parameterisation)
+        Expected state after reset
+        --------------------------
+          steer  : mu=0.50, nu=2.69 → Beta(1.35, 1.35), entropy ≈ -0.23
+          throttle: mu=0.50, nu=2.69 → Beta(1.35, 1.35), entropy ≈ -0.23
+          total entropy ≈ -0.46  (vs -8 before)
         """
         il = self.il_model
-        print("[reset_nu_heads_for_ppo] Resetting distribution heads:")
+        print("[reset_nu_heads_for_ppo] Resetting all mu/nu heads to maximum-entropy state:")
 
-        # ── nu head ───────────────────────────────────────────────────────────
-        for layer_idx, layer in enumerate(il.throttle_nu_head):
-            if isinstance(layer, nn.Linear):
-                # zeros → linear_output = 0 for any features
-                # Softplus(0) = ln(2) ≈ 0.693, so nu = 0.693 + 2.0 ≈ 2.69 (exact)
-                nn.init.zeros_(layer.weight)
-                nn.init.constant_(layer.bias, 0.0)
-                print(f"  throttle_nu_head[{layer_idx}] Linear  "
-                      f"weight={layer.weight.abs().max().item():.6f}  bias={layer.bias.mean().item():.4f}")
+        nu_heads = [("steer_nu_head",    il.steer_nu_head),
+                    ("throttle_nu_head", il.throttle_nu_head)]
+        mu_heads = [("steer_mu_head",    il.steer_mu_head),
+                    ("throttle_mu_head", il.throttle_mu_head)]
 
-        # ── mu head: ONLY the last Linear layer ───────────────────────────────
-        # N(0, small_std) is NOT sufficient — IL backbone features have large
-        # L2 norm (||merged|| ≈ 150+, ImpalaNetV2), so even std=0.01 weights
-        # produce pre-sigmoid outputs of ±1.5+, pushing mu away from 0.5.
-        # zeros guarantees linear_output = 0 for every observation → sigmoid(0) = 0.5 exact.
-        last_linear = None
-        for layer in il.throttle_mu_head.modules():
-            if isinstance(layer, nn.Linear):
-                last_linear = layer
-        if last_linear is not None:
-            nn.init.zeros_(last_linear.weight)
-            nn.init.constant_(last_linear.bias, 0.0)
-            print(f"  throttle_mu_head (last Linear)  "
-                  f"weight={last_linear.weight.abs().max().item():.6f}  bias={last_linear.bias.mean().item():.4f}")
+        for head_name, head in nu_heads + mu_heads:
+            last_linear = None
+            for layer in head.modules():
+                if isinstance(layer, nn.Linear):
+                    last_linear = layer
+            if last_linear is not None:
+                nn.init.zeros_(last_linear.weight)
+                nn.init.constant_(last_linear.bias, 0.0)
+                print(f"  {head_name:25s}  weight_max={last_linear.weight.abs().max().item():.6f}  bias={last_linear.bias.mean().item():.4f}")
 
-        print("[reset_nu_heads_for_ppo] Done — mu≈0.50  nu≈2.69  entropy≈0.0\n")
+        print("[reset_nu_heads_for_ppo] Done — mu=0.50 exact, nu=2.69 exact, entropy≈-0.46\n")
 
     # ------------------------------------------------------------------
     def load_from_il_checkpoint(self, path: str, device: str = "cpu"):
