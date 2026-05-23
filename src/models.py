@@ -5,12 +5,15 @@ Public API
 ----------
 DepthEstimationModel   – DepthAnythingV2 wrapper (frozen or trainable)
 EgoReading             – NamedTuple snapshot from extract_ego_state()
-EGO_DIM                – number of dimensions fed to the policy network (2)
+EGO_DIM                – number of dimensions fed to the policy network (5)
+EGO_MOTION_DIM         – motion-only ego dims stored on disk (3)
+NAVI_DIM               – navigation-command dims (2: [left, right] one-hot)
 extract_ego_state()    – build EgoReading from a MetaDrive agent
 DrivingPolicyNet       – two-stream CNN + ego policy network
 DrivingPolicyNet2      – deeper variant with BatchNorm fusion head
 """
 
+import math
 import os
 import sys
 import time
@@ -99,23 +102,58 @@ class DepthEstimationModel:
 # 2. EGO-STATE UTILITIES
 # ============================================================
 
-EGO_DIM = 3  # [total_speed, last_steer, heading_delta]
+EGO_MOTION_DIM = 3  # [total_speed, last_steer, heading_delta] — stored on disk
+NAVI_DIM       = 2  # [navi_left, navi_right] one-hot turn command (forward = [0, 0])
+EGO_DIM        = EGO_MOTION_DIM + NAVI_DIM  # 5 — what the policy network actually receives
+
+
+def navigation_command_onehot(agent) -> tuple[float, float]:
+    """
+    Return the upcoming turn command as a (navi_left, navi_right) one-hot.
+
+        forward → (0.0, 0.0)
+        left    → (1.0, 0.0)
+        right   → (0.0, 1.0)
+
+    Replicates MetaDrive's own navigation_command computation
+    (base_vehicle.before_step) from agent.navigation.navi_arrow_dir, so the
+    signal is identical to info["navigation_command"] without needing the
+    info dict. This is the conditional-imitation-learning command that tells
+    the policy which way to go at the next junction — information the camera
+    alone cannot provide.
+    """
+    nav = getattr(agent, "navigation", None)
+    arrow = getattr(nav, "navi_arrow_dir", None) if nav is not None else None
+    if not arrow or len(arrow) < 2:
+        return 0.0, 0.0
+
+    lane_0_heading, lane_1_heading = float(arrow[0]), float(arrow[1])
+    diff = (lane_0_heading - lane_1_heading + np.pi) % (2 * np.pi) - np.pi
+    if abs(diff) < (10.0 / 180.0 * math.pi):
+        return 0.0, 0.0  # straight / forward
+
+    dir_0 = np.array([math.cos(lane_0_heading), math.sin(lane_0_heading), 0.0])
+    dir_1 = np.array([math.cos(lane_1_heading), math.sin(lane_1_heading), 0.0])
+    turn_left = float(np.cross(dir_1, dir_0)[-1]) < 0.0
+    return (1.0, 0.0) if turn_left else (0.0, 1.0)
 
 
 class EgoReading(NamedTuple):
     """
     Full ego-state snapshot captured at every step.
 
-    Sent to the model (ego_model slice)
-    ------------------------------------
+    Sent to the model (ego_model = ego_motion ++ ego_nav)
+    -----------------------------------------------------
     total_speed   : wheel-speed proxy, normalised to [0, 1]
     last_steer    : previous steering command, in [-1, 1]
+    heading_delta : change in heading since last step (rad), normalised to [-1, 1]
+    navi_left     : 1.0 if the next junction turns left,  else 0.0
+    navi_right    : 1.0 if the next junction turns right, else 0.0
 
     Collected but NOT sent to the model
     ------------------------------------
     forward_speed : longitudinal velocity component, normalised to [-1, 1]
     lateral_speed : lateral velocity component, normalised to [-1, 1]
-    heading_delta : change in heading since last step (rad), normalised to [-1, 1]
     timestamp     : wall-clock time of this reading (float, seconds since epoch)
     """
     total_speed   : float
@@ -124,19 +162,32 @@ class EgoReading(NamedTuple):
     lateral_speed : float
     heading_delta : float
     timestamp     : float
+    navi_left     : float = 0.0
+    navi_right    : float = 0.0
+
+    @property
+    def ego_motion(self) -> np.ndarray:
+        """Motion-only slice (EGO_MOTION_DIM,) — stored on disk as `ego_state`."""
+        return np.array([self.total_speed, self.last_steer, self.heading_delta], dtype=np.float32)
+
+    @property
+    def ego_nav(self) -> np.ndarray:
+        """Navigation-command slice (NAVI_DIM,) — stored separately as `navi_state`."""
+        return np.array([self.navi_left, self.navi_right], dtype=np.float32)
 
     @property
     def ego_model(self) -> np.ndarray:
-        """Return the (EGO_DIM,) array actually fed to the policy network."""
-        return np.array([self.total_speed, self.last_steer, self.heading_delta], dtype=np.float32)
+        """Full (EGO_DIM,) array fed to the policy network: motion ++ navigation."""
+        return np.concatenate([self.ego_motion, self.ego_nav]).astype(np.float32)
 
 
 def extract_ego_state(agent, last_steer: float = 0.0) -> EgoReading:
     """
     Build a full EgoReading snapshot from a MetaDrive agent.
 
-    Model input  →  ego_reading.ego_model  →  [total_speed, last_steer]
-    Logged only  →  forward_speed, lateral_speed, heading_delta, timestamp
+    Model input  →  ego_reading.ego_model  →  [total_speed, last_steer,
+                    heading_delta, navi_left, navi_right]
+    Logged only  →  forward_speed, lateral_speed, timestamp
     """
     timestamp = time.time()
 
@@ -152,6 +203,8 @@ def extract_ego_state(agent, last_steer: float = 0.0) -> EgoReading:
     heading_delta   = (heading_delta + np.pi) % (2 * np.pi) - np.pi
     agent._prev_heading = current_heading
 
+    navi_left, navi_right = navigation_command_onehot(agent)
+
     return EgoReading(
         total_speed   = float(np.clip(total_speed_raw / 30.0, 0.0, 1.0)),
         last_steer    = float(np.clip(last_steer,             -1.0, 1.0)),
@@ -159,6 +212,8 @@ def extract_ego_state(agent, last_steer: float = 0.0) -> EgoReading:
         lateral_speed = float(np.clip(spd_lat / 30.0,         -1.0, 1.0)),
         heading_delta = float(np.clip(heading_delta / 0.3,    -1.0, 1.0)),
         timestamp     = timestamp,
+        navi_left     = navi_left,
+        navi_right    = navi_right,
     )
 
 # ============================================================
@@ -172,7 +227,7 @@ class DrivingPolicyNet(nn.Module):
     Ego stream     : MLP on EGO_DIM ego-state vector →  32-d feature
     Fusion head    : Linear(544 → 2)  →  [steer, accel]
 
-    Ego input: [total_speed, last_steer]
+    Ego input (EGO_DIM=5): [total_speed, last_steer, heading_delta, navi_left, navi_right]
     """
 
     def __init__(self, in_channels: int = 4, out_dim: int = 2, ego_dim: int = EGO_DIM, p: float = 0.2, image_size: int = None):

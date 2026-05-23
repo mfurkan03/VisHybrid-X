@@ -47,8 +47,18 @@ def _worker_collect(
     save_every_n=20,
     poster_path=None,
 ):
-    """Worker process that handles a subset of the total episodes."""
-    
+    """
+    Worker process that handles a subset of the total episodes.
+
+    Navigation is collected in the SAME loop that captures the images (the only
+    reliable way — MetaDrive episodes are not reproducible across runs, so a
+    separate replay pass would misalign nav with the saved frames) and written
+    to its OWN folder <save_dir>/nav/<split>/episode_N.npz, which holds only
+    navi_state — no RGB/depth. This keeps navigation a separate, self-contained
+    data type that the depth-precompute step ignores and the dataset loader
+    joins back by episode filename.
+    """
+
     angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(num_cameras)
 
     # Calculate global splits
@@ -106,6 +116,7 @@ def _worker_collect(
         actions          = []
         ego_states       = []
         ego_states_full  = []
+        navi_states      = []
         frame_timestamps = []
         last_steer       = 0.0
 
@@ -125,7 +136,8 @@ def _worker_collect(
 
             save_this_frame = (ep_steps % save_every_n == 0)
             if save_this_frame:
-                ego_states.append(reading.ego_model)
+                ego_states.append(reading.ego_motion)   # 3-dim motion only (nav kept separate)
+                navi_states.append(reading.ego_nav)     # 2-dim [navi_left, navi_right]
                 ego_states_full.append([
                     reading.total_speed,
                     reading.last_steer,
@@ -170,7 +182,23 @@ def _worker_collect(
                 if quit_requested:
                     done = True
 
-        # Build and save episode
+        # ── Navigation episode (always saved, to the SEPARATE nav/ folder) ──────
+        nav_dict = {
+            "navi_state":       np.array(navi_states,      dtype=np.float32),  # (N, NAVI_DIM)
+            "frame_timestamps": np.array(frame_timestamps, dtype=np.float64),
+        }
+        nav_path = os.path.join(save_dir, "nav", current_split, f"episode_{global_ep_id}.npz")
+
+        save_threads = []
+        nav_t = threading.Thread(
+            target=lambda p, d: np.savez_compressed(p, **d),
+            args=(nav_path, nav_dict),
+            daemon=True,
+        )
+        nav_t.start()
+        save_threads.append(nav_t)
+
+        # ── Main episode (RGB/depth/action/ego) ─────────────────────────────────
         save_dict = {
             "action":           np.array(actions),
             "ego_state":        np.array(ego_states,      dtype=np.float32),
@@ -180,23 +208,24 @@ def _worker_collect(
         for rgb_name in rgb_cam_names:
             depth_list = observations[f"{rgb_name}_depth"]
             rgb_list = observations[f"{rgb_name}_rgb"]
-            
+
             save_dict[f"{rgb_name}_depth"] = np.array(depth_list, dtype=np.float32)
             save_dict[f"{rgb_name}_rgb"] = np.array(rgb_list, dtype=np.uint8)
 
         save_path = os.path.join(save_dir, current_split, f"episode_{global_ep_id}.npz")
-        
-        # We can just save sequentially inside the worker, or keep the thread approach
-        t = threading.Thread(
+        main_t = threading.Thread(
             target=lambda p, d: np.savez_compressed(p, **d),
             args=(save_path, save_dict),
             daemon=True,
         )
-        t.start()
-        print(f"\n  --> [Worker {worker_id}] Saving Global Episode {global_ep_id} to '{current_split}'")
+        main_t.start()
+        save_threads.append(main_t)
+
+        print(f"\n  --> [Worker {worker_id}] Saving Global Episode {global_ep_id} to '{current_split}' (+ nav)")
 
         ep += 1
-        t.join() # Good practice to wait for save to finish before moving onto next heavy render
+        for t in save_threads:
+            t.join()  # wait for saves to finish before the next heavy render
 
     if visualize:
         import cv2
@@ -223,12 +252,14 @@ def collect_expert_data_parallel(
     save_every_n    = 20,
     poster_path     = None,
 ):
-    os.makedirs(os.path.join(save_dir, "train"), exist_ok=True)
-    os.makedirs(os.path.join(save_dir, "val"),   exist_ok=True)
-    os.makedirs(os.path.join(save_dir, "test"),  exist_ok=True)
+    # Navigation is written to a SEPARATE nav/ folder (only navi_state, no
+    # images) so it stays a self-contained data type in the pipeline.
+    for split in ("train", "val", "test"):
+        os.makedirs(os.path.join(save_dir, split), exist_ok=True)
+        os.makedirs(os.path.join(save_dir, "nav", split), exist_ok=True)
 
     mode_str = "GPU (CUDA)" if image_on_cuda else "CPU (NumPy)"
-    
+
     # Auto-disable visualization if running multiple workers
     if num_workers > 1 and visualize:
         print("\n[WARNING] Visualization is disabled because multiple workers are running.")
@@ -238,7 +269,7 @@ def collect_expert_data_parallel(
     print(f"  Parallel Processing : {num_workers} Workers")
     print(f"  Total Episodes  : {num_episodes}")
     print(f"  Processing Mode : {mode_str}")
-    print(f"  Saving to       : '{save_dir}' (Split into train/val/test)")
+    print(f"  Saving to       : '{save_dir}' (+ separate nav/ folder)")
     print(f"  Camera Count    : {num_cameras}")
     print(f"  Sim FPS         : {100 // decision_repeat} Hz  (decision_repeat={decision_repeat}, save_every_n={save_every_n})")
     print(f"{'='*55}\n")
@@ -317,10 +348,6 @@ if __name__ == "__main__":
         num_episodes  = args.episodes,
         num_workers   = args.num_workers,
         save_dir      = args.save_dir,
-
-
-
-
 
 
         

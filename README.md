@@ -32,7 +32,9 @@ Three architectures, selected with `--arch`:
 
 All networks accept a **4-channel input** (depth + RGB) at `image_size × image_size`, fuse a 512-d visual feature with a 32-d ego-state feature, and output `[steering, accel/brake]` ∈ [-1, 1].
 
-**Ego state (EGO_DIM=3):** `[total_speed, last_steer, heading_delta]`
+**Ego state (EGO_DIM=5):** `[total_speed, last_steer, heading_delta, navi_left, navi_right]`
+
+The last two are the high-level **turn command** (one-hot: forward = `[0,0]`, left = `[1,0]`, right = `[0,1]`), derived from `agent.navigation` — the conditional-imitation-learning signal that disambiguates which way to go at intersections (the camera alone cannot tell). On disk it is split into a 3-dim `ego_state` (motion) and a separate 2-dim `navi_state` (navigation), re-joined at training time. See [Step 1b](#step-1b--navigation-data-separate-folder).
 
 ### IL → RL Actor-Critic
 
@@ -100,15 +102,16 @@ python -c "import sys; sys.path.insert(0,'src'); from models import build_policy
 The fastest path to a working agent (~2 h on a modern GPU):
 
 ```bash
-# 1. Collect 50 expert episodes (~20 min)
+# 1. Collect 50 expert episodes (~20 min) — also writes the separate dataset/nav/ folder
 python src/generate_expert_dataset.py --episodes 50 --num_workers 4
+__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia python src/generate_expert_dataset.py --episodes 50 --num_workers 1
 
 # 2. Precompute depth cache (~10 min on GPU)
 python src/train_dpt.py --mode precompute --data_dir dataset --out_dir data/processed/dpt_pred
 
-# 3. Train IL policy for 20 epochs (~30–60 min)
+# 3. Train IL policy for 20 epochs (~30–60 min) — --nav_dir enables the navigation command
 python src/train_test_policy.py --mode train --epochs 20 \
-    --pred_dir data/processed/dpt_pred \
+    --pred_dir data/processed/dpt_pred --nav_dir dataset/nav \
     --model_path models/policy_model.pth --arch impala --image_size 84
 
 # 4. Watch it drive
@@ -132,6 +135,7 @@ Metadrive Autonomous/
 ├── src/
 ├── models/                    ← checkpoints go here
 ├── dataset/                   ← expert data (created in step 1)
+│   └── nav/                   ← navigation command, separate folder (created in step 1)
 ├── data/processed/dpt_pred/   ← depth cache (created in step 3)
 ├── Depth-Anything-V2/
 │   └── checkpoints/
@@ -151,6 +155,24 @@ python src/generate_expert_dataset.py --episodes 100 --image_on_cuda --num_worke
 ```
 
 Parallel workers drive MetaDrive with the built-in expert policy. Each episode takes 5–30 s. Output: `dataset/train/`, `val/`, `test/` as `.npz` files. 100 episodes ≈ 50–80k frames. Minimum for a smoke-test: 30 episodes.
+
+---
+
+### Step 1b — Navigation Data (separate folder)
+
+The same collection run **also** writes the high-level turn command to a separate
+folder `dataset/nav/{train,val,test}/episode_N.npz` (key `navi_state`, shape
+`(N, 2)` = `[navi_left, navi_right]`). It contains *only* navigation — no
+RGB/depth — so it stays a self-contained data type: the depth-precompute step
+ignores it, and the dataset loader re-joins it by episode filename via
+`--nav_dir`. No extra command is needed; it is produced in Step 1.
+
+> **Why it can't be collected on its own afterwards:** MetaDrive episodes are
+> not reproducible across runs (traffic and scenario cycling diverge), so a
+> separate replay pass would misalign nav with the saved frames. Navigation is
+> therefore captured *in the same pass* as the images. To add navigation to a
+> dataset collected before this feature existed, **re-collect** the dataset
+> (or train with `--nav_dir` omitted, which sets navigation to zeros = forward).
 
 ---
 
@@ -186,10 +208,16 @@ Runs DPT once on every frame and caches the result. Takes 10–30 min on GPU. Po
 
 ```bash
 python src/train_test_policy.py --mode train --epochs 30 \
-    --pred_dir data/processed/dpt_pred \
+    --pred_dir data/processed/dpt_pred --nav_dir dataset/nav \
     --model_path models/policy_model.pth \
     --arch impala --image_size 84
 ```
+
+`--nav_dir dataset/nav` feeds the navigation command into the policy (EGO_DIM=5).
+Omit it to train without navigation (the input falls back to zeros = forward), e.g.
+on a dataset collected before navigation existed. The console prints
+`[INFO] Navigation: from dataset/nav` (or `DISABLED (nav=zeros)`) and each split's
+loader reports `+nav (N episodes)` so you can confirm it was picked up.
 
 **What to watch:**
 ```
@@ -207,7 +235,7 @@ Checkpoints: `models/policy_model_best.pth` (lowest val loss — use this).
 python src/train_test_policy.py --mode finetune \
     --finetune_from models/policy_model_best.pth \
     --model_path models/policy_finetuned.pth \
-    --pred_dir data/processed/dpt_pred \
+    --pred_dir data/processed/dpt_pred --nav_dir dataset/nav \
     --epochs 10 --lr 2e-5 --freeze_backbone
 ```
 
@@ -218,7 +246,7 @@ python src/train_test_policy.py --mode finetune \
 ```bash
 python src/train_test_policy.py --mode test \
     --model_path models/policy_model_best.pth \
-    --pred_dir data/processed/dpt_pred
+    --pred_dir data/processed/dpt_pred --nav_dir dataset/nav
 ```
 
 Reports steering/accel MAE, direction accuracy, braking accuracy, Pearson correlation, p95 steering error, active/critical turn MAE, jitter ratio, and out-of-bounds rate. Good offline metrics don't guarantee good simulation — always do the live test too.
@@ -334,6 +362,7 @@ python ../src/test_simulation_policy.py \
 | `--arch` | — | `simple`, `impala`, or `impala_v2` |
 | `--image_size` | `84` | Input resolution |
 | `--pred_dir` | — | Path to precomputed depth cache |
+| `--nav_dir` | `None` | Path to the separate navigation folder (e.g. `dataset/nav`). Omit to disable navigation (input = zeros = forward) |
 | `--fully_masked_epochs` | — | Epochs with lane-only input before curriculum starts |
 | `--curriculum_epochs` | — | Epochs to blend from lane-only to full RGB |
 | `--freeze_backbone` | off | Freeze CNN during fine-tuning |

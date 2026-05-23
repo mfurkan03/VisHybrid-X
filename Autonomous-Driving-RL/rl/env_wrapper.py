@@ -307,8 +307,11 @@ class MetaDriveRLWrapper:
         steer    = float(self._prev_action[0])
         throttle = float(self._prev_action[1])
         speed, last_steer, heading_delta = (float(ego_np[i]) for i in range(3))
+        navi_left  = float(ego_np[3]) if ego_np.shape[0] > 3 else 0.0
+        navi_right = float(ego_np[4]) if ego_np.shape[0] > 4 else 0.0
+        nav_cmd = "LEFT" if navi_left else ("RIGHT" if navi_right else "FORWARD")
 
-        W, H = 400, 220
+        W, H = 400, 250
         panel = np.zeros((H, W, 3), dtype=np.uint8)
 
         def _bar(y, label, val, lo, hi, color):
@@ -325,6 +328,8 @@ class MetaDriveRLWrapper:
         _bar(110, "Speed(kph)",  speed,     0.0, 60.0, (255, 180,  50))
         _bar(150, "Heading Delta",   heading_delta, -1.0, 1.0, (200, 100, 255))
         _bar(190, "Last steer",  last_steer,    -1.0, 1.0, (100, 200, 255))
+        cv2.putText(panel, f"Nav cmd : {nav_cmd}", (10, 230),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 220, 255), 2)
 
         cv2.imshow("RL Info Panel", panel)
         cv2.waitKey(1)
