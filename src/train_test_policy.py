@@ -339,7 +339,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode",       type=str, required=True,
                         choices=["train", "finetune", "test", "all"])
-    parser.add_argument("--epochs",     type=int,   default=30)
+    parser.add_argument("--epochs",     type=int,   default=70)
     parser.add_argument("--data_dir",   type=str,   default="dataset")
     parser.add_argument("--dpt_path",   type=str,   default="models/dpt_finetuned.pth")
     parser.add_argument("--model_path", type=str,   default="models/policy_model.pth")
@@ -350,8 +350,8 @@ if __name__ == "__main__":
     parser.add_argument("--freeze_backbone", action="store_true")
     parser.add_argument("--reset_optimizer", action="store_true")
     parser.add_argument("--resume",          action="store_true")
-    parser.add_argument("--curriculum_epochs", type=int, default=10)
-    parser.add_argument("--fully_masked_epochs", type=int, default=3)
+    parser.add_argument("--curriculum_epochs", type=int, default=30)
+    parser.add_argument("--fully_masked_epochs", type=int, default=8)
     parser.add_argument("--image_size", type=int, default=84)
     parser.add_argument("--arch", type=str, default="simple", choices=["simple", "impala", "impala_v2"])
     parser.add_argument("--always_lane_masked", action="store_true",
