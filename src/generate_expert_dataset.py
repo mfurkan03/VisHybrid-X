@@ -22,10 +22,21 @@ from metadrive.component.map.base_map import BaseMap
 from metadrive.component.map.pg_map import MapGenerateMethod
 from metadrive.examples import expert
 
-from models import extract_ego_state, EGO_DIM
+from models import extract_ego_state, navigation_command_onehot, EGO_DIM
 from data.cameras import build_cameras, process_gpu, process_cpu
 from data.viewer import show_cameras
 from utils.fps import FPSCounter
+
+
+# MetaDrive's own info["navigation_command"] string → our (navi_left, navi_right)
+# one-hot. Used to validate that navigation_command_onehot() matches the
+# simulator's convention (catches a flipped left/right label).
+_MD_CMD_TO_ONEHOT = {
+    "forward": (0.0, 0.0),
+    "straight": (0.0, 0.0),
+    "left":    (1.0, 0.0),
+    "right":   (0.0, 1.0),
+}
 
 
 # ============================================================
@@ -92,6 +103,12 @@ def _worker_collect(
     fps_counter = FPSCounter(window=60)
     process_fn = process_gpu if image_on_cuda else process_cpu
     quit_requested = False
+
+    # Nav-label validation accumulators (compare our one-hot vs MetaDrive's
+    # own info["navigation_command"] over the whole worker run).
+    nav_key_present = 0   # steps where info exposed navigation_command
+    nav_recognized  = 0   # of those, value mapped to a known command
+    nav_mismatch    = 0   # of recognized, our one-hot disagreed
 
     ep = 0
     while ep < num_episodes:
@@ -162,6 +179,21 @@ def _worker_collect(
             if ep_steps >= 2500:
                 done = True
 
+            # --- Nav-label validation (read-only; does not alter saved data) ---
+            # Cross-check our computed turn command against MetaDrive's own
+            # post-step info["navigation_command"]. A non-zero mismatch rate on
+            # turns means the label is flipped/mis-decoded and CIL conditioning
+            # would train on wrong targets.
+            md_cmd = info.get("navigation_command", None)
+            if md_cmd is not None:
+                nav_key_present += 1
+                expected = _MD_CMD_TO_ONEHOT.get(str(md_cmd).lower())
+                if expected is not None:
+                    nav_recognized += 1
+                    ours = navigation_command_onehot(env.agent)
+                    if tuple(float(v) for v in ours) != expected:
+                        nav_mismatch += 1
+
             if fps_counter.total_steps % 100 == 0:
                 print(f"  [Worker {worker_id} | Ep {ep+1}/{num_episodes}] "
                       f"Step: {fps_counter.total_steps:5d}  |  "
@@ -222,7 +254,24 @@ def _worker_collect(
     if visualize:
         import cv2
         cv2.destroyAllWindows()
-        
+
+    # ── Nav-label validation summary ──────────────────────────────────────
+    if nav_key_present == 0:
+        print(f"\n  [Worker {worker_id}] [NAV-CHECK] info['navigation_command'] was never "
+              f"present — could not validate the turn label. The saved navi_state relies "
+              f"entirely on navigation_command_onehot(); verify it manually if conditioning "
+              f"fails.", flush=True)
+    elif nav_recognized == 0:
+        print(f"\n  [Worker {worker_id}] [NAV-CHECK] navigation_command was present but never "
+              f"matched a known value — extend _MD_CMD_TO_ONEHOT to validate.", flush=True)
+    else:
+        rate = nav_mismatch / nav_recognized * 100.0
+        verdict = "OK — labels agree with MetaDrive." if rate < 1.0 else \
+                  "MISMATCH — turn labels likely flipped/mis-decoded; fix before training!"
+        print(f"\n  [Worker {worker_id}] [NAV-CHECK] {nav_mismatch}/{nav_recognized} "
+              f"({rate:.2f}%) of recognized commands disagreed with our one-hot. {verdict}",
+              flush=True)
+
     env.close()
     return worker_id, fps_counter.total_steps
 

@@ -4,6 +4,7 @@ policy/trainer.py – shared epoch loop, data loader builder, and feature extrac
 
 import csv
 import os
+import sys
 import cv2
 
 import numpy as np
@@ -12,9 +13,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models import EGO_DIM
+# Progress bars spam ~30k carriage-return lines into redirected log files.
+# Show them only on an interactive terminal; suppress when piped to a file.
+_TQDM_DISABLE = not sys.stderr.isatty()
+
+from models import EGO_DIM, EGO_MOTION_DIM, NAVI_DIM
 from policy.datasets import MetaDriveRGBDataset, PrecomputedDepthDataset
-from policy.losses import (custom_driving_loss_beta, compute_offline_metrics,
+from policy.losses import (custom_driving_loss_beta, speed_steer_coupling_loss,
+                           compute_offline_metrics,
                            compute_predictive_metrics, compute_heading_metrics)
 from utils.checkpoints import save_checkpoint
 from utils.seed import worker_init_fn
@@ -107,6 +113,8 @@ def apply_augmentations(
     prob_pixel_noise: float = 1.0,
     prob_hflip: float = 0.5,
     prob_grayscale: float = 0.1,
+    prob_ego_noise: float = 0.0,
+    ego_noise_std: float = 0.05,
 ) -> tuple:
     """
     Per-sample stochastic augmentations applied to the combined (4, H, W) tensor.
@@ -155,6 +163,16 @@ def apply_augmentations(
             img[2] = gray
             img[3] = gray
 
+        # Ego state noise: perturb speed, last_steer, heading_delta to approximate
+        # off-ideal-line states the model needs to recover from in corners.
+        # Nav dims (indices 3, 4) are binary and left untouched.
+        if prob_ego_noise > 0.0 and np.random.random() < prob_ego_noise:
+            noise = np.random.normal(0.0, ego_noise_std, (3,)).astype(np.float32)
+            ego_out[i, :3] += noise
+            ego_out[i, 0]   = np.clip(ego_out[i, 0],  0.0,  1.0)   # speed ≥ 0
+            ego_out[i, 1]   = np.clip(ego_out[i, 1], -1.0,  1.0)   # last_steer
+            ego_out[i, 2]   = np.clip(ego_out[i, 2], -1.0,  1.0)   # heading_delta
+
         imgs[i] = img
 
     return torch.stack(imgs), actions_out, ego_out
@@ -194,8 +212,26 @@ def extract_features_frozen(
 # MODULE-LEVEL COLLATE FUNCTIONS  (must be at module level for
 # pickling when num_workers > 0 on Windows spawn)
 # ============================================================
+def _extract_navi(dataset, n: int) -> np.ndarray:
+    """
+    Best-effort (n, NAVI_DIM) nav one-hot from either dataset type.
+
+    PrecomputedDepthDataset keeps it in `navi_states`; MetaDriveRGBDataset
+    folds it into the last NAVI_DIM columns of the 5-dim `ego_states`.
+    Returns all-zeros if neither is present (older data without nav).
+    """
+    if hasattr(dataset, "navi_states") and len(dataset.navi_states):
+        return np.asarray(dataset.navi_states, dtype=np.float32)[:, :NAVI_DIM]
+    if hasattr(dataset, "ego_states") and len(dataset.ego_states):
+        ego = np.asarray(dataset.ego_states, dtype=np.float32)
+        if ego.shape[1] >= EGO_DIM:
+            return ego[:, EGO_MOTION_DIM:EGO_DIM]
+    return np.zeros((n, NAVI_DIM), dtype=np.float32)
+
+
 def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_estimator,
-                  seed: int = 0):
+                  seed: int = 0, nav_boost: float = 6.0, brake_boost: float = 1.0,
+                  turn_boost: float = 1.0):
     if use_precomputed:
         train_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="train")
         val_ds   = PrecomputedDepthDataset(pred_dir=pred_dir, split="val")
@@ -221,14 +257,76 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
 
     from torch.utils.data import WeightedRandomSampler
     actions_np = np.array(train_ds.actions)
+    if actions_np.ndim < 2 or len(actions_np) == 0:
+        raise RuntimeError(
+            f"Training dataset is empty (0 samples). "
+            f"If using --pred_dir, make sure the path contains a 'train/' subdirectory with .npz files. "
+            f"If using raw data, make sure --data_dir points to a directory with train/val/test splits."
+        )
     steer_mag  = np.abs(actions_np[:, 0])
 
+    # Base shaping by steering magnitude (straight / turning / intersection).
     bins        = np.digitize(steer_mag, [0.05, 0.2])  # 0: straight, 1: turning, 2: intersection
     bin_targets = {0: 0.48, 1: 0.45, 2: 0.05}
     weights     = np.zeros(len(steer_mag), dtype=np.float64)
     for b in np.unique(bins):
         mask          = bins == b
         weights[mask] = bin_targets[b] / mask.sum()
+
+    # --- P1: nav-aware boost ----------------------------------------------
+    # Intended to upsample RARE junction frames so the (navi_left, navi_right)
+    # command is seen often enough to be learnable.  This is only valid when the
+    # command is actually rare.  In practice navigation_command_onehot() fires
+    # on every curve (not just junctions), so on these maps it is active ~50% of
+    # frames — boosting it then just oversamples half the data and DESTROYS the
+    # straight/turn/intersection balance (measured: straight 49% → 38%), which
+    # hurts lane-keeping.  So we only boost when nav is genuinely rare, and warn
+    # otherwise instead of silently skewing the sampler.
+    NAV_RARE_MAX = 0.15   # above this fraction, nav is not a rare junction cue
+    navi       = _extract_navi(train_ds, len(steer_mag))
+    nav_active = np.abs(navi).sum(axis=1) > 0.5
+    nav_frac   = float(nav_active.mean())
+    n_l        = int((navi[:, 0] > 0.5).sum())
+    n_r        = int((navi[:, 1] > 0.5).sum())
+    if nav_boost > 1.0 and nav_active.any() and nav_frac <= NAV_RARE_MAX:
+        weights[nav_active] *= nav_boost
+        share = weights[nav_active].sum() / weights.sum() * 100.0
+        print(f"[INFO] Nav-aware sampler: {int(nav_active.sum())}/{len(weights)} junction "
+              f"frames (L={n_l}, R={n_r}, {nav_frac*100:.1f}% of data) boosted {nav_boost:g}x "
+              f"→ ~{share:.1f}% of sampled batches.")
+        if n_l == 0 or n_r == 0:
+            print("[WARNING] Nav-aware sampler: only one turn direction is present in the "
+                  "data — labels may be wrong or the route set is unbalanced.")
+    elif nav_boost > 1.0 and nav_frac > NAV_RARE_MAX:
+        print(f"[INFO] Nav-aware sampler: nav command active in {nav_frac*100:.1f}% of frames "
+              f"(L={n_l}, R={n_r}) — NOT a rare junction cue (expected <{NAV_RARE_MAX*100:.0f}%). "
+              f"Skipping nav_boost to preserve the steer-magnitude balance; the command is "
+              f"already well-represented for conditioning.")
+    elif nav_boost > 1.0:
+        print("[WARNING] Nav-aware sampler: navi_state is all-zero — no junction frames to "
+              "boost. Conditioning on navigation cannot work until navi_state is recorded "
+              "during collection. Skipping nav boost.")
+
+    # --- Turn-aware boost --------------------------------------------------
+    # Upsample sharp-turn frames (|steer| >= 0.2) so the loss gradient
+    # on corners isn't washed out by straight-line majority.
+    sharp_mask = steer_mag >= 0.2
+    if turn_boost > 1.0 and sharp_mask.any():
+        weights[sharp_mask] *= turn_boost
+        share = weights[sharp_mask].sum() / weights.sum() * 100.0
+        print(f"[INFO] Turn-boost sampler: {int(sharp_mask.sum())}/{len(weights)} sharp-turn "
+              f"frames (|steer|≥0.2) boosted {turn_boost:g}x → ~{share:.1f}% of sampled batches.")
+
+    # --- P2 (code-only): brake-aware boost --------------------------------
+    # Braking (accel < -0.1) is rare relative to constant forward-rolling, so
+    # upsample decelerations to keep proximity-braking examples from being
+    # washed out.  Junction frames that are also braking get both boosts.
+    brake_active = actions_np[:, 1] < -0.1
+    if brake_boost > 1.0 and brake_active.any():
+        weights[brake_active] *= brake_boost
+        share = weights[brake_active].sum() / weights.sum() * 100.0
+        print(f"[INFO] Brake-aware sampler: {int(brake_active.sum())}/{len(weights)} braking "
+              f"frames boosted {brake_boost:g}x → ~{share:.1f}% of sampled batches.")
 
     sampler = WeightedRandomSampler(
         torch.tensor(weights, dtype=torch.float64),
@@ -249,17 +347,21 @@ def run_epoch(policy_model, loader, optimizer, device,
               use_precomputed, depth_estimator, is_train, desc,
               current_epoch: int = 999, curriculum_epochs: int = 10, fully_masked_epochs: int = 3,
               image_size: int = None, always_lane_masked: bool = False,
-              prob_pixel_noise: float = 0.0, prob_hflip: float = 0.0, prob_grayscale: float = 0.0):
+              prob_pixel_noise: float = 0.0, prob_hflip: float = 0.0, prob_grayscale: float = 0.0,
+              prob_ego_noise: float = 0.0, ego_noise_std: float = 0.05,
+              coupling_weight: float = 0.0, coupling_steer_threshold: float = 0.3,
+              turn_weight_scale: float = 1.5):
     """Run one training or validation epoch. Returns (avg_loss, preds, trues, ego_states, ego_fulls)."""
     policy_model.train() if is_train else policy_model.eval()
     total_loss                           = 0.0
+    total_coupling                       = 0.0
     all_pred, all_true, all_ego, all_ego_full = [], [], [], []
 
     aug_active = is_train and current_epoch >= fully_masked_epochs
 
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     with ctx:
-        for batch in tqdm(loader, desc=desc, leave=False):
+        for batch in tqdm(loader, desc=desc, leave=False, disable=_TQDM_DISABLE):
             if use_precomputed:
                 depth_t, rgb_np, actions_np, ego_np, ego_full_np = batch
                 depth_t  = depth_t.to(device)
@@ -288,6 +390,8 @@ def run_epoch(policy_model, loader, optimizer, device,
                     prob_pixel_noise=prob_pixel_noise,
                     prob_hflip=prob_hflip,
                     prob_grayscale=prob_grayscale,
+                    prob_ego_noise=prob_ego_noise,
+                    ego_noise_std=ego_noise_std,
                 )
 
             actions_t  = torch.tensor(actions_np, dtype=torch.float32, device=device)
@@ -299,7 +403,15 @@ def run_epoch(policy_model, loader, optimizer, device,
                 optimizer.zero_grad()
 
             pred_alpha, pred_beta = policy_model(combined, ego_t)
-            loss = custom_driving_loss_beta(pred_alpha, pred_beta, actions_01)
+            loss = custom_driving_loss_beta(pred_alpha, pred_beta, actions_01,
+                                            turn_weight_scale=turn_weight_scale)
+
+            # P3: discourage accelerating through sharp predicted turns.
+            if coupling_weight > 0.0:
+                coupling = speed_steer_coupling_loss(
+                    pred_alpha, pred_beta, steer_threshold=coupling_steer_threshold)
+                loss = loss + coupling_weight * coupling
+                total_coupling += float(coupling.item())
 
             if is_train:
                 loss.backward()
@@ -315,6 +427,9 @@ def run_epoch(policy_model, loader, optimizer, device,
             all_ego_full.append(ego_full_np)
 
     avg_loss = total_loss / max(len(loader), 1)
+    if coupling_weight > 0.0 and is_train:
+        print(f"         [COUPLE] mean steer/throttle penalty: "
+              f"{total_coupling / max(len(loader), 1):.5f}  (weight {coupling_weight:g})")
     if not all_pred:
         empty = np.zeros((0, 2), dtype=np.float32)
         return avg_loss, empty, empty, np.zeros((0, EGO_DIM), dtype=np.float32), np.zeros((0, 5), dtype=np.float32)
@@ -349,6 +464,11 @@ def train_loop(
     prob_pixel_noise: float = 0.0,
     prob_hflip: float = 0.0,
     prob_grayscale: float = 0.0,
+    prob_ego_noise: float = 0.0,
+    ego_noise_std: float = 0.05,
+    coupling_weight: float = 0.0,
+    coupling_steer_threshold: float = 0.3,
+    turn_weight_scale: float = 1.5,
 ) -> float:
     """Shared epoch loop used by train_policy and finetune_policy."""
     file_root, file_ext = os.path.splitext(model_path)
@@ -387,6 +507,11 @@ def train_loop(
             prob_pixel_noise=prob_pixel_noise,
             prob_hflip=prob_hflip,
             prob_grayscale=prob_grayscale,
+            prob_ego_noise=prob_ego_noise,
+            ego_noise_std=ego_noise_std,
+            coupling_weight=coupling_weight,
+            coupling_steer_threshold=coupling_steer_threshold,
+            turn_weight_scale=turn_weight_scale,
         )
         avg_val, val_pred, val_true, val_ego, val_ego_full = run_epoch(
             policy_model, val_loader, optimizer, device,
@@ -397,6 +522,9 @@ def train_loop(
             fully_masked_epochs=fully_masked_epochs,
             image_size=image_size,
             always_lane_masked=always_lane_masked,
+            coupling_weight=coupling_weight,
+            coupling_steer_threshold=coupling_steer_threshold,
+            turn_weight_scale=turn_weight_scale,
         )
 
         tr_m   = compute_offline_metrics(tr_pred, tr_true)

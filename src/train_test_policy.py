@@ -28,6 +28,7 @@ python src/train_test_policy.py --mode test \
 import argparse
 import math
 import os
+import sys
 
 BENCHMARK_SEEDS = [0, 1, 2, 3, 4]
 
@@ -89,6 +90,14 @@ def train_policy(
     prob_pixel_noise: float = 1.0,
     prob_hflip: float = 0.5,
     prob_grayscale: float = 0.1,
+    nav_boost: float = 6.0,
+    brake_boost: float = 1.0,
+    turn_boost: float = 1.0,
+    coupling_weight: float = 0.0,
+    coupling_steer_threshold: float = 0.3,
+    prob_ego_noise: float = 0.0,
+    ego_noise_std: float = 0.05,
+    turn_weight_scale: float = 1.5,
 ):
     print("--- Phase 2: Training Driving Policy (from scratch) ---")
     seed_everything(seed)
@@ -98,7 +107,9 @@ def train_policy(
     depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path)
 
     print(f"[INFO] {'Using PRECOMPUTED DPT from: ' + pred_dir if use_precomputed else 'Live DPT inference.'}")
-    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator, seed=seed)
+    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator,
+                                             seed=seed, nav_boost=nav_boost, brake_boost=brake_boost,
+                                             turn_boost=turn_boost)
 
     policy_model = build_policy(arch, image_size).to(device)
     optimizer    = optim.AdamW(policy_model.parameters(), lr=lr)
@@ -119,6 +130,11 @@ def train_policy(
         prob_pixel_noise=prob_pixel_noise,
         prob_hflip=prob_hflip,
         prob_grayscale=prob_grayscale,
+        prob_ego_noise=prob_ego_noise,
+        ego_noise_std=ego_noise_std,
+        coupling_weight=coupling_weight,
+        coupling_steer_threshold=coupling_steer_threshold,
+        turn_weight_scale=turn_weight_scale,
     )
 
 
@@ -148,6 +164,14 @@ def finetune_policy(
     prob_pixel_noise: float = 1.0,
     prob_hflip: float = 0.5,
     prob_grayscale: float = 0.1,
+    nav_boost: float = 6.0,
+    brake_boost: float = 1.0,
+    turn_boost: float = 1.0,
+    coupling_weight: float = 0.0,
+    coupling_steer_threshold: float = 0.3,
+    prob_ego_noise: float = 0.0,
+    ego_noise_std: float = 0.05,
+    turn_weight_scale: float = 1.5,
 ):
     """
     Fine-tune (or resume) a previously saved policy model.
@@ -167,7 +191,9 @@ def finetune_policy(
     use_precomputed = pred_dir is not None and os.path.isdir(os.path.join(pred_dir, "train"))
     depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path)
 
-    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator, seed=seed)
+    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator,
+                                             seed=seed, nav_boost=nav_boost, brake_boost=brake_boost,
+                                             turn_boost=turn_boost)
 
     policy_model = build_policy(arch, image_size).to(device)
     if freeze_bb:
@@ -208,6 +234,11 @@ def finetune_policy(
         prob_pixel_noise=prob_pixel_noise,
         prob_hflip=prob_hflip,
         prob_grayscale=prob_grayscale,
+        prob_ego_noise=prob_ego_noise,
+        ego_noise_std=ego_noise_std,
+        coupling_weight=coupling_weight,
+        coupling_steer_threshold=coupling_steer_threshold,
+        turn_weight_scale=turn_weight_scale,
     )
 
 
@@ -271,7 +302,7 @@ def test_policy(
     test_pred, test_true, test_ego, test_ego_full = [], [], [], []
 
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Testing"):
+        for batch in tqdm(test_loader, desc="Testing", disable=not sys.stderr.isatty()):
             if use_precomputed:
                 depth_t, rgb_np, actions_np, ego_np, ego_full_np = batch
                 depth_t   = depth_t.to(device)
@@ -370,6 +401,46 @@ if __name__ == "__main__":
                         help="Probability [0-1] of horizontal flip per sample; negates steer and heading_delta (0=off)")
     parser.add_argument("--aug_grayscale", type=float, default=0.1,
                         help="Probability [0-1] of converting RGB to grayscale per sample (0=off)")
+    # P1 sampler boosts (1.0 = disabled)
+    parser.add_argument("--nav_boost", type=float, default=6.0,
+                        help="Multiplicative sampling boost for junction frames where the nav "
+                             "command is active, so navigation conditioning is actually learned "
+                             "(1.0=off)")
+    parser.add_argument("--brake_boost", type=float, default=1.0,
+                        help="Multiplicative sampling boost for braking frames (accel < -0.1). "
+                             "OFF by default (1.0): it STACKS multiplicatively with the loss's "
+                             "existing 3x brake weight, so e.g. 3.0 here gives ~9x braking "
+                             "emphasis and starves the throttle head. Raise only if you also "
+                             "lower the brake_weight in custom_driving_loss_beta.")
+    # Option-3 turn / ego-noise improvements
+    parser.add_argument("--turn_boost", type=float, default=1.0,
+                        help="Multiplicative sampling boost for sharp-turn frames (|steer|>=0.2). "
+                             "Recommended: 3.0. Raises their share of sampled batches so the loss "
+                             "gradient on corners is not washed out by straight-line majority. "
+                             "(1.0=off, no change to sampler)")
+    parser.add_argument("--aug_ego_noise", type=float, default=0.0,
+                        help="Probability [0-1] of adding Gaussian noise to the ego state "
+                             "(speed, last_steer, heading_delta) per sample during training. "
+                             "Approximates off-ideal-line recovery states without new data. "
+                             "Recommended: 0.8  (0.0=off)")
+    parser.add_argument("--ego_noise_std", type=float, default=0.05,
+                        help="Std-dev of Gaussian noise added to continuous ego dims when "
+                             "--aug_ego_noise > 0.  0.05 ≈ 5%% of the normalised range.")
+    parser.add_argument("--turn_weight_scale", type=float, default=1.5,
+                        help="Multiplier on the steer-magnitude term inside the Beta-NLL loss. "
+                             "Default 1.5 → max 2.5x weight on full-lock turns. "
+                             "Raise to 3.0 for stronger turn emphasis (max 4x). "
+                             "Does not affect braking weight.")
+    # P3 speed/steer coupling — OFF by default (0.0).
+    parser.add_argument("--coupling_weight", type=float, default=0.0,
+                        help="Weight of the speed/steer coupling penalty that discourages "
+                             "accelerating through sharp predicted turns. OFF by default: the "
+                             "MetaDrive IDM expert MAINTAINS throttle through turns, so this "
+                             "penalty fights imitation and collapses turn-throttle to ~0, making "
+                             "the car coast to a stop at every curve. Enable only with an expert "
+                             "that actually decelerates for turns.")
+    parser.add_argument("--coupling_steer_threshold", type=float, default=0.3,
+                        help="|steer| above which the coupling penalty starts applying (in [0,1])")
     args = parser.parse_args()
 
     seeds = BENCHMARK_SEEDS if args.benchmark else [args.seed]
@@ -393,7 +464,15 @@ if __name__ == "__main__":
                          seed=seed,
                          prob_pixel_noise=args.aug_pixel_noise,
                          prob_hflip=args.aug_hflip,
-                         prob_grayscale=args.aug_grayscale)
+                         prob_grayscale=args.aug_grayscale,
+                         nav_boost=args.nav_boost,
+                         brake_boost=args.brake_boost,
+                         turn_boost=args.turn_boost,
+                         coupling_weight=args.coupling_weight,
+                         coupling_steer_threshold=args.coupling_steer_threshold,
+                         prob_ego_noise=args.aug_ego_noise,
+                         ego_noise_std=args.ego_noise_std,
+                         turn_weight_scale=args.turn_weight_scale)
 
     if args.mode == "finetune":
         if args.finetune_from is None:
@@ -425,6 +504,14 @@ if __name__ == "__main__":
                 prob_pixel_noise=args.aug_pixel_noise,
                 prob_hflip=args.aug_hflip,
                 prob_grayscale=args.aug_grayscale,
+                nav_boost=args.nav_boost,
+                brake_boost=args.brake_boost,
+                turn_boost=args.turn_boost,
+                coupling_weight=args.coupling_weight,
+                coupling_steer_threshold=args.coupling_steer_threshold,
+                prob_ego_noise=args.aug_ego_noise,
+                ego_noise_std=args.ego_noise_std,
+                turn_weight_scale=args.turn_weight_scale,
             )
 
     if args.mode in ("test", "all"):

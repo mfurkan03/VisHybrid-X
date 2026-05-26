@@ -10,6 +10,8 @@ python src/test_simulation_policy.py \
 """
 
 import argparse
+import json
+import os
 import time
 
 import cv2
@@ -41,6 +43,10 @@ def run_simulation(
     steer_momentum:     float = 0.0,
     no_render:          bool  = False,
     max_steps:          int   = 1000,
+    decision_repeat:    int   = 5,
+    log_path:           str   = None,
+    start_seed:         int   = 316181,
+    map_config:         str   = None,
 ):
     print("--- Online Evaluation (Simulation) ---")
     seed_everything(seed)
@@ -76,7 +82,6 @@ def run_simulation(
     angles, sensors, rgb_cam_names, _ = build_cameras(1)
     rgb_name = rgb_cam_names[0]
 
-    start_seed = 316181
     config = {
         "use_render":        not no_render,
         "image_observation": True,
@@ -87,13 +92,37 @@ def run_simulation(
         "start_seed":        start_seed,
         "num_scenarios":     num_episodes,
         "horizon":           max_steps,
-        "traffic_density": 0.15
+        "decision_repeat":   decision_repeat,   # MUST match the value used in generate_expert_dataset.py
+        "traffic_density":   0.15,
     }
+    if map_config is not None:
+        # Override procedural map with a fixed block-string layout.
+        # Each char is a block type: S=Straight, C=Curve, T=TIntersection, X=XIntersection
+        # Example: "SXTXSX" → straight, X-intersection, T-intersection repeated
+        config["map"] = map_config
+        # map_config overrides start_seed-based generation; num_scenarios still controls resets
+        print(f"[INFO] Using fixed map layout: '{map_config}' (overrides seed-based generation)")
+    print(f"[INFO] decision_repeat = {decision_repeat} (physics steps per action). "
+          f"This MUST match data collection or the last_steer/heading feedback is miscalibrated.")
     env = MetaDriveEnv(config)
 
     success_flags, route_completions = [], []
     out_of_roads, crash_vehicles, crash_objects = [], [], []
     survival_times, average_speeds, jitter_rates, safety_scores = [], [], [], []
+
+    log_data: dict = {
+        "config": {
+            "arch": arch,
+            "model_path": model_path,
+            "dpt_path": dpt_path,
+            "seed": seed,
+            "decision_repeat": decision_repeat,
+            "max_steps": max_steps,
+            "steer_momentum": steer_momentum,
+            "always_lane_masked": always_lane_masked,
+        },
+        "episodes": [],
+    }
 
     for ep in range(num_episodes):
         obs, info  = env.reset(seed=start_seed + ep)
@@ -106,6 +135,8 @@ def run_simulation(
         steers      = []
         stuck_steps = 0
         stuck       = False
+
+        step_log: list = []
 
         while not done:
             step_count += 1
@@ -190,6 +221,19 @@ def run_simulation(
             if not done:
                 speeds.append(ego_reading.total_speed)
 
+            if log_path:
+                step_log.append({
+                    "step":          step_count,
+                    "steer":         round(float(pred_action[0]), 4),
+                    "throttle":      round(float(pred_action[1]), 4),
+                    "speed":         round(float(ego_reading.total_speed), 4),
+                    "heading_delta": round(float(ego_reading.heading_delta), 4),
+                    "last_steer":    round(float(ego_reading.last_steer), 4),
+                    "navi_left":     bool(ego_reading.navi_left),
+                    "navi_right":    bool(ego_reading.navi_right),
+                    "reward":        round(float(reward), 4),
+                })
+
             cur_time  = time.time()
             elapsed   = cur_time - last_time
             last_time = cur_time
@@ -228,19 +272,54 @@ def run_simulation(
               f"Jitter: {jitter_rates[-1]:.4f} | "
               f"Safety: {safety_scores[-1]*100:.1f}%")
 
+        if log_path:
+            log_data["episodes"].append({
+                "episode":        ep + 1,
+                "termination":    reason,
+                "success":        bool(success_flags[-1]),
+                "route_pct":      round(route_completions[-1] * 100, 2),
+                "avg_speed":      round(average_speeds[-1], 4),
+                "jitter":         round(jitter_rates[-1], 4),
+                "safety_score":   round(safety_scores[-1], 4),
+                "survival_steps": step_count,
+                "out_of_road":    bool(out_of_roads[-1]),
+                "crash_vehicle":  bool(crash_vehicles[-1]),
+                "crash_object":   bool(crash_objects[-1]),
+                "steps":          step_log,
+            })
+
+    summary = {
+        "success_rate_pct":    round(float(np.mean(success_flags)) * 100, 2),
+        "route_completion_pct": round(float(np.mean(route_completions)) * 100, 2),
+        "out_of_road_rate_pct": round(float(np.mean(out_of_roads)) * 100, 2),
+        "crash_vehicle_rate_pct": round(float(np.mean(crash_vehicles)) * 100, 2),
+        "crash_object_rate_pct":  round(float(np.mean(crash_objects)) * 100, 2),
+        "avg_survival_steps":  round(float(np.mean(survival_times)), 2),
+        "avg_driving_speed":   round(float(np.mean(average_speeds)), 4),
+        "avg_steering_jitter": round(float(np.mean(jitter_rates)), 4),
+        "safe_driving_score_pct": round(float(np.mean(safety_scores)) * 100, 2),
+    }
     print(
         f"\n=== ONLINE SUMMARY ===\n"
-        f"Success Rate:         {np.mean(success_flags)*100:.1f}%\n"
-        f"Route Completion:     {np.mean(route_completions)*100:.1f}%\n"
-        f"Out of Road Rate:     {np.mean(out_of_roads)*100:.1f}%\n"
-        f"Crash Vehicle Rate:   {np.mean(crash_vehicles)*100:.1f}%\n"
-        f"Crash Object Rate:    {np.mean(crash_objects)*100:.1f}%\n"
-        f"Avg Survival Time:    {np.mean(survival_times):.1f} steps\n"
-        f"Avg Driving Speed:    {np.mean(average_speeds):.2f}\n"
-        f"Avg Steering Jitter:  {np.mean(jitter_rates):.4f}\n"
-        f"Safe Driving Score:   {np.mean(safety_scores)*100:.1f}%  "
+        f"Success Rate:         {summary['success_rate_pct']:.1f}%\n"
+        f"Route Completion:     {summary['route_completion_pct']:.1f}%\n"
+        f"Out of Road Rate:     {summary['out_of_road_rate_pct']:.1f}%\n"
+        f"Crash Vehicle Rate:   {summary['crash_vehicle_rate_pct']:.1f}%\n"
+        f"Crash Object Rate:    {summary['crash_object_rate_pct']:.1f}%\n"
+        f"Avg Survival Time:    {summary['avg_survival_steps']:.1f} steps\n"
+        f"Avg Driving Speed:    {summary['avg_driving_speed']:.2f}\n"
+        f"Avg Steering Jitter:  {summary['avg_steering_jitter']:.4f}\n"
+        f"Safe Driving Score:   {summary['safe_driving_score_pct']:.1f}%  "
         f"(35% collision-free + 35% road-adherence + 30% steering-smoothness)"
     )
+
+    if log_path:
+        log_data["summary"] = summary
+        os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+        with open(log_path, "w") as f:
+            json.dump(log_data, f, indent=2)
+        print(f"\n[LOG] Saved simulation log → {log_path}")
+
     env.close()
     if not no_render:
         cv2.destroyAllWindows()
@@ -268,6 +347,21 @@ if __name__ == "__main__":
     parser.add_argument("--max_steps", type=int, default=1000,
                         help="Hard episode step limit (MetaDrive horizon). "
                              "Episodes also end early if speed < 1 km/h for 150 consecutive steps.")
+    parser.add_argument("--decision_repeat", type=int, default=5,
+                        help="Physics steps per action. MUST match the value used during data "
+                             "collection (generate_expert_dataset.py). A mismatch miscalibrates "
+                             "the last_steer/heading_delta feedback and causes a slow steering weave.")
+    parser.add_argument("--log_path", type=str, default=None,
+                        help="If set, save a JSON log of every step and episode summary to this path. "
+                             "Example: logs/sim_run.json")
+    parser.add_argument("--start_seed", type=int, default=316181,
+                        help="MetaDrive scenario start seed. Episode i uses seed start_seed+i. "
+                             "Use find_curvy_seeds.py to discover seeds with lots of turns.")
+    parser.add_argument("--map", type=str, default=None, dest="map_config",
+                        help="Fixed map block string, e.g. 'SXTXSX'. "
+                             "S=Straight C=Curve T=TIntersection X=XIntersection. "
+                             "Overrides seed-based procedural generation. "
+                             "Recommended for 90-degree turn testing: 'STSTXTXTXT'")
     args = parser.parse_args()
     if args.arch != "expert" and args.model_path is None:
         parser.error("--model_path is required unless --arch expert")
@@ -283,4 +377,8 @@ if __name__ == "__main__":
         steer_momentum      = args.steer_momentum,
         no_render           = args.no_render,
         max_steps           = args.max_steps,
+        decision_repeat     = args.decision_repeat,
+        log_path            = args.log_path,
+        start_seed          = args.start_seed,
+        map_config          = args.map_config,
     )

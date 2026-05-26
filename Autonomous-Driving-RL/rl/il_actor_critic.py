@@ -41,14 +41,15 @@ class ILActorCritic(nn.Module):
     """
     PPO actor-critic that uses an IL backbone for feature extraction.
 
-    The IL backbone exposes a 544-d merged feature (512 visual + 32 ego)
-    via forward(..., return_features=True).  Its distribution heads
+    The IL backbone exposes a merged feature (512 visual + ego-encoder out_dim,
+    = 560 with the dedicated nav branch; read from il_model.merged_dim) via
+    forward(..., return_features=True).  Its distribution heads
     (steer_alpha_head, steer_beta_head, throttle_mu_head, throttle_nu_head)
     are reused directly — they carry trained IL weights and are fine-tuned
     during RL at backbone_lr.
 
     ILActorCritic adds only:
-      value_head : Linear(544 → 128 → ReLU → 1) — new, random init (RL critic)
+      value_head : Linear(merged_dim → 128 → ReLU → 1) — new, random init (RL critic)
 
     Actions are sampled from Beta(α, β) ∈ (0, 1) and scaled to [-1, 1]
     before being sent to the environment.  The buffer stores the raw [0, 1]
@@ -62,16 +63,23 @@ class ILActorCritic(nn.Module):
     yielding std ≈ 0.5 in [-1, 1] — too noisy for consistent forward motion.
     """
 
-    MERGED_DIM = 544  # 512 (visual) + 32 (ego) — fixed across all IL archs
+    MERGED_DIM = 544  # legacy fallback only; the real size is read from
+                      # il_model.merged_dim (512 visual + ego-encoder out_dim).
+                      # With the dedicated nav branch the ego encoder emits 48,
+                      # so current backbones report merged_dim = 560.
     CONCENTRATION_SCALE = 1.0  # tighter distribution; mean unchanged, std / sqrt(3)
 
     def __init__(self, il_model: nn.Module):
         super().__init__()
         self.il_model = il_model
 
+        # Read the backbone's actual fused-feature width.  Older checkpoints
+        # without the attribute fall back to 544 (pre-nav-branch architecture).
+        merged_dim = getattr(il_model, "merged_dim", self.MERGED_DIM)
+
         # Only new head — not present in IL checkpoints, starts from random init.
         self.value_head = nn.Sequential(
-            nn.Linear(self.MERGED_DIM, 128),
+            nn.Linear(merged_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 1),
         )

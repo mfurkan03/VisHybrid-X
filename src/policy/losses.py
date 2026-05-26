@@ -9,7 +9,12 @@ from scipy.stats import pearsonr
 from torch.distributions import Beta
 
 
-def custom_driving_loss_beta(alpha: torch.Tensor, beta: torch.Tensor, target_01: torch.Tensor) -> torch.Tensor:
+def custom_driving_loss_beta(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    target_01: torch.Tensor,
+    turn_weight_scale: float = 1.5,
+) -> torch.Tensor:
     """
     NLL loss for Beta-distributed policy output.
 
@@ -17,8 +22,12 @@ def custom_driving_loss_beta(alpha: torch.Tensor, beta: torch.Tensor, target_01:
     target_01   : (B, 2) expert actions mapped to [0, 1]
 
     Weighted the same way as the original smooth-L1 loss:
-      - Turn weight : proportional to |steer| magnitude
+      - Turn weight : proportional to |steer| magnitude, scaled by turn_weight_scale
       - 2× weight on braking events (accel_01 < 0.45 ↔ accel < -0.1)
+
+    turn_weight_scale: multiplier on the steer-magnitude penalty term.
+      Default 1.5 → max 2.5× on full lock.
+      Raise to 3.0 to double turn emphasis (max 4×) when the model under-steers in corners.
     """
     # Clip to (0.01, 0.99) — not just 1e-6.  Expert actions occasionally exceed
     # [-1,1] (MetaDrive raw output); after (a+1)/2 mapping they land outside [0,1]
@@ -31,7 +40,7 @@ def custom_driving_loss_beta(alpha: torch.Tensor, beta: torch.Tensor, target_01:
     nll  = -dist.log_prob(t)                              # (B, 2), positive
 
     steer_mag   = (t[:, 0] - 0.5).abs() * 2.0            # |steer| in [0,1]
-    turn_weight = 1.0 + 1.5 * steer_mag
+    turn_weight = 1.0 + turn_weight_scale * steer_mag
     weighted    = nll.clone()
     weighted[:, 0] = nll[:, 0] * turn_weight
 
@@ -39,6 +48,50 @@ def custom_driving_loss_beta(alpha: torch.Tensor, beta: torch.Tensor, target_01:
     weighted[:, 1] = nll[:, 1] * brake_weight
 
     return weighted.mean()
+
+
+def speed_steer_coupling_loss(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    steer_threshold: float = 0.3,
+) -> torch.Tensor:
+    """
+    P3: couple the otherwise-independent steer and throttle heads.
+
+    The steer and throttle heads predict from the same features but never see
+    each other, so the throttle head keeps accelerating through corners. This
+    soft penalty pushes the policy to ease off the throttle when it predicts a
+    sharp turn — the behaviour that stops "accelerating through turns" swerving.
+
+    ⚠️  OFF BY DEFAULT (coupling_weight=0.0). This penalty is only valid when
+    the demonstrator actually slows for turns. The MetaDrive IDM/PID expert
+    MAINTAINS throttle through curves (measured: expert throttle ≈ +0.25 at
+    |steer| ∈ [0.3, 0.5]), so the penalty directly fights the imitation target
+    and collapses predicted turn-throttle to ~0 — in closed loop the car then
+    coasts to a stop at every curve/junction. It is one-directional (only
+    penalises acceleration, never rewards it), so even a small weight applies
+    steady downward pressure that the weak Beta-NLL throttle signal cannot
+    counter. Enable only with an expert that genuinely decelerates for turns.
+
+    Uses the Beta means (= mu) as a differentiable point estimate of each
+    action, mapped back to [-1, 1]:
+        steer    = 2 * mu_steer    - 1   ∈ [-1, 1]
+        throttle = 2 * mu_throttle - 1   ∈ [-1, 1]   (>0 accelerate, <0 brake)
+
+    penalty = mean( relu(|steer| - steer_threshold) * relu(throttle) )
+      • only sharp turns (|steer| > threshold) contribute — gentle steering is
+        left alone so normal lane-following is not penalised,
+      • only positive throttle is penalised — braking *into* a turn is desired,
+      • gradients flow to both mu heads, so the coupling is learned jointly.
+
+    Returns a non-negative scalar; weight it in the caller.
+    """
+    mu       = alpha / (alpha + beta)            # (B, 2) in (0, 1)
+    steer    = mu[:, 0] * 2.0 - 1.0              # [-1, 1]
+    throttle = mu[:, 1] * 2.0 - 1.0              # [-1, 1]
+    sharp     = (steer.abs() - steer_threshold).clamp(min=0.0)   # >0 only on sharp turns
+    accel_pos = throttle.clamp(min=0.0)                          # penalise acceleration only
+    return (sharp * accel_pos).mean()
 
 
 def custom_driving_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

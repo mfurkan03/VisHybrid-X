@@ -219,13 +219,61 @@ def extract_ego_state(agent, last_steer: float = 0.0) -> EgoReading:
 # ============================================================
 # 3. DRIVING POLICY NETWORKS
 # ============================================================
+class _EgoNavEncoder(nn.Module):
+    """
+    Two-pathway ego encoder with a *dedicated* branch for the nav command.
+
+    The ego vector is laid out as [motion (EGO_MOTION_DIM) ++ nav (NAVI_DIM)]:
+        motion = [total_speed, last_steer, heading_delta]   (dense, always on)
+        nav    = [navi_left, navi_right]                    (sparse one-hot;
+                                                             active only near junctions)
+
+    A single shared MLP (the old `ego_fc`) lets the 3 dense motion features
+    dominate the first linear layer, so the sparse turn command is averaged
+    away and the policy learns to ignore it — the conditional-imitation
+    conditioning failure behind the "ignored navigation" symptom.  Giving the
+    command its own weights (that see ONLY the nav one-hot) means it can no
+    longer be drowned out by motion, and the two feature blocks are
+    concatenated so the heads receive the nav signal directly.
+
+        motion → motion_fc → motion_out
+        nav    → nav_fc    → nav_out
+        out    = concat(motion_feat, nav_feat)         # (motion_out + nav_out)
+    """
+
+    def __init__(self, ego_dim: int = EGO_DIM, motion_out: int = 32,
+                 nav_out: int = 16, motion_p: float = 0.0):
+        super().__init__()
+        self.motion_dim = EGO_MOTION_DIM
+        self.nav_dim    = ego_dim - EGO_MOTION_DIM
+
+        motion_layers = [nn.Linear(self.motion_dim, 64), nn.ReLU()]
+        if motion_p > 0.0:
+            motion_layers.append(nn.Dropout(motion_p))   # matches old ego_fc dropout
+        motion_layers += [nn.Linear(64, motion_out), nn.ReLU()]
+        self.motion_fc = nn.Sequential(*motion_layers)
+
+        # No dropout on the nav branch: zeroing the single active unit of a
+        # sparse one-hot would destroy the command we are trying to amplify.
+        self.nav_fc = nn.Sequential(
+            nn.Linear(self.nav_dim, 32), nn.ReLU(),
+            nn.Linear(32, nav_out),      nn.ReLU(),
+        )
+        self.out_dim = motion_out + nav_out
+
+    def forward(self, ego: torch.Tensor) -> torch.Tensor:
+        motion = ego[:, :self.motion_dim]
+        nav    = ego[:, self.motion_dim:]
+        return torch.cat([self.motion_fc(motion), self.nav_fc(nav)], dim=1)
+
+
 class DrivingPolicyNet(nn.Module):
     """
     Two-stream policy network.
 
     Visual stream  : CNN on (4, H, W) observation  → 512-d feature
-    Ego stream     : MLP on EGO_DIM ego-state vector →  32-d feature
-    Fusion head    : Linear(544 → 2)  →  [steer, accel]
+    Ego stream     : _EgoNavEncoder (split motion / nav) → 48-d feature
+    Fusion head    : Linear(560 → 2)  →  [steer, accel]
 
     Ego input (EGO_DIM=5): [total_speed, last_steer, heading_delta, navi_left, navi_right]
     """
@@ -246,13 +294,10 @@ class DrivingPolicyNet(nn.Module):
         self.fc_vis  = nn.Linear(flattened_dim, 512)
         self.dropout_vis = nn.Dropout(p) # Görsel feature dropout
 
-        self.ego_fc = nn.Sequential(
-            nn.Linear(ego_dim, 64), nn.ReLU(),
-            nn.Dropout(p), # Ego state dropout
-            nn.Linear(64, 32),      nn.ReLU(),
-        )
+        self.ego_encoder = _EgoNavEncoder(ego_dim, motion_p=p)
 
-        merged_dim = 512 + 32
+        merged_dim      = 512 + self.ego_encoder.out_dim
+        self.merged_dim = merged_dim   # exposed so the RL value head can size itself
         self.steer_mu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
         self.steer_nu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
         self.throttle_mu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
@@ -267,7 +312,7 @@ class DrivingPolicyNet(nn.Module):
         v = self.flatten(v)
         v = F.relu(self.fc_vis(v))
         v = self.dropout_vis(v)
-        e = self.ego_fc(ego)
+        e = self.ego_encoder(ego)
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
@@ -315,9 +360,9 @@ class ImpalaNet(nn.Module):
     - Pre-activation ReLU in residual blocks → smoother gradient flow
 
     Visual stream    : 3 IMPALA stages (32→64→64 ch) → 512-d shared feature
-    Ego stream       : 2-layer MLP                    →  32-d feature
-    Steer heads      : steer_alpha_head / steer_beta_head (544→1 each)
-    Throttle heads   : throttle_alpha_head / throttle_beta_head (544→1 each)
+    Ego stream       : _EgoNavEncoder (motion + dedicated nav branch) → 48-d
+    Steer heads      : steer_alpha_head / steer_beta_head (560→1 each)
+    Throttle heads   : throttle_alpha_head / throttle_beta_head (560→1 each)
 
     Separate head pairs let steering and throttle specialise independently
     from the shared visual representation.
@@ -345,12 +390,10 @@ class ImpalaNet(nn.Module):
             nn.Linear(flattened_dim, 512), nn.ReLU(),
         )
 
-        self.ego_fc = nn.Sequential(
-            nn.Linear(ego_dim, 64), nn.ReLU(),
-            nn.Linear(64, 32),      nn.ReLU(),
-        )
+        self.ego_encoder = _EgoNavEncoder(ego_dim)
 
-        merged_dim = 512 + 32
+        merged_dim      = 512 + self.ego_encoder.out_dim
+        self.merged_dim = merged_dim   # exposed so the RL value head can size itself
         self.steer_mu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
         self.steer_nu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
         self.throttle_mu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
@@ -360,7 +403,7 @@ class ImpalaNet(nn.Module):
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         v = self.vis_proj(self.cnn(x))
-        e = self.ego_fc(ego)
+        e = self.ego_encoder(ego)
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
@@ -462,12 +505,10 @@ class ImpalaNetV2(nn.Module):
             nn.Linear(1024, 512),           nn.ReLU(),
         )
 
-        self.ego_fc = nn.Sequential(
-            nn.Linear(ego_dim, 64), nn.ReLU(),
-            nn.Linear(64, 32),      nn.ReLU(),
-        )
+        self.ego_encoder = _EgoNavEncoder(ego_dim)
 
-        merged_dim = 512 + 32
+        merged_dim      = 512 + self.ego_encoder.out_dim
+        self.merged_dim = merged_dim   # exposed so the RL value head can size itself
         self.steer_mu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
         self.steer_nu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
         self.throttle_mu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
@@ -481,7 +522,7 @@ class ImpalaNetV2(nn.Module):
             (x[:, 1:] - self.rgb_mean) / self.rgb_std,
         ], dim=1)
         v = self.vis_proj(self.cnn(x))
-        e = self.ego_fc(ego)
+        e = self.ego_encoder(ego)
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
