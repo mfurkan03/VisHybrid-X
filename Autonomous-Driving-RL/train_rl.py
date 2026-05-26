@@ -108,7 +108,7 @@ def build_obs_batch(
 
 def parse_args():
     p = argparse.ArgumentParser(description="MetaDrive RL Training (PPO)")
-    p.add_argument("--timesteps",      type=int,   default=200_000)
+    p.add_argument("--timesteps",      type=int,   default=1_000_000)
     p.add_argument("--lr",             type=float, default=3e-4,
                    help="LR for value_head (random-init RL critic)")
     p.add_argument("--backbone_lr",    type=float, default=5e-6,
@@ -371,7 +371,6 @@ def main():
     global_step       = start_global_step
     update_count      = start_update_count
     backbone_unfrozen = warmup_already_done
-    _dist_diag_done   = False   # one-shot distribution diagnostic before first PPO update
     episode_count  = 0
     episode_rewards = []
     episode_lengths = []
@@ -554,9 +553,9 @@ def main():
 
         buffer.compute_gae(last_values, ppo_cfg.gamma, ppo_cfg.gae_lambda)
 
-        # ── One-shot distribution diagnostic (real obs, before first PPO update) ─
-        if not _dist_diag_done:
-            _dist_diag_done = True
+        # ── Distribution diagnostic (real obs, every 10 updates) ────────────
+        _DIAG_EVERY = 10
+        if update_count == 0 or update_count % _DIAG_EVERY == 0:
             _n = min(64, buffer._total)
             _imgs_d = torch.from_numpy(
                 buffer.imgs.reshape(buffer._total, *buffer.imgs.shape[2:])[:_n].copy()
@@ -567,26 +566,35 @@ def main():
             policy.eval()
             with torch.no_grad():
                 _merged = policy._get_merged(_imgs_d, _egos_d)
-                _mu = policy.il_model.throttle_mu_head(_merged)          # (N, 1), Sigmoid output
+                # throttle — raw heads
+                _mu = policy.il_model.throttle_mu_head(_merged)
                 _nu = torch.clamp(
                     policy.il_model.throttle_nu_head(_merged) + 2.0,
                     min=2.0, max=10.0,
-                )                                                         # (N, 1), clamped
-                _mu_c  = _mu.clamp(1e-6, 1.0 - 1e-6)
-                _alpha = (_mu_c * _nu)
-                _beta  = ((1.0 - _mu_c) * _nu)
-                _ent   = torch.distributions.Beta(_alpha, _beta).entropy()
+                )
+                _mu_c   = _mu.clamp(1e-6, 1.0 - 1e-6)
+                _t_alph = _mu_c * _nu
+                _t_bet  = (1.0 - _mu_c) * _nu
+                _t_ent  = torch.distributions.Beta(_t_alph, _t_bet).entropy()
+                # steer — use _get_dist so scale + clamp are applied
+                _dist   = policy._get_dist(_merged)
+                _s_alph = _dist.concentration1[:, 0:1]   # (N, 1)
+                _s_bet  = _dist.concentration0[:, 0:1]
+                _s_mean = _s_alph / (_s_alph + _s_bet)
+                _s_ent  = torch.distributions.Beta(_s_alph, _s_bet).entropy()
             print("\n" + "─" * 55)
-            print("[DiagDist] throttle_mu  "
-                  f"mean={_mu.mean().item():.4f}  std={_mu.std().item():.4f}  "
-                  f"min={_mu.min().item():.4f}  max={_mu.max().item():.4f}")
-            print("[DiagDist] throttle_nu  "
-                  f"mean={_nu.mean().item():.4f}  max={_nu.max().item():.4f}")
-            print("[DiagDist] Beta entropy "
-                  f"mean={_ent.mean().item():.4f}  "
-                  f"(batch={_n}, before update {update_count + 1})")
+            print(f"[DiagDist] update={update_count + 1}  batch={_n}")
+            print(f"[DiagDist] throttle_mu   mean={_mu.mean():.4f}  std={_mu.std():.4f}"
+                  f"  min={_mu.min():.4f}  max={_mu.max():.4f}")
+            print(f"[DiagDist] throttle_nu   mean={_nu.mean():.4f}  max={_nu.max():.4f}")
+            print(f"[DiagDist] throttle H    mean={_t_ent.mean():.4f} nats")
+            print(f"[DiagDist] steer α       mean={_s_alph.mean():.4f}  max={_s_alph.max():.4f}")
+            print(f"[DiagDist] steer β       mean={_s_bet.mean():.4f}   max={_s_bet.max():.4f}")
+            print(f"[DiagDist] steer mean    mean={_s_mean.mean():.4f}  spread={(_s_mean.max()-_s_mean.min()):.4f}")
+            print(f"[DiagDist] steer H       mean={_s_ent.mean():.4f} nats  (target ≈0.0 at reset, should recover)")
             print("─" * 55 + "\n")
-            del _imgs_d, _egos_d, _merged, _mu, _nu, _mu_c, _alpha, _beta, _ent
+            del _imgs_d, _egos_d, _merged, _mu, _nu, _mu_c, _t_alph, _t_bet, _t_ent
+            del _dist, _s_alph, _s_bet, _s_mean, _s_ent
 
         # ── PPO update ────────────────────────────────────────────────────────
         policy.train()

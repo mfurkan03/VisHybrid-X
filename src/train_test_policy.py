@@ -78,7 +78,6 @@ def train_policy(
     data_dir:   str   = "data/raw",
     lr:         float = 1e-4,
     pred_dir:   str   = None,
-    nav_dir:    str   = None,
     curriculum_epochs: int = 10,
     fully_masked_epochs: int = 3,
     image_size: int = None,
@@ -99,9 +98,8 @@ def train_policy(
     depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path)
 
     print(f"[INFO] {'Using PRECOMPUTED DPT from: ' + pred_dir if use_precomputed else 'Live DPT inference.'}")
-    print(f"[INFO] Navigation: {'from ' + nav_dir if nav_dir else 'DISABLED (nav=zeros)'}")
 
-    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator, seed=seed, nav_dir=nav_dir)
+    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator, seed=seed)
 
     policy_model = build_policy(arch, image_size).to(device)
     optimizer    = optim.AdamW(policy_model.parameters(), lr=lr)
@@ -137,7 +135,6 @@ def finetune_policy(
     data_dir:        str   = "data/raw",
     lr:              float = 2e-5,
     pred_dir:        str   = None,
-    nav_dir:         str   = None,
     freeze_bb:       bool  = False,
     reset_optimizer: bool  = False,
     resume:          bool  = False,
@@ -171,8 +168,7 @@ def finetune_policy(
     use_precomputed = pred_dir is not None and os.path.isdir(os.path.join(pred_dir, "train"))
     depth_estimator = None if use_precomputed else DepthEstimationModel(finetuned_path=dpt_path)
 
-    print(f"[INFO] Navigation: {'from ' + nav_dir if nav_dir else 'DISABLED (nav=zeros)'}")
-    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator, seed=seed, nav_dir=nav_dir)
+    train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator, seed=seed)
 
     policy_model = build_policy(arch, image_size).to(device)
     if freeze_bb:
@@ -224,7 +220,6 @@ def test_policy(
     dpt_path:   str,
     data_dir:   str,
     pred_dir:   str = None,
-    nav_dir:    str = None,
     image_size: int = None,
     arch: str = "simple",
     always_lane_masked: bool = False,
@@ -249,7 +244,7 @@ def test_policy(
 
     if use_precomputed:
         from policy.trainer import apply_lane_mask
-        test_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="test", nav_dir=nav_dir)
+        test_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="test")
         def collate_fn(batch):
             depths, rgbs, actions, egos, ego_fulls = zip(*batch)
             return (
@@ -261,7 +256,7 @@ def test_policy(
             )
     else:
         depth_estimator = DepthEstimationModel(finetuned_path=dpt_path)
-        test_ds = MetaDriveRGBDataset(data_dir=data_dir, split="test", nav_dir=nav_dir)
+        test_ds = MetaDriveRGBDataset(data_dir=data_dir, split="test")
         def collate_fn(batch):
             rgbs, actions, egos = zip(*batch)
             n = len(actions)
@@ -348,10 +343,6 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str,   default="models/policy_model.pth")
     parser.add_argument("--lr",         type=float, default=1e-4)
     parser.add_argument("--pred_dir",   type=str,   default=None)
-    parser.add_argument("--nav_dir",    type=str,   default=None,
-                        help="Path to the SEPARATE navigation folder (e.g. dataset/nav). "
-                             "Episodes are matched by filename. Omit to disable navigation "
-                             "(nav input = zeros = forward command).")
     # fine-tune args
     parser.add_argument("--finetune_from",  type=str, default=None)
     parser.add_argument("--freeze_backbone", action="store_true")
@@ -390,7 +381,6 @@ if __name__ == "__main__":
                 print(f"\n[BENCHMARK] === Seed {seed} — checkpoint: {mp} ===")
             train_policy(args.epochs, 32, mp,
                          args.dpt_path, args.data_dir, args.lr, pred_dir=args.pred_dir,
-                         nav_dir=args.nav_dir,
                          curriculum_epochs=args.curriculum_epochs,
                          fully_masked_epochs=args.fully_masked_epochs,
                          image_size=args.image_size,
@@ -419,7 +409,6 @@ if __name__ == "__main__":
                 data_dir        = args.data_dir,
                 lr              = args.lr if args.lr != 1e-4 else 1e-6,
                 pred_dir        = args.pred_dir,
-                nav_dir         = args.nav_dir,
                 freeze_bb       = args.freeze_backbone,
                 reset_optimizer = args.reset_optimizer,
                 resume          = args.resume,
@@ -438,6 +427,6 @@ if __name__ == "__main__":
 
     if args.mode in ("test", "all"):
         test_policy(args.model_path, args.dpt_path, args.data_dir,
-                    pred_dir=args.pred_dir, nav_dir=args.nav_dir,
+                    pred_dir=args.pred_dir,
                     image_size=args.image_size, arch=args.arch,
                     always_lane_masked=args.always_lane_masked, seed=args.seed)

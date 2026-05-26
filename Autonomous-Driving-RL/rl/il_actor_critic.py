@@ -27,6 +27,7 @@ directly.  ILActorCritic delegates distribution computation to those trained
 heads via _get_dist(), and only adds a new value_head for the RL critic.
 This ensures IL-trained distribution knowledge is preserved at the start of RL.
 """
+import math
 import sys
 from pathlib import Path
 
@@ -57,17 +58,28 @@ class ILActorCritic(nn.Module):
     CONCENTRATION_SCALE multiplies alpha and beta in _get_dist() to reduce
     sampling variance without changing the distribution mean.  Applied
     identically during rollout sampling and PPO log-prob evaluation so the
-    policy gradient remains correct.  Throttle needs this more than steer
-    because its concentration (= nu) can be as low as 2.0 at IL init,
-    yielding std ≈ 0.5 in [-1, 1] — too noisy for consistent forward motion.
+    policy gradient remains correct.
+
+    steer_concentration_scale is a registered buffer (saved in checkpoints).
+    It is 1.0 after IL loading and set to _STEER_SCALE_AT_RESET by
+    reset_nu_heads_for_ppo().  It only multiplies the steer concentrations,
+    leaving throttle untouched.  The ratio α/β is preserved, so steer means
+    are identical before and after reset — only concentration (sharpness) drops.
     """
 
     MERGED_DIM = 544  # 512 (visual) + 32 (ego) — fixed across all IL archs
-    CONCENTRATION_SCALE = 1.0  # tighter distribution; mean unchanged, std / sqrt(3)
+    CONCENTRATION_SCALE = 1.0
+
+    # softplus(0) + 2.0 = ln(2) + 2.0 ≈ 2.693 — the steer concentration at zero-init.
+    # This scale brings it to exactly 1.0 (Beta(1,1) = uniform = maximum entropy).
+    _STEER_SCALE_AT_RESET: float = 1.0 / (math.log(2) + 2.0)  # ≈ 0.372
 
     def __init__(self, il_model: nn.Module):
         super().__init__()
         self.il_model = il_model
+
+        # Saved in state_dict so RL checkpoint resumes use the correct scale.
+        self.register_buffer("steer_concentration_scale", torch.tensor(1.0))
 
         # Only new head — not present in IL checkpoints, starts from random init.
         self.value_head = nn.Sequential(
@@ -96,6 +108,9 @@ class ILActorCritic(nn.Module):
         nu             = torch.clamp(il.throttle_nu_head(merged) + 2.0, min=2.0, max=10.0)  # (B, 1)
         throttle_alpha = mu * nu
         throttle_beta  = (1.0 - mu) * nu
+
+        steer_alpha = steer_alpha * self.steer_concentration_scale
+        steer_beta  = steer_beta  * self.steer_concentration_scale
 
         alpha = torch.cat([steer_alpha, throttle_alpha], dim=-1) * self.CONCENTRATION_SCALE  # (B, 2)
         beta  = torch.cat([steer_beta,  throttle_beta],  dim=-1) * self.CONCENTRATION_SCALE  # (B, 2)
@@ -167,52 +182,49 @@ class ILActorCritic(nn.Module):
         """
         Reset distribution heads to maximum-entropy state before PPO fine-tuning.
 
-        Diagnostic on the IL checkpoint revealed two problems:
-          1. throttle_nu_head — already fixed: nu reset to ~2.69 (near-minimum
-             concentration), giving a broad Beta.
-          2. throttle_mu_head — IL training drove the mean to ~0.84 (heavy
-             forward-throttle bias).  At nu=2 this gives Beta(1.68, 0.32),
-             which is extremely right-skewed with entropy ≈ -8.5.  PPO cannot
-             explore braking or coasting from this starting point.
+        Throttle
+        --------
+        IL training drove mu → ~0.84 (heavy forward bias), giving Beta(1.68, 0.32)
+        with entropy ≈ -8.5 — PPO cannot explore braking from this start.
+        Fix: zero the last Linear in mu_head (sigmoid(0)=0.5) and all of nu_head
+        (softplus(0)+2=2.69 → throttle_alpha=throttle_beta≈1.35 → Beta(1.35,1.35)).
 
-        Fix for mu_head
-        ---------------
-        Only the LAST Linear layer is reset (weight → N(0, 0.01), bias → 0.0).
-        sigmoid(0) = 0.5, so the output centres at 0.5 after reset.
-        Earlier layers in the Sequential are left untouched: they may encode
-        useful IL feature projections.  (In practice throttle_mu_head is a
-        single Linear+Sigmoid, so this resets the whole head anyway.)
+        Steer
+        -----
+        IL training drives steer concentrations to ~700+ (Smooth-L1 loss has no
+        entropy penalty — the model becomes extremely confident).  The 50.0 clamp
+        in _get_dist() then caps all outputs at 50 regardless of any scale, so a
+        scale alone cannot change the entropy.
 
-        WHY steer_alpha_head / steer_beta_head are NOT reset
-        -----------------------------------------------------
-        Steer has no separate mu/nu split — alpha_head and beta_head jointly
-        encode both mean steering direction AND concentration.  Resetting them
-        would erase IL-learned directional behaviour, which must be preserved.
+        Additionally, the IL steer mean spread across observations is near-trivial
+        (~0.09 in [0,1]) — the heads learned "steer neutral with extreme confidence"
+        rather than meaningful directional variation.  There is little IL directional
+        knowledge worth preserving in the heads themselves.
 
-        Expected state after reset (any input batch)
-        --------------------------------------------
-          mu  ≈ 0.50  (std ~0.05)
-          nu  ≈ 2.69  (just above the +2.0 minimum floor)
-          Beta(~1, ~1) → entropy ≈ 0.0  (maximum for this parameterisation)
+        Fix: zero-init both steer heads so every observation yields the constant
+        softplus(0)+2.0 = 2.693.  The steer_concentration_scale (≈0.372) then
+        brings 2.693 × 0.372 ≈ 1.0 → Beta(1,1) (maximum entropy).  Unlike
+        Option-B random-init (which failed), zero-init produces a deterministic,
+        well-behaved constant output; the backbone relearns steer differentiation
+        via PPO gradient flow within a few updates.
+
+        After reset
+        -----------
+          steer    : constant Beta(1,1) for all obs — maximum entropy
+          throttle : mu≈0.50  nu≈2.69  Beta(~1.35, ~1.35)
         """
         il = self.il_model
         print("[reset_nu_heads_for_ppo] Resetting distribution heads:")
 
-        # ── nu head ───────────────────────────────────────────────────────────
+        # ── throttle nu head ──────────────────────────────────────────────────
         for layer_idx, layer in enumerate(il.throttle_nu_head):
             if isinstance(layer, nn.Linear):
-                # zeros → linear_output = 0 for any features
-                # Softplus(0) = ln(2) ≈ 0.693, so nu = 0.693 + 2.0 ≈ 2.69 (exact)
                 nn.init.zeros_(layer.weight)
                 nn.init.constant_(layer.bias, 0.0)
                 print(f"  throttle_nu_head[{layer_idx}] Linear  "
                       f"weight={layer.weight.abs().max().item():.6f}  bias={layer.bias.mean().item():.4f}")
 
-        # ── mu head: ONLY the last Linear layer ───────────────────────────────
-        # N(0, small_std) is NOT sufficient — IL backbone features have large
-        # L2 norm (||merged|| ≈ 150+, ImpalaNetV2), so even std=0.01 weights
-        # produce pre-sigmoid outputs of ±1.5+, pushing mu away from 0.5.
-        # zeros guarantees linear_output = 0 for every observation → sigmoid(0) = 0.5 exact.
+        # ── throttle mu head (last Linear only) ───────────────────────────────
         last_linear = None
         for layer in il.throttle_mu_head.modules():
             if isinstance(layer, nn.Linear):
@@ -223,7 +235,30 @@ class ILActorCritic(nn.Module):
             print(f"  throttle_mu_head (last Linear)  "
                   f"weight={last_linear.weight.abs().max().item():.6f}  bias={last_linear.bias.mean().item():.4f}")
 
-        print("[reset_nu_heads_for_ppo] Done — mu≈0.50  nu≈2.69  entropy≈0.0\n")
+        # ── steer heads: zero-init + scale ───────────────────────────────────
+        # IL training drives steer concentrations to 700+ (no entropy penalty in
+        # Smooth-L1 loss). The 50.0 clamp in _get_dist() then caps all of them at
+        # 50 regardless of any scale, so the scale trick alone has no effect.
+        # Solution: zero-init both heads so every observation yields the constant
+        # softplus(0)+2.0 = 2.693, then scale × 2.693 ≈ 1.0 → Beta(1,1).
+        # This is safe (unlike Option B random-init) because zero-init gives a
+        # deterministic well-behaved output; the backbone quickly relearns steer
+        # differentiation via PPO gradient flow after a few updates.
+        for name, head in [("steer_alpha_head", il.steer_alpha_head),
+                            ("steer_beta_head",  il.steer_beta_head)]:
+            for i, layer in enumerate(head):
+                if isinstance(layer, nn.Linear):
+                    nn.init.zeros_(layer.weight)
+                    nn.init.constant_(layer.bias, 0.0)
+                    print(f"  {name}[{i}] Linear  "
+                          f"weight={layer.weight.abs().max().item():.6f}  "
+                          f"bias={layer.bias.mean().item():.4f}")
+
+        self.steer_concentration_scale.fill_(self._STEER_SCALE_AT_RESET)
+        print(f"  steer_concentration_scale → {self.steer_concentration_scale.item():.4f}"
+              f"  (2.693 × {self._STEER_SCALE_AT_RESET:.3f} ≈ 1.0 → Beta(1,1))")
+
+        print("[reset_nu_heads_for_ppo] Done\n")
 
     # ------------------------------------------------------------------
     def load_from_il_checkpoint(self, path: str, device: str = "cpu"):

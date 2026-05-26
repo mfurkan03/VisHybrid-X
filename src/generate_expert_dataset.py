@@ -52,11 +52,9 @@ def _worker_collect(
 
     Navigation is collected in the SAME loop that captures the images (the only
     reliable way — MetaDrive episodes are not reproducible across runs, so a
-    separate replay pass would misalign nav with the saved frames) and written
-    to its OWN folder <save_dir>/nav/<split>/episode_N.npz, which holds only
-    navi_state — no RGB/depth. This keeps navigation a separate, self-contained
-    data type that the depth-precompute step ignores and the dataset loader
-    joins back by episode filename.
+    separate replay pass would misalign nav with the saved frames) and saved
+    as the `navi_state` key inside the main episode .npz file alongside RGB,
+    depth, action, and ego_state.
     """
 
     angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(num_cameras)
@@ -182,27 +180,13 @@ def _worker_collect(
                 if quit_requested:
                     done = True
 
-        # ── Navigation episode (always saved, to the SEPARATE nav/ folder) ──────
-        nav_dict = {
-            "navi_state":       np.array(navi_states,      dtype=np.float32),  # (N, NAVI_DIM)
-            "frame_timestamps": np.array(frame_timestamps, dtype=np.float64),
-        }
-        nav_path = os.path.join(save_dir, "nav", current_split, f"episode_{global_ep_id}.npz")
-
+        # ── Main episode (RGB/depth/action/ego/nav) ──────────────────────────────
         save_threads = []
-        nav_t = threading.Thread(
-            target=lambda p, d: np.savez_compressed(p, **d),
-            args=(nav_path, nav_dict),
-            daemon=True,
-        )
-        nav_t.start()
-        save_threads.append(nav_t)
-
-        # ── Main episode (RGB/depth/action/ego) ─────────────────────────────────
         save_dict = {
             "action":           np.array(actions),
             "ego_state":        np.array(ego_states,      dtype=np.float32),
             "ego_state_full":   np.array(ego_states_full, dtype=np.float32),
+            "navi_state":       np.array(navi_states,     dtype=np.float32),  # (N, NAVI_DIM)
             "frame_timestamps": np.array(frame_timestamps, dtype=np.float64),
         }
         for rgb_name in rgb_cam_names:
@@ -221,7 +205,7 @@ def _worker_collect(
         main_t.start()
         save_threads.append(main_t)
 
-        print(f"\n  --> [Worker {worker_id}] Saving Global Episode {global_ep_id} to '{current_split}' (+ nav)")
+        print(f"\n  --> [Worker {worker_id}] Saving Global Episode {global_ep_id} to '{current_split}'")
 
         ep += 1
         for t in save_threads:
@@ -252,11 +236,8 @@ def collect_expert_data_parallel(
     save_every_n    = 20,
     poster_path     = None,
 ):
-    # Navigation is written to a SEPARATE nav/ folder (only navi_state, no
-    # images) so it stays a self-contained data type in the pipeline.
     for split in ("train", "val", "test"):
         os.makedirs(os.path.join(save_dir, split), exist_ok=True)
-        os.makedirs(os.path.join(save_dir, "nav", split), exist_ok=True)
 
     mode_str = "GPU (CUDA)" if image_on_cuda else "CPU (NumPy)"
 
@@ -269,7 +250,7 @@ def collect_expert_data_parallel(
     print(f"  Parallel Processing : {num_workers} Workers")
     print(f"  Total Episodes  : {num_episodes}")
     print(f"  Processing Mode : {mode_str}")
-    print(f"  Saving to       : '{save_dir}' (+ separate nav/ folder)")
+    print(f"  Saving to       : '{save_dir}'")
     print(f"  Camera Count    : {num_cameras}")
     print(f"  Sim FPS         : {100 // decision_repeat} Hz  (decision_repeat={decision_repeat}, save_every_n={save_every_n})")
     print(f"{'='*55}\n")
