@@ -112,10 +112,15 @@ def parse_args():
     p.add_argument("--lr",             type=float, default=3e-4,
                    help="LR for value_head (random-init RL critic)")
     p.add_argument("--backbone_lr",    type=float, default=5e-6,
-                   help="LR for the IL backbone (much lower to avoid forgetting)")
-    p.add_argument("--dist_head_lr",   type=float, default=3e-5,
-                   help="LR for Beta distribution heads (steer/throttle mu/nu). "
-                        "Lower than value_head lr to prevent entropy collapse after warmup.")
+                   help="LR for the IL backbone + action_head (much lower to avoid forgetting)")
+    p.add_argument("--init_action_std", type=float, default=0.6,
+                   help="Initial action std for MultivariateNormal exploration")
+    p.add_argument("--min_action_std",  type=float, default=0.1,
+                   help="Floor for action std decay — never goes below this")
+    p.add_argument("--std_decay_rate",  type=float, default=0.05,
+                   help="Amount to subtract from action_std every --std_decay_freq steps")
+    p.add_argument("--std_decay_freq",  type=int,   default=200_000,
+                   help="Decay action_std every this many env steps")
     p.add_argument("--warmup_updates", type=int,   default=20,
                    help="Freeze backbone + action heads for this many PPO updates (critic-only warmup)")
     p.add_argument("--rollout",        type=int,   default=2048,
@@ -128,7 +133,7 @@ def parse_args():
                    help="Per-epoch avg KL early-stopping threshold. 0=disabled. "
                         "~0.05 for IL->RL fine-tuning, ~0.01 for scratch PPO.")
     p.add_argument("--arch",           type=str,   default="impala",
-                   choices=["simple", "impala", "impala_v2"])
+                   choices=["simple", "impala", "impala_v2", "efficient"])
     p.add_argument("--image_size",     type=int,   default=84)
     p.add_argument("--n_envs",         type=int,   default=1,
                    help="Number of parallel env workers. 1=DummyVecEnv (no subprocess), "
@@ -188,7 +193,7 @@ def main():
     print(f"  Rollout/env  : {args.rollout}  (total/update = {args.rollout * n_envs:,})")
     print(f"  Batch        : {args.batch}  epochs={args.epochs}  target_kl={args.target_kl}")
     print(f"  Seed         : {args.seed}")
-    print(f"  LR (heads)   : {args.lr}  backbone_lr={args.backbone_lr}  warmup={args.warmup_updates} updates")
+    print(f"  LR (value)   : {args.lr}  backbone_lr={args.backbone_lr}  warmup={args.warmup_updates} updates")
     print(f"  AMP          : {args.amp}   compile={args.compile}")
     if args.il_checkpoint:
         print(f"  IL checkpoint: {args.il_checkpoint}")
@@ -233,12 +238,10 @@ def main():
 
     # ── Policy ────────────────────────────────────────────────────────────────
     il_model = build_policy(args.arch, args.image_size)
-    policy   = ILActorCritic(il_model).to(device)
+    policy   = ILActorCritic(il_model, init_action_std=args.init_action_std).to(device)
 
     if args.il_checkpoint and os.path.exists(args.il_checkpoint):
         policy.load_from_il_checkpoint(args.il_checkpoint, device)
-        # Reset nu heads to maximum entropy state before PPO fine-tuning
-        policy.reset_nu_heads_for_ppo()
     elif args.il_checkpoint:
         print(f"[WARNING] IL checkpoint not found: {args.il_checkpoint}")
 
@@ -282,35 +285,25 @@ def main():
             print("[W&B] wandb not installed — logging disabled. pip install wandb\n")
             wb_run = None
 
-    # Four LR groups:
-    #   cnn_params       — CNN backbone + projection + ego MLP: backbone_lr (preserve visual features)
-    #   dist_head_params — Beta distribution heads: dist_head_lr (IL-trained, must update slowly
-    #                      to avoid entropy collapse; much lower than value_head lr)
-    #   head_params      — value_head: lr (random init, must learn fast)
-    _DIST_HEAD_NAMES = {"steer_alpha_head", "steer_beta_head", "throttle_mu_head", "throttle_nu_head"}
-    dist_head_params = []
-    cnn_params       = []
-    for name, param in policy.il_model.named_parameters():
-        if name.split(".")[0] in _DIST_HEAD_NAMES:
-            dist_head_params.append(param)
-        else:
-            cnn_params.append(param)
-    il_params   = cnn_params + dist_head_params   # all il_model params, used for warmup freeze/unfreeze
-    head_params = list(policy.value_head.parameters())
+    # Two LR groups:
+    #   backbone_params — CNN + projection + ego MLP + action_head: backbone_lr (preserve IL features)
+    #   head_params     — value_head: lr (random init, must learn fast)
+    # cov_matrix / action_var are plain buffers (not parameters) — no optimizer group needed.
+    backbone_params = list(policy.il_model.parameters())
+    il_params       = backbone_params   # all non-value params, used for warmup freeze/unfreeze
+    head_params     = list(policy.value_head.parameters())
 
     optimizer = torch.optim.Adam([
-        {"params": cnn_params,       "lr": args.backbone_lr},
-        {"params": dist_head_params, "lr": args.dist_head_lr},
-        {"params": head_params,      "lr": args.lr},
+        {"params": backbone_params, "lr": args.backbone_lr},
+        {"params": head_params,     "lr": args.lr},
     ])
     if resumed_optimizer_state is not None:
         optimizer.load_state_dict(resumed_optimizer_state)
         if args.force_lr:
-            optimizer.param_groups[0]["lr"] = args.backbone_lr   # cnn_params
-            optimizer.param_groups[1]["lr"] = args.dist_head_lr  # dist_head_params
-            optimizer.param_groups[2]["lr"] = args.lr            # value_head
+            optimizer.param_groups[0]["lr"] = args.backbone_lr   # backbone
+            optimizer.param_groups[1]["lr"] = args.lr            # value_head
             print(f"[RL Resume] Optimizer state restored + LRs overridden: "
-                  f"backbone={args.backbone_lr}, dist_heads={args.dist_head_lr}, value_head={args.lr}")
+                  f"backbone={args.backbone_lr}, value_head={args.lr}")
         else:
             print("[RL Resume] Optimizer state restored.")
 
@@ -392,6 +385,10 @@ def main():
     obs_verifier  = ObsVerifier() if args.save_obs_ref else None
     obs_ref_saved = False
 
+    # Track the current action std for step-based decay.
+    current_action_std = args.init_action_std
+    next_decay_step    = args.std_decay_freq
+
     start_time = time.time()
     print("Training started...\n")
 
@@ -452,8 +449,7 @@ def main():
             with torch.no_grad():
                 actions, log_probs, _, values = policy.get_action_and_value(imgs_t, egos_t)
 
-            actions_01  = actions.cpu().numpy()          # (k, 2) in [0, 1] — stored in buffer
-            actions_env = actions_01 * 2.0 - 1.0         # (k, 2) in [-1, 1] — sent to env
+            actions_env = actions.cpu().numpy()            # (k, 2) in [-1, 1] — stored in buffer and sent to env
 
             # ── Step the ready envs — done workers dispatch RESET immediately ─
             step_results = vec_env.step(ready, actions_env)
@@ -473,7 +469,7 @@ def main():
                 # Write directly into the (T, N, ...) buffer arrays by env index.
                 buffer.imgs[t, i]      = imgs_np[i]       # obs that produced the action
                 buffer.egos[t, i]      = egos[i]
-                buffer.actions[t, i]   = actions_01[k]
+                buffer.actions[t, i]   = actions_env[k]
                 buffer.rewards[t, i]   = reward
                 buffer.dones[t, i]     = float(done)
                 buffer.log_probs[t, i] = log_probs[k].item()
@@ -553,7 +549,7 @@ def main():
 
         buffer.compute_gae(last_values, ppo_cfg.gamma, ppo_cfg.gae_lambda)
 
-        # ── Distribution diagnostic (real obs, every 10 updates) ────────────
+        # ── Distribution diagnostic (every 10 updates) ───────────────────────
         _DIAG_EVERY = 10
         if update_count == 0 or update_count % _DIAG_EVERY == 0:
             _n = min(64, buffer._total)
@@ -566,40 +562,30 @@ def main():
             policy.eval()
             with torch.no_grad():
                 _merged = policy._get_merged(_imgs_d, _egos_d)
-                # throttle — raw heads
-                _mu = policy.il_model.throttle_mu_head(_merged)
-                _nu = torch.clamp(
-                    policy.il_model.throttle_nu_head(_merged) + 2.0,
-                    min=2.0, max=10.0,
-                )
-                _mu_c   = _mu.clamp(1e-6, 1.0 - 1e-6)
-                _t_alph = _mu_c * _nu
-                _t_bet  = (1.0 - _mu_c) * _nu
-                _t_ent  = torch.distributions.Beta(_t_alph, _t_bet).entropy()
-                # steer — use _get_dist so scale + clamp are applied
+                _means  = torch.cat([policy.il_model.steer_head(_merged), policy.il_model.accel_head(_merged)], dim=-1)  # (N, 2)
                 _dist   = policy._get_dist(_merged)
-                _s_alph = _dist.concentration1[:, 0:1]   # (N, 1)
-                _s_bet  = _dist.concentration0[:, 0:1]
-                _s_mean = _s_alph / (_s_alph + _s_bet)
-                _s_ent  = torch.distributions.Beta(_s_alph, _s_bet).entropy()
+                _ent    = _dist.entropy()                         # (N,)
+            _std = policy.action_var.sqrt()
             print("\n" + "─" * 55)
             print(f"[DiagDist] update={update_count + 1}  batch={_n}")
-            print(f"[DiagDist] throttle_mu   mean={_mu.mean():.4f}  std={_mu.std():.4f}"
-                  f"  min={_mu.min():.4f}  max={_mu.max():.4f}")
-            print(f"[DiagDist] throttle_nu   mean={_nu.mean():.4f}  max={_nu.max():.4f}")
-            print(f"[DiagDist] throttle H    mean={_t_ent.mean():.4f} nats")
-            print(f"[DiagDist] steer α       mean={_s_alph.mean():.4f}  max={_s_alph.max():.4f}")
-            print(f"[DiagDist] steer β       mean={_s_bet.mean():.4f}   max={_s_bet.max():.4f}")
-            print(f"[DiagDist] steer mean    mean={_s_mean.mean():.4f}  spread={(_s_mean.max()-_s_mean.min()):.4f}")
-            print(f"[DiagDist] steer H       mean={_s_ent.mean():.4f} nats  (target ≈0.0 at reset, should recover)")
+            print(f"[DiagDist] action_std  steer={_std[0]:.4f}  accel={_std[1]:.4f}")
+            print(f"[DiagDist] mean steer  mean={_means[:,0].mean():+.4f}  std={_means[:,0].std():.4f}")
+            print(f"[DiagDist] mean accel  mean={_means[:,1].mean():+.4f}  std={_means[:,1].std():.4f}")
+            print(f"[DiagDist] entropy     mean={_ent.mean():.4f} nats")
             print("─" * 55 + "\n")
-            del _imgs_d, _egos_d, _merged, _mu, _nu, _mu_c, _t_alph, _t_bet, _t_ent
-            del _dist, _s_alph, _s_bet, _s_mean, _s_ent
+            del _imgs_d, _egos_d, _merged, _means, _dist, _ent
 
         # ── PPO update ────────────────────────────────────────────────────────
         policy.train()
         losses = ppo_update(policy, optimizer, buffer, ppo_cfg, scaler=amp_scaler)
         update_count += 1
+
+        # ── Action std decay ──────────────────────────────────────────────────
+        if global_step >= next_decay_step and current_action_std > args.min_action_std:
+            current_action_std = max(args.min_action_std,
+                                     current_action_std - args.std_decay_rate)
+            policy.set_action_std(current_action_std)
+            next_decay_step += args.std_decay_freq
 
         gc.collect()
         if device.type == "cuda":
@@ -610,7 +596,7 @@ def main():
             for p in il_params:
                 p.requires_grad_(True)
             print(f"[Warmup] IL model unfrozen at update {update_count} "
-                  f"— CNN at lr={args.backbone_lr}, dist heads at lr={args.lr}.")
+                  f"— backbone at lr={args.backbone_lr}, value_head at lr={args.lr}.")
 
         elapsed = time.time() - start_time
         fps     = global_step / max(elapsed, 1e-6)

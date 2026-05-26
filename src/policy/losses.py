@@ -44,7 +44,7 @@ def custom_driving_loss_beta(alpha: torch.Tensor, beta: torch.Tensor, target_01:
 def custom_driving_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     smooth_l1    = nn.functional.smooth_l1_loss(pred, target, reduction='none')
     weighted_loss = smooth_l1.clone()
-    brake_weight = 1.0 + (target[:, 1] < -0.1).float() * 3.0  # 4x on braking events
+    brake_weight = 1.0 + (target[:, 1] < -0.1).float() * 2.0  # 3x on braking events
     weighted_loss[:, 1] = smooth_l1[:, 1] * brake_weight
     return weighted_loss.mean()
 

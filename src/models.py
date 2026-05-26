@@ -10,7 +10,6 @@ EGO_MOTION_DIM         – motion-only ego dims stored on disk (3)
 NAVI_DIM               – navigation-command dims (2: [left, right] one-hot)
 extract_ego_state()    – build EgoReading from a MetaDrive agent
 DrivingPolicyNet       – two-stream CNN + ego policy network
-DrivingPolicyNet2      – deeper variant with BatchNorm fusion head
 """
 
 import math
@@ -225,7 +224,7 @@ class DrivingPolicyNet(nn.Module):
 
     Visual stream  : CNN on (4, H, W) observation  → 512-d feature
     Ego stream     : MLP on EGO_DIM ego-state vector →  32-d feature
-    Fusion head    : Linear(544 → 2)  →  [steer, accel]
+    Action head    : Linear(544 → 2) + Tanh  →  [steer, accel] ∈ [-1, 1]
 
     Ego input (EGO_DIM=5): [total_speed, last_steer, heading_delta, navi_left, navi_right]
     """
@@ -237,27 +236,24 @@ class DrivingPolicyNet(nn.Module):
         self.conv2   = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3   = nn.Conv2d(64, 64, kernel_size=3, stride=1)
         self.flatten = nn.Flatten()
-        
+
         with torch.no_grad():
             dummy = torch.zeros(1, in_channels, image_size, image_size)
             dummy_out = self.flatten(self.conv3(self.conv2(self.conv1(dummy))))
             flattened_dim = dummy_out.shape[1]
-        
-        self.fc_vis  = nn.Linear(flattened_dim, 512)
-        self.dropout_vis = nn.Dropout(p) # Görsel feature dropout
+
+        self.fc_vis      = nn.Linear(flattened_dim, 512)
+        self.dropout_vis = nn.Dropout(p)
 
         self.ego_fc = nn.Sequential(
             nn.Linear(ego_dim, 64), nn.ReLU(),
-            nn.Dropout(p), # Ego state dropout
+            nn.Dropout(p),
             nn.Linear(64, 32),      nn.ReLU(),
         )
 
         merged_dim = 512 + 32
-        self.steer_alpha_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        self.steer_beta_head   = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        self.throttle_mu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
-        self.throttle_nu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        nn.init.constant_(self.throttle_mu_head[-2].bias, -1.0)  # sigmoid(-1) ≈ 0.27, brake-biased
+        self.steer_head = nn.Sequential(nn.Linear(merged_dim, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh())
+        self.accel_head = nn.Sequential(nn.Linear(merged_dim, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh())
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         v = F.relu(self.conv1(x))
@@ -270,13 +266,7 @@ class DrivingPolicyNet(nn.Module):
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
-        steer_alpha = self.steer_alpha_head(merged) + 2.0
-        steer_beta  = self.steer_beta_head(merged)  + 2.0
-        mu = self.throttle_mu_head(merged)
-        nu = self.throttle_nu_head(merged) + 2.0
-        alpha = torch.cat([steer_alpha, mu * nu],           dim=1)
-        beta  = torch.cat([steer_beta,  (1.0 - mu) * nu],  dim=1)
-        return alpha, beta
+        return torch.cat([self.steer_head(merged), self.accel_head(merged)], dim=-1)
 
 class _ImpalaResBlock(nn.Module):
     """Pre-activation residual block used inside the IMPALA CNN."""
@@ -295,8 +285,7 @@ class _ImpalaResBlock(nn.Module):
 
 def _impala_stage(in_ch: int, out_ch: int) -> nn.Sequential:
     return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-        nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+        nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1),
         _ImpalaResBlock(out_ch),
         _ImpalaResBlock(out_ch),
     )
@@ -313,13 +302,9 @@ class ImpalaNet(nn.Module):
     - MaxPool stages → better spatial information retention than strided convs
     - Pre-activation ReLU in residual blocks → smoother gradient flow
 
-    Visual stream    : 3 IMPALA stages (32→64→64 ch) → 512-d shared feature
-    Ego stream       : 2-layer MLP                    →  32-d feature
-    Steer heads      : steer_alpha_head / steer_beta_head (544→1 each)
-    Throttle heads   : throttle_alpha_head / throttle_beta_head (544→1 each)
-
-    Separate head pairs let steering and throttle specialise independently
-    from the shared visual representation.
+    Visual stream : 3 IMPALA stages (32→64→64 ch) → 512-d shared feature
+    Ego stream    : 2-layer MLP                    →  32-d feature
+    Action head   : Linear(544 → 2) + Tanh         →  [steer, accel] ∈ [-1, 1]
 
     RL note: call model.train() during gradient updates and model.eval()
     during rollout collection — Dropout is the only stateful layer.
@@ -350,11 +335,8 @@ class ImpalaNet(nn.Module):
         )
 
         merged_dim = 512 + 32
-        self.steer_alpha_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        self.steer_beta_head   = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        self.throttle_mu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
-        self.throttle_nu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        nn.init.constant_(self.throttle_mu_head[-2].bias, -1.0)  # sigmoid(-1) ≈ 0.27, brake-biased
+        self.steer_head = nn.Sequential(nn.Linear(merged_dim, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh())
+        self.accel_head = nn.Sequential(nn.Linear(merged_dim, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh())
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         v = self.vis_proj(self.cnn(x))
@@ -362,13 +344,7 @@ class ImpalaNet(nn.Module):
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
-        steer_alpha = self.steer_alpha_head(merged) + 2.0
-        steer_beta  = self.steer_beta_head(merged)  + 2.0
-        mu = self.throttle_mu_head(merged)
-        nu = self.throttle_nu_head(merged) + 2.0
-        alpha = torch.cat([steer_alpha, mu * nu],           dim=1)
-        beta  = torch.cat([steer_beta,  (1.0 - mu) * nu],  dim=1)
-        return alpha, beta
+        return torch.cat([self.steer_head(merged), self.accel_head(merged)], dim=-1)
 
 
 # ============================================================
@@ -409,11 +385,47 @@ class _ImpalaResBlockSE(nn.Module):
 
 def _impala_stage_se(in_ch: int, out_ch: int) -> nn.Sequential:
     return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-        nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+        nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1),
         _ImpalaResBlockSE(out_ch),
         _ImpalaResBlockSE(out_ch),
     )
+
+
+# ============================================================
+# EfficientDrivingNet building blocks
+# ============================================================
+
+def _gn(ch: int) -> nn.GroupNorm:
+    """GroupNorm with 8 groups — safe at BS=1; all channel counts here are divisible by 8."""
+    return nn.GroupNorm(min(8, ch), ch)
+
+
+class _MBConv(nn.Module):
+    """
+    MobileNetV2-style inverted residual block with GroupNorm and optional SE.
+
+    expand=1 skips the pointwise expand step (used in the first stage).
+    SE is applied on the intermediate (expanded) channels before projection.
+    """
+    def __init__(self, in_ch: int, out_ch: int, expand: int = 6,
+                 stride: int = 1, use_se: bool = False):
+        super().__init__()
+        mid = in_ch * expand
+        layers = []
+        if expand != 1:
+            layers += [nn.Conv2d(in_ch, mid, 1, bias=False), _gn(mid), nn.ReLU6()]
+        layers += [
+            nn.Conv2d(mid, mid, 3, stride=stride, padding=1, groups=mid, bias=False),
+            _gn(mid), nn.ReLU6(),
+        ]
+        if use_se:
+            layers.append(_SEBlock(mid))
+        layers += [nn.Conv2d(mid, out_ch, 1, bias=False), _gn(out_ch)]
+        self.conv = nn.Sequential(*layers)
+        self.skip = (stride == 1 and in_ch == out_ch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.conv(x) if self.skip else self.conv(x)
 
 
 class ImpalaNetV2(nn.Module):
@@ -448,16 +460,14 @@ class ImpalaNetV2(nn.Module):
             _impala_stage_se(48, 96),
             _impala_stage_se(96, 96),
             nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
         )
 
-        with torch.no_grad():
-            dummy         = torch.zeros(1, in_channels, image_size, image_size)
-            flattened_dim = self.cnn(dummy).shape[1]
-
+        # After GlobalAvgPool the spatial dims collapse to 1×1, leaving 96-d.
+        # Linear(96→512) replaces the old Linear(11616→1024→512) — 13× fewer params.
         self.vis_proj = nn.Sequential(
-            nn.Linear(flattened_dim, 1024), nn.ReLU(),
-            nn.Linear(1024, 512),           nn.ReLU(),
+            nn.Linear(96, 512), nn.ReLU(),
         )
 
         self.ego_fc = nn.Sequential(
@@ -466,11 +476,8 @@ class ImpalaNetV2(nn.Module):
         )
 
         merged_dim = 512 + 32
-        self.steer_alpha_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        self.steer_beta_head   = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        self.throttle_mu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
-        self.throttle_nu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        nn.init.constant_(self.throttle_mu_head[-2].bias, -1.0)  # sigmoid(-1) ≈ 0.27, brake-biased
+        self.steer_head = nn.Sequential(nn.Linear(merged_dim, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh())
+        self.accel_head = nn.Sequential(nn.Linear(merged_dim, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh())
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         x = torch.cat([
@@ -482,19 +489,78 @@ class ImpalaNetV2(nn.Module):
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
-        steer_alpha = self.steer_alpha_head(merged) + 2.0
-        steer_beta  = self.steer_beta_head(merged)  + 2.0
-        mu = self.throttle_mu_head(merged)
-        nu = self.throttle_nu_head(merged) + 2.0
-        alpha = torch.cat([steer_alpha, mu * nu],           dim=1)
-        beta  = torch.cat([steer_beta,  (1.0 - mu) * nu],  dim=1)
-        return alpha, beta
+        return torch.cat([self.steer_head(merged), self.accel_head(merged)], dim=-1)
+
+
+class EfficientDrivingNet(nn.Module):
+    """
+    MobileNetV3-inspired driving policy encoder.  Use --arch efficient.
+
+    Stem (stride 2) → 4 MBConv stages → GlobalAvgPool → 512-d projection.
+    GroupNorm throughout — safe at batch_size=1 for RL rollouts.
+    SE attention on later stages improves channel re-weighting for depth cues.
+
+    ~490K parameters (vs ImpalaNet ~1.3M, ImpalaNetV2 ~950K).
+    Same 544-d merged feature (512 visual + 32 ego) as all other architectures;
+    compatible with ILActorCritic without any changes.
+
+    Stage config: (expand_ratio, out_ch, n_blocks, stride, use_se)
+    """
+
+    _STAGES = [
+        (1,  16, 1, 1, False),   # 42×42  — no expand, single block
+        (6,  32, 2, 2, False),   # 21×21
+        (6,  64, 2, 2, True),    # 11×11  — SE on later, richer stages
+        (6,  96, 2, 1, True),    # 11×11
+    ]
+
+    def __init__(self, in_channels: int = 4, out_dim: int = 2,
+                 ego_dim: int = EGO_DIM, p: float = 0.3, image_size: int = None):
+        super().__init__()
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, stride=2, padding=1, bias=False),
+            _gn(32), nn.ReLU6(),
+        )
+
+        blocks, ch = [], 32
+        for expand, out_ch, n_blocks, stride, use_se in self._STAGES:
+            for i in range(n_blocks):
+                blocks.append(_MBConv(ch, out_ch,
+                                      expand=expand,
+                                      stride=stride if i == 0 else 1,
+                                      use_se=use_se))
+                ch = out_ch
+        self.blocks = nn.Sequential(*blocks)
+
+        self.pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten())
+        self.vis_proj = nn.Sequential(nn.Linear(96, 512), nn.ReLU())
+
+        self.ego_fc = nn.Sequential(
+            nn.Linear(ego_dim, 64), nn.ReLU(),
+            nn.Linear(64, 32),      nn.ReLU(),
+        )
+
+        merged_dim = 512 + 32
+        self.steer_head = nn.Sequential(nn.Linear(merged_dim, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh())
+        self.accel_head = nn.Sequential(nn.Linear(merged_dim, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh())
+
+    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
+        v = self.vis_proj(self.pool(self.blocks(self.stem(x))))
+        e = self.ego_fc(ego)
+        merged = torch.cat([v, e], dim=1)
+        if return_features:
+            return merged
+        return torch.cat([self.steer_head(merged), self.accel_head(merged)], dim=-1)
 
 
 def build_policy(arch: str = "simple", image_size: int = None) -> nn.Module:
-    """Factory: 'simple' → DrivingPolicyNet, 'impala' → ImpalaNet, 'impala_v2' → ImpalaNetV2."""
+    """Factory: 'simple' → DrivingPolicyNet, 'impala' → ImpalaNet,
+    'impala_v2' → ImpalaNetV2, 'efficient' → EfficientDrivingNet."""
     if arch == "impala":
         return ImpalaNet(image_size=image_size)
     if arch == "impala_v2":
         return ImpalaNetV2(image_size=image_size)
+    if arch == "efficient":
+        return EfficientDrivingNet(image_size=image_size)
     return DrivingPolicyNet(image_size=image_size)

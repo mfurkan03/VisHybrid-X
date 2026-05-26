@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from models import EGO_DIM
 from policy.datasets import MetaDriveRGBDataset, PrecomputedDepthDataset
-from policy.losses import (custom_driving_loss_beta, compute_offline_metrics,
+from policy.losses import (custom_driving_loss, compute_offline_metrics,
                            compute_predictive_metrics, compute_heading_metrics)
 from utils.checkpoints import save_checkpoint
 from utils.seed import worker_init_fn
@@ -292,24 +292,19 @@ def run_epoch(policy_model, loader, optimizer, device,
 
             actions_t  = torch.tensor(actions_np, dtype=torch.float32, device=device)
             ego_t      = torch.tensor(ego_np,     dtype=torch.float32, device=device)
-            # Map [-1,1] → [0,1]; clip raw MetaDrive actions that fall outside [-1,1]
-            actions_01 = ((actions_t.clamp(-1.0, 1.0) + 1.0) / 2.0)
 
             if is_train:
                 optimizer.zero_grad()
 
-            pred_alpha, pred_beta = policy_model(combined, ego_t)
-            loss = custom_driving_loss_beta(pred_alpha, pred_beta, actions_01)
+            pred = policy_model(combined, ego_t)
+            loss = custom_driving_loss(pred, actions_t)
 
             if is_train:
                 loss.backward()
                 optimizer.step()
 
             total_loss += loss.item()
-            with torch.no_grad():
-                mean_01    = pred_alpha / (pred_alpha + pred_beta)   # Beta mean; exact for throttle (= mu), close to mode for steer
-                pred_mean  = (mean_01 * 2.0 - 1.0).cpu().numpy()   # back to [-1, 1]
-            all_pred.append(pred_mean)
+            all_pred.append(pred.detach().cpu().numpy())
             all_true.append(actions_np)
             all_ego.append(ego_np)
             all_ego_full.append(ego_full_np)
