@@ -52,6 +52,7 @@ def _worker_collect(
     action_noise,
     visualize,
     num_cameras,
+    camera_fov,
     image_on_cuda,
     split_ratios,
     decision_repeat=1,
@@ -70,7 +71,7 @@ def _worker_collect(
     depth, action, and ego_state.
     """
 
-    angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(num_cameras)
+    angles, sensors, rgb_cam_names, depth_cam_names = build_cameras(num_cameras, fov=camera_fov)
 
     # Calculate global splits
     train_count = int(total_episodes * split_ratios[0])
@@ -286,6 +287,7 @@ def collect_expert_data_parallel(
     save_dir             = "dataset",
     visualize            = True,
     num_cameras          = 2,
+    camera_fov           = 60,
     action_noise         = 0.3,
     image_on_cuda        = True,
     split_ratios         = (0.8, 0.1, 0.1),
@@ -340,6 +342,7 @@ def collect_expert_data_parallel(
             action_noise,
             visualize,                  # visualize
             num_cameras,                # num_cameras
+            camera_fov,                 # camera_fov
             image_on_cuda,              # image_on_cuda
             split_ratios,               # split_ratios
             decision_repeat,            # decision_repeat
@@ -376,6 +379,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir",      type=str,  default="dataset")
     parser.add_argument("--start_seed",    type=int,  default=42)
     parser.add_argument("--num_cameras",   type=int,  default=1)
+    parser.add_argument("--camera_fov",    type=float, default=60,
+                        help="Camera horizontal FOV in degrees (default 60)")
     parser.add_argument("--act_noise",   type=float,  default=0.3)
     parser.add_argument("--no_vis",        action="store_true")
     parser.add_argument("--image_on_cuda",    action="store_true", default=False)
@@ -407,6 +412,7 @@ if __name__ == "__main__":
         save_every_n        = args.save_every_n,
         visualize           = not args.no_vis,
         num_cameras         = args.num_cameras,
+        camera_fov          = args.camera_fov,
         image_on_cuda       = args.image_on_cuda,
         poster_path         = args.poster,
         traffic_density_min = td_min,

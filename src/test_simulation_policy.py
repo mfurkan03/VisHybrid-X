@@ -47,6 +47,7 @@ def run_simulation(
     log_path:           str   = None,
     start_seed:         int   = 316181,
     map_config:         str   = None,
+    camera_fov:         float = 60,
 ):
     print("--- Online Evaluation (Simulation) ---")
     seed_everything(seed)
@@ -79,7 +80,7 @@ def run_simulation(
 
     depth_estimator = None if use_expert else DepthEstimationModel(finetuned_path=dpt_path)
 
-    angles, sensors, rgb_cam_names, _ = build_cameras(1)
+    angles, sensors, rgb_cam_names, _ = build_cameras(1, fov=camera_fov)
     rgb_name = rgb_cam_names[0]
 
     config = {
@@ -362,6 +363,8 @@ if __name__ == "__main__":
                              "S=Straight C=Curve T=TIntersection X=XIntersection. "
                              "Overrides seed-based procedural generation. "
                              "Recommended for 90-degree turn testing: 'STSTXTXTXT'")
+    parser.add_argument("--camera_fov", type=float, default=60,
+                        help="Camera horizontal FOV in degrees (default 60)")
     args = parser.parse_args()
     if args.arch != "expert" and args.model_path is None:
         parser.error("--model_path is required unless --arch expert")
@@ -381,4 +384,5 @@ if __name__ == "__main__":
         log_path            = args.log_path,
         start_seed          = args.start_seed,
         map_config          = args.map_config,
+        camera_fov          = args.camera_fov,
     )

@@ -13,13 +13,14 @@ from metadrive.component.sensors.depth_camera import DepthCamera
 # ============================================================
 # CAMERA BUILDER
 # ============================================================
-def create_surround_camera(name: str, angle_degree: float, camera_class):
+def create_surround_camera(name: str, angle_degree: float, camera_class, fov: float = 60):
     """Return a camera class rotated to the given angle around the vehicle."""
 
     class CustomCam(camera_class):
         def __init__(self, width, height, engine, *, cuda=False):
             super().__init__(width, height, engine, cuda=cuda)
             self._angle = angle_degree
+            self.lens.setFov(fov)
 
         def perceive(self, to_float=True, new_parent_node=None, position=None, hpr=None):
             if new_parent_node is not None:
@@ -37,7 +38,7 @@ def create_surround_camera(name: str, angle_degree: float, camera_class):
     return CustomCam
 
 
-def build_cameras(num_cameras: int):
+def build_cameras(num_cameras: int, fov: float = 60):
     """Return (angles, sensors_dict, rgb_cam_names, depth_cam_names)."""
     angles          = [round(i * 360 / num_cameras) for i in range(num_cameras)]
     sensors         = {}
@@ -47,8 +48,8 @@ def build_cameras(num_cameras: int):
     for angle in angles:
         rgb_name   = f"cam_{angle}"
         depth_name = f"depth_{angle}"
-        sensors[rgb_name]   = (create_surround_camera(f"Cam_{angle}",   angle, RGBCamera),   196, 196)
-        sensors[depth_name] = (create_surround_camera(f"Depth_{angle}", angle, DepthCamera), 196, 196)
+        sensors[rgb_name]   = (create_surround_camera(f"Cam_{angle}",   angle, RGBCamera,   fov=fov), 196, 196)
+        sensors[depth_name] = (create_surround_camera(f"Depth_{angle}", angle, DepthCamera, fov=fov), 196, 196)
         rgb_cam_names.append(rgb_name)
         depth_cam_names.append(depth_name)
 

@@ -130,6 +130,8 @@ def parse_args():
     p.add_argument("--arch",           type=str,   default="impala",
                    choices=["simple", "impala", "impala_v2"])
     p.add_argument("--image_size",     type=int,   default=84)
+    p.add_argument("--camera_fov",     type=float, default=60,
+                   help="Camera horizontal FOV in degrees (default 60)")
     p.add_argument("--n_envs",         type=int,   default=1,
                    help="Number of parallel env workers. 1=DummyVecEnv (no subprocess), "
                         "N>1=SubprocVecEnv. Total transitions/update = n_envs * rollout.")
@@ -220,6 +222,7 @@ def main():
             image_size=args.image_size,
             dpt_path=args.dpt_path,
             render=(args.render and i == 0),
+            camera_fov=args.camera_fov,
         )
         for i in range(n_envs)
     ]

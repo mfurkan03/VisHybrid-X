@@ -102,8 +102,9 @@ class MakeEnvFn:
     scenarios:  int
     reward_cfg: RewardConfig
     image_size: int
-    dpt_path:   str  = None   # ignored — workers never use DPT
-    render:     bool = False  # only meaningful for worker 0 / DummyVecEnv
+    dpt_path:   str   = None   # ignored — workers never use DPT
+    render:     bool  = False  # only meaningful for worker 0 / DummyVecEnv
+    camera_fov: float = 60
 
     def __call__(self):
         from rl.env_wrapper import MetaDriveRLWrapper
@@ -117,6 +118,7 @@ class MakeEnvFn:
             use_depth_model=False,
             image_size=self.image_size,
             render=self.render,
+            camera_fov=self.camera_fov,
         )
 
 

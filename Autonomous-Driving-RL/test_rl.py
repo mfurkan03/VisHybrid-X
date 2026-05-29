@@ -39,6 +39,8 @@ def parse_args():
     p.add_argument("--arch",          type=str, default="impala",
                    choices=["simple", "impala", "impala_v2"])
     p.add_argument("--image_size",    type=int, default=84)
+    p.add_argument("--camera_fov",    type=float, default=60,
+                   help="Camera horizontal FOV in degrees (default 60)")
     p.add_argument("--scenarios",     type=int, default=10)
     p.add_argument("--dpt_path",      type=str, default=None)
     p.add_argument("--render",        action="store_true", default=True)
@@ -95,6 +97,7 @@ def main():
         show_perception=args.render,
         image_size=args.image_size,
         dpt_path=args.dpt_path,
+        camera_fov=args.camera_fov,
     )
 
     print(f"\n{'='*60}")

@@ -62,6 +62,7 @@ class MetaDriveRLWrapper:
         dpt_path: str = None,
         use_depth_model: bool = True,
         render: bool = False,
+        camera_fov: float = 60,
     ):
         self.reward_cfg      = reward_cfg or RewardConfig()
         self.show_perception = show_perception
@@ -71,7 +72,7 @@ class MetaDriveRLWrapper:
         self.OBS_SHAPE       = (4, image_size, image_size)
 
         # Use the same camera rig as IL training so the model sees the same viewpoint.
-        _, il_sensors, rgb_cam_names, _ = build_cameras(1)
+        _, il_sensors, rgb_cam_names, _ = build_cameras(1, fov=camera_fov)
         self.rgb_name = rgb_cam_names[0]  # "cam_0"
 
         default_cfg = {
