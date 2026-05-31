@@ -92,7 +92,7 @@ class MetaDriveRLWrapper:
             "start_seed": 0,
             "num_scenarios": 50,
             "traffic_density": 0.1,
-            "decision_repeat": 5,
+            "decision_repeat": 1,
             "horizon": 400,
         }
         if env_config:

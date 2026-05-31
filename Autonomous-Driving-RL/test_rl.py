@@ -91,6 +91,8 @@ def main():
         "manual_control": False,
         "num_scenarios": args.scenarios,
         "start_seed": start_seed,
+        "decision_repeat": 1,
+        "horizon": 10000,
     }
     env = MetaDriveRLWrapper(
         env_config=env_config,
