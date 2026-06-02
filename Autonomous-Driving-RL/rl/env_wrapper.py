@@ -91,7 +91,7 @@ class MetaDriveRLWrapper:
             "image_on_cuda": False,
             "start_seed": 0,
             "num_scenarios": 50,
-            "traffic_density": 0.1,
+            "traffic_density": 0,
             "decision_repeat": 1,
             "horizon": 400,
         }
@@ -128,8 +128,8 @@ class MetaDriveRLWrapper:
     # ── Gym-like interface ────────────────────────────────────────────────────
 
     def reset(self, seed: int | None = None):
-        density = float(np.random.choice(self._TRAFFIC_DENSITY_LEVELS, p=self._TRAFFIC_DENSITY_PROBS))
-        self.env.config["traffic_density"] = density
+        # density = float(np.random.choice(self._TRAFFIC_DENSITY_LEVELS, p=self._TRAFFIC_DENSITY_PROBS))
+        # self.env.config["traffic_density"] = density
 
         kwargs = {} if seed is None else {"seed": seed}
         raw_obs, _ = self.env.reset(**kwargs)

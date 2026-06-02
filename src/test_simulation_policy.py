@@ -94,7 +94,7 @@ def run_simulation(
         "num_scenarios":     num_episodes,
         "horizon":           max_steps,
         "decision_repeat":   decision_repeat,   # MUST match the value used in generate_expert_dataset.py
-        "traffic_density":   0.15,
+        "traffic_density":   0.1,
     }
     if map_config is not None:
         # Override procedural map with a fixed block-string layout.

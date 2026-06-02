@@ -84,16 +84,17 @@ def main():
     policy.eval()
 
     # ── Environment ───────────────────────────────────────────────────────────
-    start_seed = 42
+    start_seed = 316181
     env_config = {
-        "use_render": args.render,
-        "show_interface": args.render,
-        "manual_control": False,
-        "num_scenarios": args.scenarios,
-        "start_seed": start_seed,
-        "decision_repeat": 1,
-        "horizon": 10000,
-    }
+    "use_render": args.render,
+    "show_interface": args.render,
+    "manual_control": False,
+    "num_scenarios": args.scenarios,
+    "start_seed": start_seed,
+    "decision_repeat": 1,
+    "horizon": 10000,
+    "traffic_density": 0.1,
+}
     env = MetaDriveRLWrapper(
         env_config=env_config,
         show_perception=args.render,
