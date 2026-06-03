@@ -113,7 +113,7 @@ def parse_args():
                    help="LR for value_head (random-init RL critic)")
     p.add_argument("--backbone_lr",    type=float, default=5e-6,
                    help="LR for the IL backbone (much lower to avoid forgetting)")
-    p.add_argument("--dist_head_lr",   type=float, default=3e-5,
+    p.add_argument("--dist_head_lr",   type=float, default=1e-5,
                    help="LR for Beta distribution heads (steer/throttle mu/nu). "
                         "Lower than value_head lr to prevent entropy collapse after warmup.")
     p.add_argument("--warmup_updates", type=int,   default=20,
@@ -121,12 +121,16 @@ def parse_args():
     p.add_argument("--rollout",        type=int,   default=2048,
                    help="Rollout steps *per env* per PPO update")
     p.add_argument("--batch",          type=int,   default=256)
-    p.add_argument("--epochs",         type=int,   default=10)
+    p.add_argument("--epochs",         type=int,   default=4)
     p.add_argument("--force_lr",        action="store_true",
                    help="Override LRs in restored optimizer state (use when resuming with new --lr / --backbone_lr)")
     p.add_argument("--target_kl",      type=float, default=0.05,
                    help="Per-epoch avg KL early-stopping threshold. 0=disabled. "
                         "~0.05 for IL->RL fine-tuning, ~0.01 for scratch PPO.")
+    p.add_argument("--entropy_coef",   type=float, default=0.03,
+                   help="Entropy bonus weight. 0.03 keeps exploration alive early; LOWER it "
+                        "(0.01) once reward plateaus and entropy is flat, so the policy can "
+                        "sharpen and exploit its learned driving (fewer off-road/crash failures).")
     p.add_argument("--arch",           type=str,   default="impala",
                    choices=["simple", "impala", "impala_v2"])
     p.add_argument("--image_size",     type=int,   default=84)
@@ -135,10 +139,17 @@ def parse_args():
                         "N>1=SubprocVecEnv. Total transitions/update = n_envs * rollout.")
     p.add_argument("--il_checkpoint",  type=str,   default=None,
                    help="Path to an IL training checkpoint to fine-tune from")
+    p.add_argument("--reset_mu_heads", action="store_true",
+                   help="Also zero the mu (action-mean) heads at PPO start, discarding the "
+                        "IL-learned steering/throttle means. Default OFF: preserve the IL means "
+                        "(e.g. the FiLM nav-conditioned steering) and only widen the nu spread so "
+                        "PPO warm-starts from the IL policy. Enable only for a weak IL base.")
     p.add_argument("--rl_checkpoint",  type=str,   default=None,
                    help="Path to a previous RL checkpoint to resume from")
-    p.add_argument("--dpt_path",       type=str,   default=None,
-                   help="Path to fine-tuned DPT weights (optional)")
+    p.add_argument("--dpt_path",       type=str,   default="../models/dpt_finetuned_ep17.pth",
+                   help="Fine-tuned DPT weights — MUST be the SAME checkpoint IL trained on. "
+                        "With default None the env silently used the BASE DepthAnythingV2, "
+                        "feeding the policy depth it never saw in IL.")
     p.add_argument("--render",         action="store_true")
     p.add_argument("--save_dir",       type=str,   default="models/rl")
     p.add_argument("--scenarios",      type=int,   default=50)
@@ -237,8 +248,9 @@ def main():
 
     if args.il_checkpoint and os.path.exists(args.il_checkpoint):
         policy.load_from_il_checkpoint(args.il_checkpoint, device)
-        # Reset nu heads to maximum entropy state before PPO fine-tuning
-        policy.reset_nu_heads_for_ppo()
+        # Widen nu heads for exploration; preserve the IL action means (mu) by
+        # default so the FiLM-conditioned steering is fine-tuned, not discarded.
+        policy.reset_nu_heads_for_ppo(reset_mu=args.reset_mu_heads)
     elif args.il_checkpoint:
         print(f"[WARNING] IL checkpoint not found: {args.il_checkpoint}")
 
@@ -352,6 +364,7 @@ def main():
         mini_batch_size=args.batch,
         lr=args.lr,
         total_timesteps=args.timesteps,
+        entropy_coef=args.entropy_coef,
         use_amp=args.amp and device.type == "cuda",
         target_kl=args.target_kl,
     )
@@ -366,6 +379,19 @@ def main():
     )
 
     os.makedirs(args.save_dir, exist_ok=True)
+
+    # ── Session marker in the persistent RL log ───────────────────────────────
+    import datetime as _dt
+    try:
+        _kind = "RESUME" if (args.rl_checkpoint and start_global_step > 0) else "START"
+        with open(os.path.join(args.save_dir, "rl-log.txt"), "a") as _logf:
+            _logf.write(
+                f"\n=== {_kind} {_dt.datetime.now():%Y-%m-%d %H:%M:%S} | "
+                f"arch={args.arch} envs={args.n_envs} from_step={start_global_step:,} "
+                f"target={args.timesteps:,} entropy_coef={args.entropy_coef} ===\n"
+            )
+    except Exception as _e:
+        print(f"[WARNING] could not write session marker to rl-log.txt: {_e}")
 
     # ── Training state ────────────────────────────────────────────────────────
     global_step       = start_global_step
@@ -569,13 +595,17 @@ def main():
                 _merged = policy._get_merged(_imgs_d, _egos_d)
                 _il = policy.il_model
                 _mu_s = _il.steer_mu_head(_merged)
-                _nu_s = torch.clamp(_il.steer_nu_head(_merged) + 2.0, 2.0, 10.0)
+                _nu_s = torch.clamp(_il.steer_nu_head(_merged) + 2.0, 2.0, 8.0)
                 _mu_t = _il.throttle_mu_head(_merged)
-                _nu_t = torch.clamp(_il.throttle_nu_head(_merged) + 2.0, 2.0, 10.0)
-                _mu_sc = _mu_s.clamp(1e-6, 1.0 - 1e-6)
-                _mu_tc = _mu_t.clamp(1e-6, 1.0 - 1e-6)
-                _ent_s = torch.distributions.Beta(_mu_sc * _nu_s, (1 - _mu_sc) * _nu_s).entropy()
-                _ent_t = torch.distributions.Beta(_mu_tc * _nu_t, (1 - _mu_tc) * _nu_t).entropy()
+                _nu_t = torch.clamp(_il.throttle_nu_head(_merged) + 2.0, 2.0, 8.0)
+                _mu_sc = _mu_s.clamp(0.02, 0.98)
+                _mu_tc = _mu_t.clamp(0.02, 0.98)
+                _a_s = (_mu_sc * _nu_s).clamp(0.5, 50.0)
+                _b_s = ((1 - _mu_sc) * _nu_s).clamp(0.5, 50.0)
+                _a_t = (_mu_tc * _nu_t).clamp(0.5, 50.0)
+                _b_t = ((1 - _mu_tc) * _nu_t).clamp(0.5, 50.0)
+                _ent_s = torch.distributions.Beta(_a_s, _b_s).entropy()
+                _ent_t = torch.distributions.Beta(_a_t, _b_t).entropy()
             print("\n" + "-" * 57)
             print(f"[DiagDist] steer_mu    mean={_mu_s.mean():.4f}  std={_mu_s.std():.4f}  min={_mu_s.min():.4f}  max={_mu_s.max():.4f}")
             print(f"[DiagDist] steer_nu    mean={_nu_s.mean():.4f}  max={_nu_s.max():.4f}")
@@ -584,7 +614,8 @@ def main():
             print(f"[DiagDist] entropy     steer={_ent_s.mean():.4f}  throttle={_ent_t.mean():.4f}  "
                   f"total={(_ent_s + _ent_t).mean():.4f}  (batch={_n}, before update {update_count + 1})")
             print("-" * 57 + "\n")
-            del _merged, _il, _mu_s, _nu_s, _mu_t, _nu_t, _mu_sc, _mu_tc, _ent_s, _ent_t
+            del _merged, _il, _mu_s, _nu_s, _mu_t, _nu_t, _mu_sc, _mu_tc
+            del _a_s, _b_s, _a_t, _b_t, _ent_s, _ent_t
             del _imgs_d, _egos_d
 
         # ── PPO update ────────────────────────────────────────────────────────
@@ -604,15 +635,17 @@ def main():
                   f"— CNN at lr={args.backbone_lr}, dist heads at lr={args.lr}.")
 
         elapsed = time.time() - start_time
-        fps     = global_step / max(elapsed, 1e-6)
+        # Count only steps done THIS session, else a resume divides the carried-over
+        # global_step by the short session time and reports a hugely inflated FPS.
+        fps     = (global_step - start_global_step) / max(elapsed, 1e-6)
 
         recent_rewards = episode_rewards[-20:] if episode_rewards else [0]
         avg_reward     = np.mean(recent_rewards)
         avg_length     = np.mean(episode_lengths[-20:]) if episode_lengths else 0
         avg_route      = np.mean(episode_routes[-20:])  if episode_routes  else 0
 
-        print(
-            f"\nUpdate {update_count:3d} | "
+        summary_line = (
+            f"Update {update_count:3d} | "
             f"Step {global_step:>8,}/{ppo_cfg.total_timesteps:,} | "
             f"FPS: {fps:.0f} | "
             f"Envs: {n_envs} | "
@@ -622,8 +655,17 @@ def main():
             f"P_loss: {losses['policy_loss']:.4f} | "
             f"V_loss: {losses['value_loss']:.4f} | "
             f"Entropy: {losses['entropy']:.4f} | "
-            f"KL: {losses['approx_kl']:.5f}\n"
+            f"KL: {losses['approx_kl']:.5f}"
         )
+        print(f"\n{summary_line}\n")
+
+        # Persist each finished update's summary to models/rl/rl-log.txt (append).
+        # Independent of any shell redirect, and free of the verbose episode/warning spam.
+        try:
+            with open(os.path.join(args.save_dir, "rl-log.txt"), "a") as _logf:
+                _logf.write(summary_line + "\n")
+        except Exception as _e:
+            print(f"[WARNING] could not append to rl-log.txt: {_e}")
         if wb_run is not None:
             wb_run.log({
                 "train/policy_loss":  losses["policy_loss"],

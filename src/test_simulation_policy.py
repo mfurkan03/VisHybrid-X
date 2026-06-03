@@ -40,7 +40,7 @@ def run_simulation(
     arch:               str   = "simple",
     always_lane_masked: bool  = False,
     seed:               int   = 42,
-    steer_momentum:     float = 0.0,
+    steer_momentum:     float = 0.5,
     no_render:          bool  = False,
     max_steps:          int   = 1000,
     decision_repeat:    int   = 5,
@@ -118,7 +118,7 @@ def run_simulation(
             "seed": seed,
             "decision_repeat": decision_repeat,
             "max_steps": max_steps,
-            "steer_momentum": steer_momentum,
+            "steer_ema_alpha": steer_momentum,
             "always_lane_masked": always_lane_masked,
         },
         "episodes": [],
@@ -179,7 +179,14 @@ def run_simulation(
                     alpha, beta = policy_model(combined_tensor, ego_t)
                     mean_01     = alpha / (alpha + beta)  # Beta mean; exact for throttle (= mu), close to mode for steer
                     pred_action = (mean_01 * 2.0 - 1.0).cpu().numpy()[0]
-                pred_action[0] = steer_momentum * last_steer + (1.0 - steer_momentum) * pred_action[0]
+
+                at_junction = bool(ego_reading.navi_left) or bool(ego_reading.navi_right)
+
+                # Disable EMA at junctions so turns execute at full speed.
+                # Smoothing a 0.8 steer command to 0.4→0.6→0.7 over 3 frames
+                # means the car is already wide before it commits to the turn.
+                ema = 0.0 if at_junction else steer_momentum
+                pred_action[0] = ema * last_steer + (1.0 - ema) * pred_action[0]
                 last_steer = float(pred_action[0])
 
                 if not no_render:
@@ -338,10 +345,10 @@ if __name__ == "__main__":
                         help="Force alpha=0 (fully lane-masked) during simulation")
     parser.add_argument("--seed", type=int, default=42,
                         help="Global random seed for reproducibility")
-    parser.add_argument("--steer_momentum", type=float, default=0.0,
-                        help="Steering low-pass filter (0=off, 0.35=moderate). "
-                             "Reduces jitter but does not fix directional ambiguity at "
-                             "intersections. Enable only if the retrained model still oscillates.")
+    parser.add_argument("--steer_momentum", type=float, default=0.5,
+                        help="Steering EMA weight on straight roads (0=off, 0.5=default). "
+                             "Automatically set to 0 at junctions so turns execute crisply. "
+                             "Raise toward 0.7 for more damping on straights.")
     parser.add_argument("--no_render", action="store_true",
                         help="Disable MetaDrive window and cv2 HUD (headless/server mode)")
     parser.add_argument("--max_steps", type=int, default=1000,

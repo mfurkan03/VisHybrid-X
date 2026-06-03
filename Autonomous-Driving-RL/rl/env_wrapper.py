@@ -80,7 +80,14 @@ class MetaDriveRLWrapper:
             # image_observation must be True — otherwise MetaDrive never
             # initialises the RGB sensor and the model runs blind.
             "image_observation": True,
-            "sensors": il_sensors,
+            # Pass ONLY the RGB camera, exactly like IL's test_simulation_policy.py.
+            # build_cameras() also returns MetaDrive's native depth camera, but we
+            # never read it — depth comes from DepthAnythingV2 on the RGB frame
+            # (self.depth_model). Including it makes MetaDrive instantiate a
+            # compute-shader depth sensor that crashes on offscreen init on some
+            # GPUs (Assertion _current_shader_context != nullptr in depth_camera.py),
+            # and it would not match IL's RGB-only rig anyway.
+            "sensors": {self.rgb_name: il_sensors[self.rgb_name]},
             "vehicle_config": {
                 "image_source": self.rgb_name,
                 "lidar": {"num_lasers": 0, "distance": 0},
@@ -91,8 +98,16 @@ class MetaDriveRLWrapper:
             "start_seed": 0,
             "num_scenarios": 50,
             "traffic_density": 0.1,
+            # decision_repeat=5 (frame-skip) for RL exploration. At dr=1 the policy
+            # re-samples ~100x/sec, so exploration noise makes the car JITTER in place
+            # instead of building forward speed — empirically it got stuck creeping
+            # (~10% route, speed ~0, standing-still firing) for 150k+ steps and never
+            # learned to drive. Holding each action 5 steps makes random exploration
+            # actually move the car, which is what lets PPO discover driving. The minor
+            # IL heading_delta miscalibration this introduces is re-learned in the
+            # first few PPO updates. (IL data was dr=1; this is an RL-only choice.)
             "decision_repeat": 5,
-            "horizon": 400,
+            "horizon": 400,   # 400 x dr5 = 2000 physics steps/episode; ~5 episodes per 2048 rollout
         }
         if env_config:
             default_cfg.update(env_config)
@@ -138,6 +153,30 @@ class MetaDriveRLWrapper:
         self._step_count  = 0
         return self._get_obs(raw_obs)
 
+    def _lead_vehicle_distance(self, max_dist: float = 30.0, lane_halfwidth: float = 3.0) -> float:
+        """Longitudinal distance (m) to the nearest vehicle ahead in roughly the same
+        lane — the dense signal for the proximity braking penalty. Returns max_dist
+        when the road ahead is clear. Read-only; uses object positions (no sensor)."""
+        try:
+            agent  = self.env.agent
+            ex, ey = agent.position
+            h      = agent.heading_theta
+            ch, sh = np.cos(h), np.sin(h)
+            from metadrive.component.vehicle.base_vehicle import BaseVehicle
+            nearest = max_dist
+            for obj in self.env.engine.get_objects(lambda o: isinstance(o, BaseVehicle)).values():
+                if obj is agent:
+                    continue
+                dx  = obj.position[0] - ex
+                dy  = obj.position[1] - ey
+                fwd = dx * ch + dy * sh          # longitudinal, ahead = positive
+                lat = -dx * sh + dy * ch         # lateral offset
+                if 0.0 < fwd < nearest and abs(lat) < lane_halfwidth:
+                    nearest = fwd
+            return float(nearest)
+        except Exception:
+            return max_dist
+
     def step(self, action: np.ndarray):
         raw_obs, _, terminated, truncated, info = self.env.step(action)
 
@@ -150,8 +189,9 @@ class MetaDriveRLWrapper:
         reward, reward_details = compute_reward(
             info, action, self._prev_route, speed, self.reward_cfg, self._prev_action,
             heading_diff=float(info.get("heading_diff", 0.0)),
+            front_dist=self._lead_vehicle_distance(),
         )
-        reward = float(np.clip(reward, -10.0, 10.0))
+        reward = float(np.clip(reward, -50.0, 10.0))
         self._prev_route  = info.get("route_completion", 0.0)
         self._prev_action = action.copy()
         self.last_steer   = float(action[0])

@@ -231,7 +231,7 @@ def _extract_navi(dataset, n: int) -> np.ndarray:
 
 def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_estimator,
                   seed: int = 0, nav_boost: float = 6.0, brake_boost: float = 1.0,
-                  turn_boost: float = 1.0):
+                  turn_boost: float = 1.0, recover_boost: float = 1.0):
     if use_precomputed:
         train_ds = PrecomputedDepthDataset(pred_dir=pred_dir, split="train")
         val_ds   = PrecomputedDepthDataset(pred_dir=pred_dir, split="val")
@@ -327,6 +327,36 @@ def build_loaders(use_precomputed: bool, pred_dir, data_dir, batch_size, depth_e
         share = weights[brake_active].sum() / weights.sum() * 100.0
         print(f"[INFO] Brake-aware sampler: {int(brake_active.sum())}/{len(weights)} braking "
               f"frames boosted {brake_boost:g}x → ~{share:.1f}% of sampled batches.")
+
+    # --- Stationary-recovery boost ----------------------------------------
+    # The IDM/PID expert almost never comes to a full stop, so "stopped, now
+    # pull away" frames are rare in the data.  Without them the policy never
+    # learns to re-accelerate from a standstill and gets permanently stuck once
+    # it has braked at a junction or behind a car (the reported "when the car
+    # stops it does not move again").  Upsample low-speed frames where the
+    # expert is on the throttle so re-acceleration is actually represented.
+    # speed lives in the 5-dim ego_full (idx 0) for precomputed data, or the
+    # model ego (idx 0) for raw RGB data.
+    if hasattr(train_ds, "ego_full_states") and len(train_ds.ego_full_states):
+        speed_arr = np.asarray(train_ds.ego_full_states, dtype=np.float32)[:, 0]
+    elif hasattr(train_ds, "ego_states") and len(train_ds.ego_states):
+        speed_arr = np.asarray(train_ds.ego_states, dtype=np.float32)[:, 0]
+    else:
+        speed_arr = None
+    if recover_boost > 1.0 and speed_arr is not None:
+        m = min(len(speed_arr), len(weights))
+        recover_mask = np.zeros(len(weights), dtype=bool)
+        recover_mask[:m] = (speed_arr[:m] < 0.15) & (actions_np[:m, 1] > 0.05)
+        if recover_mask.any():
+            weights[recover_mask] *= recover_boost
+            share = weights[recover_mask].sum() / weights.sum() * 100.0
+            print(f"[INFO] Recovery-boost sampler: {int(recover_mask.sum())}/{len(weights)} "
+                  f"low-speed+throttle frames (speed<0.15, accel>0.05) boosted {recover_boost:g}x "
+                  f"→ ~{share:.1f}% of sampled batches (teaches pull-away from a stop).")
+        else:
+            print("[WARNING] Recovery-boost sampler: no low-speed+throttle frames found — "
+                  "the expert never accelerates from near-stop in this data; the stuck-at-"
+                  "junction recovery can only be learned by RL or new stop-and-go demos.")
 
     sampler = WeightedRandomSampler(
         torch.tensor(weights, dtype=torch.float64),

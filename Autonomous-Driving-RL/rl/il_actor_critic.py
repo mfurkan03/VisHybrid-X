@@ -99,19 +99,22 @@ class ILActorCritic(nn.Module):
         """
         il = self.il_model
 
-        mu_s = il.steer_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)     # (B, 1)
-        # TODO: gradually relax max clamp (e.g. to 50.0) after ~100k PPO steps
-        nu_s = torch.clamp(il.steer_nu_head(merged) + 2.0, min=2.0, max=10.0)  # (B, 1)
+        # Mu clamp at [0.02, 0.98]: prevents degenerate Beta when IL-trained mu
+        # outputs near 0 or 1 (e.g. throttle_mu=0.999 → beta=0.003 → entropy=-11).
+        mu_s = il.steer_mu_head(merged).clamp(0.02, 0.98)             # (B, 1)
+        # Cap at 8: Beta(4,4) entropy ≈ -1.04, tight enough to exploit but wide enough to explore.
+        # At 20 entropy collapses to -2.0 (essentially deterministic), causing wobble.
+        nu_s = torch.clamp(il.steer_nu_head(merged) + 2.0, min=2.0, max=8.0)   # (B, 1)
 
-        mu_t = il.throttle_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)   # (B, 1)
-        nu_t = torch.clamp(il.throttle_nu_head(merged) + 2.0, min=2.0, max=10.0)  # (B, 1)
+        mu_t = il.throttle_mu_head(merged).clamp(0.02, 0.98)          # (B, 1)
+        nu_t = torch.clamp(il.throttle_nu_head(merged) + 2.0, min=2.0, max=8.0)   # (B, 1)
 
         alpha = torch.cat([mu_s * nu_s, mu_t * nu_t], dim=-1) * self.CONCENTRATION_SCALE  # (B, 2)
         beta  = torch.cat([(1.0 - mu_s) * nu_s, (1.0 - mu_t) * nu_t], dim=-1) * self.CONCENTRATION_SCALE  # (B, 2)
-        # Clamp concentration to [1e-4, 50]: prevents float32 lgamma overflow at high values
-        # and ensures Beta log_prob is numerically stable.
-        alpha = alpha.clamp(1e-4, 50.0)
-        beta  = beta.clamp(1e-4, 50.0)
+        # Floor at 0.5: ensures both concentration params are large enough for
+        # well-behaved Beta log_prob and entropy. Ceiling at 50 prevents lgamma overflow.
+        alpha = alpha.clamp(0.5, 50.0)
+        beta  = beta.clamp(0.5, 50.0)
         return Beta(alpha, beta)
 
     # ------------------------------------------------------------------
@@ -171,44 +174,44 @@ class ILActorCritic(nn.Module):
         return mean * 2.0 - 1.0        # (B, 2) in [-1, 1]
 
     # ------------------------------------------------------------------
-    def reset_nu_heads_for_ppo(self):
+    def reset_nu_heads_for_ppo(self, reset_mu: bool = False):
         """
-        Reset all nu heads to maximum-entropy state before PPO fine-tuning.
+        Reset the nu heads to a maximum-entropy state before PPO fine-tuning,
+        and (only if reset_mu=True) also reset the mu heads.
 
-        With the new mu/nu parameterization for both steer and throttle, this
-        is now clean and symmetric: nu heads control concentration only, mu
-        heads control direction only.
+        With the mu/nu parameterization the action *direction/mean* lives in mu
+        and the *concentration/spread* lives in nu.
 
-        Nu heads (steer_nu_head, throttle_nu_head)
-        -------------------------------------------
+        Nu heads (steer_nu_head, throttle_nu_head) — ALWAYS reset
+        ---------------------------------------------------------
         Reset to zeros: linear_output = 0 → Softplus(0) = ln(2) ≈ 0.693
         → nu = 2.693 (minimum reachable given the +2.0 floor).
-        Gives Beta(mu*2.69, (1-mu)*2.69) ≈ near-uniform, entropy ≈ -0.23.
+        Widens the Beta so PPO can explore around the current mean.
 
-        Mu heads (steer_mu_head, throttle_mu_head)
-        -------------------------------------------
-        Also reset to zeros: sigmoid(0) = 0.5 exactly for any input.
-        IL-learned directional knowledge is deliberately discarded here —
-        it was encoded in high concentration (nu >> 2), not in mu.  With
-        the old alpha/beta parameterization this was a problem; with mu/nu
-        the directional info lives in mu which PPO will re-learn quickly
-        from the backbone features (which ARE preserved).
+        Mu heads (steer_mu_head, throttle_mu_head) — reset ONLY if reset_mu=True
+        -----------------------------------------------------------------------
+        Zeroing the mu heads makes sigmoid(0)=0.5 for any input, which DISCARDS
+        the IL-learned action means.  For a WEAK IL base that can help PPO escape
+        a bad prior; for a GOOD base (e.g. the FiLM nav-conditioned model, where
+        the steering/lane-following and turn direction we want to keep ARE encoded
+        in mu) it throws away exactly what we are trying to fine-tune.
 
-        Expected state after reset
-        --------------------------
-          steer  : mu=0.50, nu=2.69 → Beta(1.35, 1.35), entropy ≈ -0.23
-          throttle: mu=0.50, nu=2.69 → Beta(1.35, 1.35), entropy ≈ -0.23
-          total entropy ≈ -0.46  (vs -8 before)
+        Default is therefore reset_mu=False: PRESERVE the IL means and only widen
+        the spread, so PPO warm-starts from the IL policy and explores around it
+        instead of re-learning steering from a 0.5 prior.  The FiLM conditioning
+        lives in the backbone `merged` (read via return_features) and is preserved
+        regardless.
         """
         il = self.il_model
-        print("[reset_nu_heads_for_ppo] Resetting all mu/nu heads to maximum-entropy state:")
+        mode = "nu+mu (discard IL means)" if reset_mu else "nu only (preserve IL means)"
+        print(f"[reset_nu_heads_for_ppo] Reset mode: {mode}")
 
         nu_heads = [("steer_nu_head",    il.steer_nu_head),
                     ("throttle_nu_head", il.throttle_nu_head)]
         mu_heads = [("steer_mu_head",    il.steer_mu_head),
                     ("throttle_mu_head", il.throttle_mu_head)]
 
-        for head_name, head in nu_heads + mu_heads:
+        for head_name, head in (nu_heads + mu_heads if reset_mu else nu_heads):
             last_linear = None
             for layer in head.modules():
                 if isinstance(layer, nn.Linear):

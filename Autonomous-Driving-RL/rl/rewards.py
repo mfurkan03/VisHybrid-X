@@ -15,21 +15,27 @@ class RewardConfig:
 
     # Terminal penalties
     out_of_road_penalty: float = -20.0
-    crash_vehicle_penalty: float = -30.0
+    crash_vehicle_penalty: float = -50.0    # raised from -30: crashing must clearly cost more than
+                                            # briefly slowing/stopping, or the policy "drives through" lead cars
     crash_object_penalty: float = -20.0
 
     # Terminal rewards
     arrive_dest_bonus: float = 50.0
 
     # Continuous rewards / penalties
-    route_progress_scale: float = 10.0
+    route_progress_scale: float = 40.0      # raised 10->40: completing the route must DOMINATE the reward.
+                                            # At 10, 80% vs 50% route differed by only +3, so the policy had no
+                                            # incentive to finish and plateaued at "drive-around-then-fail" (~+20).
+                                            # At 40, full route = +40 (vs ~+30 dense), so finishing clearly wins.
+                                            # Spread per-step (route_delta x 40), so it stays under the +-10 clip.
     harsh_steering_threshold: float = 0.3   # |steer| below this is normal cornering, not penalized
     harsh_steering_weight: float = -0.1     # applied to excess above threshold, speed-scaled
-    steering_diff_penalty: float = -0.01    # sudden steer change, speed-scaled (reduced: was -0.2, too strongly discouraged exploration)
+    steering_diff_penalty: float = -0.03    # raised from -0.01: directly penalises the steering wobble (jerk), speed-scaled
     speed_scale_ref: float = 50.0           # km/h reference for speed-scaling steering penalties
     speed_bonus_weight: float = 0.1         # reduced from 0.3; was too strong and encouraged reckless speed
     speed_bonus_min: float = 3.0            # no bonus below this speed (km/h)
-    standing_still_penalty: float = -0.1    # softened from -0.3; was competing too hard vs. steering penalties
+    standing_still_penalty: float = -0.03   # softened from -0.1: braking for a lead car is legitimate and must
+                                            # not be punished harder than crashing; speed_bonus still rewards driving when clear
 
     # Heading alignment — fires every step, dense signal even when route_progress ≈ 0
     heading_alignment_weight: float = 0.03  # max reward per step when perfectly aligned with road
@@ -48,6 +54,14 @@ class RewardConfig:
     # passively (steer ≈ 0).
     lateral_suppression_steer: float = 0.15  # |steer| at which penalty is fully suppressed
 
+    # Forward proximity — the DENSE braking signal. Terminal crash penalty is clipped
+    # to -10 (see env_wrapper), so it can't teach braking on its own; this per-step
+    # penalty accumulates as the car approaches a lead vehicle, giving a gradient to
+    # slow down BEFORE the crash. Scaled by speed, so charging a close car is worst and
+    # braking (which drops speed) directly reduces it. ~0 when the road ahead is clear.
+    front_safe_dist: float = 15.0            # metres; start penalising a lead car closer than this
+    front_proximity_weight: float = -0.6     # per-step weight, x closeness(0..1) x speed_factor(0..1)
+
 
 def compute_reward(info: dict,
                    action,
@@ -55,7 +69,8 @@ def compute_reward(info: dict,
                    speed: float,
                    cfg: RewardConfig = None,
                    prev_action=None,
-                   heading_diff: float = 0.0) -> tuple[float, dict]:
+                   heading_diff: float = 0.0,
+                   front_dist: float = 100.0) -> tuple[float, dict]:
     """
     Toplam ödülü ve detaylı döküm sözlüğünü döndürür.
 
@@ -149,6 +164,16 @@ def compute_reward(info: dict,
     align_reward = cfg.heading_alignment_weight * max(0.0, 1.0 - abs(heading_diff) / cfg.heading_alignment_max_diff)
     reward += align_reward
     details["heading_alignment"] = align_reward
+
+    # 12. Forward proximity — DENSE braking signal (the terminal crash penalty is
+    # clipped to -10, so it can't teach braking by itself). Penalty grows as the car
+    # gets closer to a lead vehicle and as it goes faster, so the gradient points to
+    # slow down before the crash; braking lowers speed_factor and directly relieves it.
+    if front_dist < cfg.front_safe_dist:
+        closeness = (cfg.front_safe_dist - front_dist) / cfg.front_safe_dist   # 0..1
+        prox_pen  = cfg.front_proximity_weight * closeness * speed_factor
+        reward   += prox_pen
+        details["front_proximity"] = prox_pen
 
     # ──────────────────────────────────────────────
     #  YENİ CEZA EKLEMEK İÇİN BURAYA YAZ

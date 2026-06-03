@@ -5,9 +5,9 @@ Public API
 ----------
 DepthEstimationModel   – DepthAnythingV2 wrapper (frozen or trainable)
 EgoReading             – NamedTuple snapshot from extract_ego_state()
-EGO_DIM                – number of dimensions fed to the policy network (5)
+EGO_DIM                – number of dimensions fed to the policy network (6)
 EGO_MOTION_DIM         – motion-only ego dims stored on disk (3)
-NAVI_DIM               – navigation-command dims (2: [left, right] one-hot)
+NAVI_DIM               – navigation-command dims (3: [left, right, forward] one-hot)
 extract_ego_state()    – build EgoReading from a MetaDrive agent
 DrivingPolicyNet       – two-stream CNN + ego policy network
 DrivingPolicyNet2      – deeper variant with BatchNorm fusion head
@@ -103,39 +103,36 @@ class DepthEstimationModel:
 # ============================================================
 
 EGO_MOTION_DIM = 3  # [total_speed, last_steer, heading_delta] — stored on disk
-NAVI_DIM       = 2  # [navi_left, navi_right] one-hot turn command (forward = [0, 0])
-EGO_DIM        = EGO_MOTION_DIM + NAVI_DIM  # 5 — what the policy network actually receives
+NAVI_DIM       = 3  # [navi_left, navi_right, navi_forward] one-hot — forward is now explicit
+EGO_DIM        = EGO_MOTION_DIM + NAVI_DIM  # 6 — what the policy network actually receives
 
 
-def navigation_command_onehot(agent) -> tuple[float, float]:
+def navigation_command_onehot(agent) -> tuple[float, float, float]:
     """
-    Return the upcoming turn command as a (navi_left, navi_right) one-hot.
+    Return the upcoming turn command as a (navi_left, navi_right, navi_forward) one-hot.
 
-        forward → (0.0, 0.0)
-        left    → (1.0, 0.0)
-        right   → (0.0, 1.0)
+        forward → (0.0, 0.0, 1.0)
+        left    → (1.0, 0.0, 0.0)
+        right   → (0.0, 1.0, 0.0)
 
-    Replicates MetaDrive's own navigation_command computation
-    (base_vehicle.before_step) from agent.navigation.navi_arrow_dir, so the
-    signal is identical to info["navigation_command"] without needing the
-    info dict. This is the conditional-imitation-learning command that tells
-    the policy which way to go at the next junction — information the camera
-    alone cannot provide.
+    The forward flag is explicit (not implicit zeros) so the nav branch
+    receives a non-zero signal even on straight roads, giving the model
+    a learnable representation for "go straight through this junction."
     """
     nav = getattr(agent, "navigation", None)
     arrow = getattr(nav, "navi_arrow_dir", None) if nav is not None else None
     if not arrow or len(arrow) < 2:
-        return 0.0, 0.0
+        return 0.0, 0.0, 1.0
 
     lane_0_heading, lane_1_heading = float(arrow[0]), float(arrow[1])
     diff = (lane_0_heading - lane_1_heading + np.pi) % (2 * np.pi) - np.pi
     if abs(diff) < (10.0 / 180.0 * math.pi):
-        return 0.0, 0.0  # straight / forward
+        return 0.0, 0.0, 1.0  # straight / forward
 
     dir_0 = np.array([math.cos(lane_0_heading), math.sin(lane_0_heading), 0.0])
     dir_1 = np.array([math.cos(lane_1_heading), math.sin(lane_1_heading), 0.0])
     turn_left = float(np.cross(dir_1, dir_0)[-1]) < 0.0
-    return (1.0, 0.0) if turn_left else (0.0, 1.0)
+    return (1.0, 0.0, 0.0) if turn_left else (0.0, 1.0, 0.0)
 
 
 class EgoReading(NamedTuple):
@@ -164,6 +161,7 @@ class EgoReading(NamedTuple):
     timestamp     : float
     navi_left     : float = 0.0
     navi_right    : float = 0.0
+    navi_forward  : float = 1.0   # default 1.0: no junction ahead = go forward
 
     @property
     def ego_motion(self) -> np.ndarray:
@@ -173,7 +171,7 @@ class EgoReading(NamedTuple):
     @property
     def ego_nav(self) -> np.ndarray:
         """Navigation-command slice (NAVI_DIM,) — stored separately as `navi_state`."""
-        return np.array([self.navi_left, self.navi_right], dtype=np.float32)
+        return np.array([self.navi_left, self.navi_right, self.navi_forward], dtype=np.float32)
 
     @property
     def ego_model(self) -> np.ndarray:
@@ -203,7 +201,7 @@ def extract_ego_state(agent, last_steer: float = 0.0) -> EgoReading:
     heading_delta   = (heading_delta + np.pi) % (2 * np.pi) - np.pi
     agent._prev_heading = current_heading
 
-    navi_left, navi_right = navigation_command_onehot(agent)
+    navi_left, navi_right, navi_forward = navigation_command_onehot(agent)
 
     return EgoReading(
         total_speed   = float(np.clip(total_speed_raw / 30.0, 0.0, 1.0)),
@@ -214,6 +212,7 @@ def extract_ego_state(agent, last_steer: float = 0.0) -> EgoReading:
         timestamp     = timestamp,
         navi_left     = navi_left,
         navi_right    = navi_right,
+        navi_forward  = navi_forward,
     )
 
 # ============================================================
@@ -242,7 +241,7 @@ class _EgoNavEncoder(nn.Module):
     """
 
     def __init__(self, ego_dim: int = EGO_DIM, motion_out: int = 32,
-                 nav_out: int = 16, motion_p: float = 0.0):
+                 nav_out: int = 64, motion_p: float = 0.0):
         super().__init__()
         self.motion_dim = EGO_MOTION_DIM
         self.nav_dim    = ego_dim - EGO_MOTION_DIM
@@ -255,9 +254,11 @@ class _EgoNavEncoder(nn.Module):
 
         # No dropout on the nav branch: zeroing the single active unit of a
         # sparse one-hot would destroy the command we are trying to amplify.
+        # nav_out=64 so nav features are ~10% of merged (vs 2.9% at 16) —
+        # prevents visual features from completely drowning out the turn command.
         self.nav_fc = nn.Sequential(
-            nn.Linear(self.nav_dim, 32), nn.ReLU(),
-            nn.Linear(32, nav_out),      nn.ReLU(),
+            nn.Linear(self.nav_dim, 64), nn.ReLU(),
+            nn.Linear(64, nav_out),      nn.ReLU(),
         )
         self.out_dim = motion_out + nav_out
 
@@ -265,6 +266,52 @@ class _EgoNavEncoder(nn.Module):
         motion = ego[:, :self.motion_dim]
         nav    = ego[:, self.motion_dim:]
         return torch.cat([self.motion_fc(motion), self.nav_fc(nav)], dim=1)
+
+
+class _NavFiLM(nn.Module):
+    """
+    Feature-wise Linear Modulation (FiLM) conditioned on the nav command.
+
+    The recurring conditioning failure is that the 512-d visual feature
+    dominates the steer head, so the sparse turn command is averaged away and
+    the policy follows the *current* lane straight through every junction —
+    "lane following is perfect, but it turns too late / the wrong way."
+
+    An ADDITIVE nav signal (concatenated nav features, or the old additive
+    `nav_steer_skip` bias) can only PUSH against the visual prediction; it
+    cannot SUPPRESS it, so a confident straight-ahead visual reading wins.
+    FiLM instead multiplies the merged feature by a per-command gain (gamma)
+    and adds a per-command shift (beta):
+
+        merged' = (1 + gamma(nav)) * merged + beta(nav)
+
+    so the 'left'/'right' commands can actively gate DOWN the straight-ahead
+    visual evidence and inject a turn — conditioning the visual stream cannot
+    wash out (Perez et al. 2018, "FiLM: Visual Reasoning with a General
+    Conditioning Layer").
+
+    Applied to `merged` *before* the heads and before the `return_features`
+    return point, so the conditioning is baked into the shared representation
+    that BOTH the IL heads and the RL value/policy heads read — unlike the old
+    additive skip, which the RL path silently ignored.
+
+    Initialised to identity (gamma=0, beta=0 → merged unchanged) so a freshly
+    built model behaves exactly like the un-modulated one; training moves it
+    away from identity only where the command actually matters.
+    """
+
+    def __init__(self, feat_dim: int, nav_dim: int = NAVI_DIM, hidden: int = 64):
+        super().__init__()
+        self.gamma = nn.Sequential(
+            nn.Linear(nav_dim, hidden), nn.ReLU(), nn.Linear(hidden, feat_dim))
+        self.beta = nn.Sequential(
+            nn.Linear(nav_dim, hidden), nn.ReLU(), nn.Linear(hidden, feat_dim))
+        # Identity init: zero the final layers so gamma=0, beta=0 at start.
+        nn.init.zeros_(self.gamma[-1].weight); nn.init.zeros_(self.gamma[-1].bias)
+        nn.init.zeros_(self.beta[-1].weight);  nn.init.zeros_(self.beta[-1].bias)
+
+    def forward(self, merged: torch.Tensor, nav_raw: torch.Tensor) -> torch.Tensor:
+        return merged * (1.0 + self.gamma(nav_raw)) + self.beta(nav_raw)
 
 
 class DrivingPolicyNet(nn.Module):
@@ -298,12 +345,14 @@ class DrivingPolicyNet(nn.Module):
 
         merged_dim      = 512 + self.ego_encoder.out_dim
         self.merged_dim = merged_dim   # exposed so the RL value head can size itself
+        # FiLM conditions the merged feature on the nav command (see _NavFiLM).
+        self.nav_film   = _NavFiLM(merged_dim)
         self.steer_mu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
         self.steer_nu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
         self.throttle_mu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
         self.throttle_nu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        nn.init.constant_(self.throttle_mu_head[-2].bias, -1.0)  # sigmoid(-1) ≈ 0.27, brake-biased
-        # steer_mu_head: default bias=0 → sigmoid(0)=0.5 = neutral steer, correct starting point
+        # throttle bias=0 → sigmoid(0)=0.5 → action 0.0 (coast). Neutral start;
+        # training learns the actual throttle behavior without fighting a braking prior.
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         v = F.relu(self.conv1(x))
@@ -314,6 +363,7 @@ class DrivingPolicyNet(nn.Module):
         v = self.dropout_vis(v)
         e = self.ego_encoder(ego)
         merged = torch.cat([v, e], dim=1)
+        merged = self.nav_film(merged, ego[:, EGO_MOTION_DIM:])   # nav-conditioning baked in
         if return_features:
             return merged
         mu_s = self.steer_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)
@@ -398,13 +448,19 @@ class ImpalaNet(nn.Module):
         self.steer_nu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
         self.throttle_mu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
         self.throttle_nu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        nn.init.constant_(self.throttle_mu_head[-2].bias, -1.0)  # sigmoid(-1) ≈ 0.27, brake-biased
-        # steer_mu_head: default bias=0 → sigmoid(0)=0.5 = neutral steer, correct starting point
+        # throttle bias=0 → sigmoid(0)=0.5 → action 0.0 (coast). Neutral start;
+        # training learns the actual throttle behavior without fighting a braking prior.
+
+        # FiLM nav-conditioning (replaces the old additive nav_steer_skip, which
+        # the RL path ignored). Multiplicative gating can suppress the dominant
+        # straight-ahead visual evidence at junctions, not just push against it.
+        self.nav_film = _NavFiLM(merged_dim)
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         v = self.vis_proj(self.cnn(x))
         e = self.ego_encoder(ego)
         merged = torch.cat([v, e], dim=1)
+        merged = self.nav_film(merged, ego[:, EGO_MOTION_DIM:])   # nav-conditioning baked in
         if return_features:
             return merged
         mu_s = self.steer_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)
@@ -513,8 +569,14 @@ class ImpalaNetV2(nn.Module):
         self.steer_nu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
         self.throttle_mu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
         self.throttle_nu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        nn.init.constant_(self.throttle_mu_head[-2].bias, -1.0)  # sigmoid(-1) ≈ 0.27, brake-biased
-        # steer_mu_head: default bias=0 → sigmoid(0)=0.5 = neutral steer, correct starting point
+        # throttle bias=0 → sigmoid(0)=0.5 → action 0.0 (coast). Neutral start;
+        # training learns the actual throttle behavior without fighting a braking prior.
+
+        # FiLM nav-conditioning (replaces the old additive nav_steer_skip, which
+        # the RL path ignored). Multiplicative gating lets the 'left'/'right'
+        # command suppress the dominant straight-ahead visual evidence at a
+        # junction instead of merely adding a fixed bias the visual head can win.
+        self.nav_film = _NavFiLM(merged_dim)
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         x = torch.cat([
@@ -524,6 +586,7 @@ class ImpalaNetV2(nn.Module):
         v = self.vis_proj(self.cnn(x))
         e = self.ego_encoder(ego)
         merged = torch.cat([v, e], dim=1)
+        merged = self.nav_film(merged, ego[:, EGO_MOTION_DIM:])      # nav-conditioning baked in
         if return_features:
             return merged
         mu_s = self.steer_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)

@@ -125,7 +125,10 @@ def main():
         obs_ego = torch.from_numpy(ego).unsqueeze(0).to(device)
 
         with torch.inference_mode():
-            action_mean, _ = policy(obs_img, obs_ego)
+            # forward() returns (Beta dist, value); for a deterministic action we
+            # want the distribution MEAN mapped to [-1, 1] — act_deterministic does
+            # exactly that and matches how the IL sim test drives the policy.
+            action_mean = policy.act_deterministic(obs_img, obs_ego)
 
         action = np.clip(action_mean.squeeze(0).cpu().numpy(), -1.0, 1.0)
         obs, _, done, _ = env.step(action)

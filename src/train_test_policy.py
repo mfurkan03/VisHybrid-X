@@ -93,6 +93,7 @@ def train_policy(
     nav_boost: float = 6.0,
     brake_boost: float = 1.0,
     turn_boost: float = 1.0,
+    recover_boost: float = 1.0,
     coupling_weight: float = 0.0,
     coupling_steer_threshold: float = 0.3,
     prob_ego_noise: float = 0.0,
@@ -109,7 +110,7 @@ def train_policy(
     print(f"[INFO] {'Using PRECOMPUTED DPT from: ' + pred_dir if use_precomputed else 'Live DPT inference.'}")
     train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator,
                                              seed=seed, nav_boost=nav_boost, brake_boost=brake_boost,
-                                             turn_boost=turn_boost)
+                                             turn_boost=turn_boost, recover_boost=recover_boost)
 
     policy_model = build_policy(arch, image_size).to(device)
     optimizer    = optim.AdamW(policy_model.parameters(), lr=lr)
@@ -167,6 +168,7 @@ def finetune_policy(
     nav_boost: float = 6.0,
     brake_boost: float = 1.0,
     turn_boost: float = 1.0,
+    recover_boost: float = 1.0,
     coupling_weight: float = 0.0,
     coupling_steer_threshold: float = 0.3,
     prob_ego_noise: float = 0.0,
@@ -193,7 +195,7 @@ def finetune_policy(
 
     train_loader, val_loader = build_loaders(use_precomputed, pred_dir, data_dir, batch_size, depth_estimator,
                                              seed=seed, nav_boost=nav_boost, brake_boost=brake_boost,
-                                             turn_boost=turn_boost)
+                                             turn_boost=turn_boost, recover_boost=recover_boost)
 
     policy_model = build_policy(arch, image_size).to(device)
     if freeze_bb:
@@ -418,6 +420,12 @@ if __name__ == "__main__":
                              "Recommended: 3.0. Raises their share of sampled batches so the loss "
                              "gradient on corners is not washed out by straight-line majority. "
                              "(1.0=off, no change to sampler)")
+    parser.add_argument("--recover_boost", type=float, default=1.0,
+                        help="Multiplicative sampling boost for low-speed frames where the expert "
+                             "is on the throttle (speed<0.15, accel>0.05). Teaches the policy to "
+                             "pull away from a standstill so it does not get permanently stuck "
+                             "after braking at a junction or behind a car. Recommended: 4.0 "
+                             "(1.0=off).")
     parser.add_argument("--aug_ego_noise", type=float, default=0.0,
                         help="Probability [0-1] of adding Gaussian noise to the ego state "
                              "(speed, last_steer, heading_delta) per sample during training. "
@@ -468,6 +476,7 @@ if __name__ == "__main__":
                          nav_boost=args.nav_boost,
                          brake_boost=args.brake_boost,
                          turn_boost=args.turn_boost,
+                         recover_boost=args.recover_boost,
                          coupling_weight=args.coupling_weight,
                          coupling_steer_threshold=args.coupling_steer_threshold,
                          prob_ego_noise=args.aug_ego_noise,
@@ -507,6 +516,7 @@ if __name__ == "__main__":
                 nav_boost=args.nav_boost,
                 brake_boost=args.brake_boost,
                 turn_boost=args.turn_boost,
+                recover_boost=args.recover_boost,
                 coupling_weight=args.coupling_weight,
                 coupling_steer_threshold=args.coupling_steer_threshold,
                 prob_ego_noise=args.aug_ego_noise,

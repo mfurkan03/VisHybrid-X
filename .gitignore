@@ -16,3 +16,6 @@ visualizations/*
 wandb
 rl_checkpoints/*
 logs/
+Autonomous-Driving-RL/models/*
+Autonomous-Driving-RL/rl/rl_train.log
+Autonomous-Driving-RL/rl_train.log
