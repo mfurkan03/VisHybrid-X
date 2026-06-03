@@ -136,8 +136,12 @@ class MetaDriveRLWrapper:
     # Approximate targets: ~86.9% → 0.1, ~10% → 0.3, ~2% → 0.6, ~1% → 1.0, ~0.1% → 0.0
     # Traffic density curriculum: low most of the time, rarely high.
     # Approximate targets: ~10% → 0.0, ~80% → 0.1, ~8% → 0.3, ~1.5% → 0.6, ~0.5% → 1.0
+    # Rebalanced so the car actually encounters lead vehicles: the old curriculum
+    # put 90% of episodes at density <=0.1, so the front_proximity braking signal
+    # (and crash_vehicle) fired ~never across 370k steps and braking could not be
+    # learned. Now ~65% of episodes have density >=0.3.
     _TRAFFIC_DENSITY_LEVELS = np.array([0.0, 0.1, 0.3, 0.6, 1.0], dtype=np.float32)
-    _TRAFFIC_DENSITY_PROBS  = np.array([0.10, 0.80, 0.08, 0.015, 0.005], dtype=np.float64)
+    _TRAFFIC_DENSITY_PROBS  = np.array([0.05, 0.30, 0.40, 0.20, 0.05], dtype=np.float64)
 
     # ── Gym-like interface ────────────────────────────────────────────────────
 

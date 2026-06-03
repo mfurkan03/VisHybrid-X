@@ -59,8 +59,12 @@ class RewardConfig:
     # penalty accumulates as the car approaches a lead vehicle, giving a gradient to
     # slow down BEFORE the crash. Scaled by speed, so charging a close car is worst and
     # braking (which drops speed) directly reduces it. ~0 when the road ahead is clear.
-    front_safe_dist: float = 15.0            # metres; start penalising a lead car closer than this
-    front_proximity_weight: float = -0.6     # per-step weight, x closeness(0..1) x speed_factor(0..1)
+    front_safe_dist: float = 25.0            # metres; start penalising a lead car closer than this
+                                             # (raised 15->25: with decision_repeat=5 the car needs a
+                                             #  longer runway to brake before it's too late)
+    front_proximity_weight: float = -1.2     # per-step weight, x closeness(0..1) x speed_factor(0..1)
+                                             # (raised -0.6->-1.2 so braking clearly beats the +0.1/step
+                                             #  speed bonus + route-progress reward for plowing forward)
 
 
 def compute_reward(info: dict,
