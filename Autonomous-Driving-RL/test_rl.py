@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import numpy as np
 import torch
+import cv2
 
 STUCK_SPEED    = 0.05   # normalized total_speed (0-1) below which the car is considered stationary
 STUCK_PATIENCE = 500    # consecutive steps below threshold before terminating
@@ -47,6 +48,14 @@ def parse_args():
     p.add_argument("--obs_ref",       type=str, default=None, metavar="PATH",
                    help="Reference JSON from train_rl.py --save_obs_ref. "
                         "Prints a match report after the test run.")
+    p.add_argument("--capture",       type=str, default=None, nargs="?", const="capture.mp4",
+                   metavar="PATH",
+                   help="Save the simulation render to an MP4 file (default: capture.mp4). "
+                        "Implicitly enables --render.")
+    p.add_argument("--capture_fps",   type=int, default=20,
+                   help="Output video frame rate (default: 20)")
+    p.add_argument("--seed",          type=int, default=316181,
+                   help="Starting seed for the first episode (default: 316181)")
     return p.parse_args()
 
 
@@ -83,8 +92,12 @@ def main():
 
     policy.eval()
 
+    capturing = args.capture is not None
+    if capturing:
+        args.render = True  # render required for frame capture
+
     # ── Environment ───────────────────────────────────────────────────────────
-    start_seed = 316181
+    start_seed = args.seed
     env_config = {
     "use_render": args.render,
     "show_interface": args.render,
@@ -93,7 +106,11 @@ def main():
     "start_seed": start_seed,
     "decision_repeat": 1,
     "horizon": 10000,
-    "traffic_density": 0.1,
+    "traffic_density": 0.01,
+    "debug": False,
+    "debug_physics_world": False,
+    "debug_static_world": False,
+    "show_coordinates": False,
 }
     env = MetaDriveRLWrapper(
         env_config=env_config,
@@ -102,6 +119,10 @@ def main():
         dpt_path=args.dpt_path,
         camera_fov=args.camera_fov,
     )
+
+    # ── Video writer ──────────────────────────────────────────────────────────
+    # Initialized lazily on the first captured frame (window not ready before reset)
+    video_writer = None
 
     print(f"\n{'='*60}")
     print(f"  RL Policy Test  ({args.scenarios} scenarios)")
@@ -135,6 +156,17 @@ def main():
                 action = policy.act_deterministic(obs_img, obs_ego).squeeze(0).cpu().numpy()
 
             obs, reward, done, info = env.step(action)
+
+            if capturing:
+                frame = env.get_render_frame()
+                if frame is not None:
+                    if video_writer is None:
+                        h, w = frame.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        video_writer = cv2.VideoWriter(args.capture, fourcc, args.capture_fps, (w, h))
+                        print(f"[Capture] Recording {w}×{h} @ {args.capture_fps} fps → {args.capture}")
+                    video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
             ep_reward  += reward
             step_count += 1
             steers.append(float(action[0]))
@@ -206,6 +238,9 @@ def main():
         print(f"\nError during test: {e}")
         raise
     finally:
+        if video_writer is not None:
+            video_writer.release()
+            print(f"[Capture] Saved → {args.capture}")
         env.close()
 
     if success_flags:

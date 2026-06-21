@@ -87,6 +87,10 @@ class MetaDriveRLWrapper:
                 "lidar": {"num_lasers": 0, "distance": 0},
                 "side_detector": {"num_lasers": 0},
                 "lane_line_detector": {"num_lasers": 0},
+                "show_navi_mark": False,
+                "show_dest_mark": False,
+                "show_line_to_dest": False,
+                "show_line_to_navi_mark": False,
             },
             "image_on_cuda": False,
             "start_seed": 0,
@@ -164,6 +168,35 @@ class MetaDriveRLWrapper:
         info["speed_km_h"]     = speed
 
         return obs, reward, done, info
+
+    def _setup_capture_texture(self):
+        """Attach a RTMCopyRam texture to the render window (called once after first reset)."""
+        from panda3d.core import Texture, GraphicsOutput
+        self._cap_tex = Texture("screen_capture")
+        self.env.engine.win.addRenderTexture(
+            self._cap_tex, GraphicsOutput.RTMCopyRam
+        )
+        self._cap_w = self.env.engine.win.getXSize()
+        self._cap_h = self.env.engine.win.getYSize()
+        self._cap_ready = True
+
+    def get_render_frame(self) -> np.ndarray | None:
+        """
+        Return the latest render as RGB (H, W, 3) uint8.
+        Uses a RTMCopyRam texture — Panda3D copies the framebuffer to RAM
+        automatically each render pass, so no synchronous GPU readback here.
+        """
+        try:
+            if not getattr(self, "_cap_ready", False):
+                self._setup_capture_texture()
+            data = self._cap_tex.getRamImageAs("RGB")
+            arr = np.frombuffer(data, dtype=np.uint8).reshape(
+                (self._cap_h, self._cap_w, 3)
+            )
+            return arr[::-1].copy()  # flip Y (OpenGL → image convention)
+        except Exception as e:
+            print(f"[Capture] Frame grab failed: {e}")
+            return None
 
     def close(self):
         self.env.close()
