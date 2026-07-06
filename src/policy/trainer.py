@@ -19,7 +19,7 @@ _TQDM_DISABLE = not sys.stderr.isatty()
 
 from models import EGO_DIM, EGO_MOTION_DIM, NAVI_DIM
 from policy.datasets import MetaDriveRGBDataset, PrecomputedDepthDataset
-from policy.losses import (custom_driving_loss_beta, speed_steer_coupling_loss,
+from policy.losses import (custom_driving_loss,
                            compute_offline_metrics,
                            compute_predictive_metrics, compute_heading_metrics)
 from utils.checkpoints import save_checkpoint
@@ -394,24 +394,14 @@ def run_epoch(policy_model, loader, optimizer, device,
                     ego_noise_std=ego_noise_std,
                 )
 
-            actions_t  = torch.tensor(actions_np, dtype=torch.float32, device=device)
+            actions_t  = torch.tensor(actions_np, dtype=torch.float32, device=device).clamp(-1.0, 1.0)
             ego_t      = torch.tensor(ego_np,     dtype=torch.float32, device=device)
-            # Map [-1,1] → [0,1]; clip raw MetaDrive actions that fall outside [-1,1]
-            actions_01 = ((actions_t.clamp(-1.0, 1.0) + 1.0) / 2.0)
 
             if is_train:
                 optimizer.zero_grad()
 
-            pred_alpha, pred_beta = policy_model(combined, ego_t)
-            loss = custom_driving_loss_beta(pred_alpha, pred_beta, actions_01,
-                                            turn_weight_scale=turn_weight_scale)
-
-            # P3: discourage accelerating through sharp predicted turns.
-            if coupling_weight > 0.0:
-                coupling = speed_steer_coupling_loss(
-                    pred_alpha, pred_beta, steer_threshold=coupling_steer_threshold)
-                loss = loss + coupling_weight * coupling
-                total_coupling += float(coupling.item())
+            pred = policy_model(combined, ego_t)
+            loss = custom_driving_loss(pred, actions_t)
 
             if is_train:
                 loss.backward()
@@ -419,8 +409,7 @@ def run_epoch(policy_model, loader, optimizer, device,
 
             total_loss += loss.item()
             with torch.no_grad():
-                mean_01    = pred_alpha / (pred_alpha + pred_beta)   # Beta mean; exact for throttle (= mu), close to mode for steer
-                pred_mean  = (mean_01 * 2.0 - 1.0).cpu().numpy()   # back to [-1, 1]
+                pred_mean = pred.cpu().numpy()
             all_pred.append(pred_mean)
             all_true.append(actions_np)
             all_ego.append(ego_np)
