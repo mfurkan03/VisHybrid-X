@@ -298,12 +298,10 @@ class DrivingPolicyNet(nn.Module):
 
         merged_dim      = 512 + self.ego_encoder.out_dim
         self.merged_dim = merged_dim   # exposed so the RL value head can size itself
-        self.steer_mu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
-        self.steer_nu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        self.throttle_mu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
-        self.throttle_nu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        nn.init.constant_(self.throttle_mu_head[-2].bias, -1.0)  # sigmoid(-1) ≈ 0.27, brake-biased
-        # steer_mu_head: default bias=0 → sigmoid(0)=0.5 = neutral steer, correct starting point
+        self.steer_head    = nn.Sequential(nn.Linear(merged_dim, 1), nn.Tanh())
+        self.throttle_head = nn.Sequential(nn.Linear(merged_dim, 1), nn.Tanh())
+        nn.init.constant_(self.throttle_head[-2].bias, -1.5)  # tanh(-1.5) ≈ -0.905, brake-biased
+        # steer_head: default bias=0 → tanh(0)=0.0 = neutral steer, correct starting point
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         v = F.relu(self.conv1(x))
@@ -316,13 +314,9 @@ class DrivingPolicyNet(nn.Module):
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
-        mu_s = self.steer_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)
-        nu_s = self.steer_nu_head(merged) + 2.0
-        mu_t = self.throttle_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)
-        nu_t = self.throttle_nu_head(merged) + 2.0
-        alpha = torch.cat([mu_s * nu_s, mu_t * nu_t], dim=1)
-        beta  = torch.cat([(1.0 - mu_s) * nu_s, (1.0 - mu_t) * nu_t], dim=1)
-        return alpha, beta
+        steer = self.steer_head(merged)
+        accel = self.throttle_head(merged)
+        return torch.cat([steer, accel], dim=1)
 
 class _ImpalaResBlock(nn.Module):
     """Pre-activation residual block used inside the IMPALA CNN."""
@@ -394,12 +388,10 @@ class ImpalaNet(nn.Module):
 
         merged_dim      = 512 + self.ego_encoder.out_dim
         self.merged_dim = merged_dim   # exposed so the RL value head can size itself
-        self.steer_mu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
-        self.steer_nu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        self.throttle_mu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
-        self.throttle_nu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        nn.init.constant_(self.throttle_mu_head[-2].bias, -1.0)  # sigmoid(-1) ≈ 0.27, brake-biased
-        # steer_mu_head: default bias=0 → sigmoid(0)=0.5 = neutral steer, correct starting point
+        self.steer_head    = nn.Sequential(nn.Linear(merged_dim, 1), nn.Tanh())
+        self.throttle_head = nn.Sequential(nn.Linear(merged_dim, 1), nn.Tanh())
+        nn.init.constant_(self.throttle_head[-2].bias, -1.5)  # tanh(-1.5) ≈ -0.905, brake-biased
+        # steer_head: default bias=0 → tanh(0)=0.0 = neutral steer, correct starting point
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         v = self.vis_proj(self.cnn(x))
@@ -407,13 +399,9 @@ class ImpalaNet(nn.Module):
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
-        mu_s = self.steer_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)
-        nu_s = self.steer_nu_head(merged) + 2.0
-        mu_t = self.throttle_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)
-        nu_t = self.throttle_nu_head(merged) + 2.0
-        alpha = torch.cat([mu_s * nu_s, mu_t * nu_t], dim=1)
-        beta  = torch.cat([(1.0 - mu_s) * nu_s, (1.0 - mu_t) * nu_t], dim=1)
-        return alpha, beta
+        steer = self.steer_head(merged)
+        accel = self.throttle_head(merged)
+        return torch.cat([steer, accel], dim=1)
 
 
 # ============================================================
@@ -509,12 +497,10 @@ class ImpalaNetV2(nn.Module):
 
         merged_dim      = 512 + self.ego_encoder.out_dim
         self.merged_dim = merged_dim   # exposed so the RL value head can size itself
-        self.steer_mu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
-        self.steer_nu_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        self.throttle_mu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Sigmoid())
-        self.throttle_nu_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
-        nn.init.constant_(self.throttle_mu_head[-2].bias, -1.0)  # sigmoid(-1) ≈ 0.27, brake-biased
-        # steer_mu_head: default bias=0 → sigmoid(0)=0.5 = neutral steer, correct starting point
+        self.steer_head    = nn.Sequential(nn.Linear(merged_dim, 1), nn.Tanh())
+        self.throttle_head = nn.Sequential(nn.Linear(merged_dim, 1), nn.Tanh())
+        nn.init.constant_(self.throttle_head[-2].bias, -1.5)  # tanh(-1.5) ≈ -0.905, brake-biased
+        # steer_head: default bias=0 → tanh(0)=0.0 = neutral steer, correct starting point
 
     def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
         x = torch.cat([
@@ -526,13 +512,9 @@ class ImpalaNetV2(nn.Module):
         merged = torch.cat([v, e], dim=1)
         if return_features:
             return merged
-        mu_s = self.steer_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)
-        nu_s = self.steer_nu_head(merged) + 2.0
-        mu_t = self.throttle_mu_head(merged).clamp(1e-6, 1.0 - 1e-6)
-        nu_t = self.throttle_nu_head(merged) + 2.0
-        alpha = torch.cat([mu_s * nu_s, mu_t * nu_t], dim=1)
-        beta  = torch.cat([(1.0 - mu_s) * nu_s, (1.0 - mu_t) * nu_t], dim=1)
-        return alpha, beta
+        steer = self.steer_head(merged)
+        accel = self.throttle_head(merged)
+        return torch.cat([steer, accel], dim=1)
 
 
 def build_policy(arch: str = "simple", image_size: int = None) -> nn.Module:
