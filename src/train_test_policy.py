@@ -59,7 +59,7 @@ def _curriculum_lr_lambda(fully_masked_epochs: int, total_epochs: int, eta_min_r
     return lr_lambda
 
 from policy.datasets import PrecomputedDepthDataset, MetaDriveRGBDataset
-from policy.losses import (custom_driving_loss_beta, compute_offline_metrics,
+from policy.losses import (custom_driving_loss, compute_offline_metrics,
                            compute_predictive_metrics, compute_heading_metrics)
 from policy.trainer import build_loaders, train_loop, extract_features_frozen
 from utils.checkpoints import (
@@ -317,11 +317,10 @@ def test_policy(
                                                       always_lane_masked=always_lane_masked)
                 ego_t       = torch.tensor(ego_np, dtype=torch.float32, device=device)
 
-            pred_alpha, pred_beta = policy_model(combined, ego_t)
-            actions_01 = (actions_t.clamp(-1.0, 1.0) + 1.0) / 2.0
-            test_loss += custom_driving_loss_beta(pred_alpha, pred_beta, actions_01).item()
-            mean_01    = pred_alpha / (pred_alpha + pred_beta)
-            pred_mean  = (mean_01 * 2.0 - 1.0).cpu().numpy()
+            pred = policy_model(combined, ego_t)
+            target = actions_t.clamp(-1.0, 1.0)
+            test_loss += custom_driving_loss(pred, target).item()
+            pred_mean = pred.cpu().numpy()
             test_pred.append(pred_mean)
             test_true.append(actions_np)
             test_ego.append(ego_np)
@@ -411,7 +410,7 @@ if __name__ == "__main__":
                              "OFF by default (1.0): it STACKS multiplicatively with the loss's "
                              "existing 3x brake weight, so e.g. 3.0 here gives ~9x braking "
                              "emphasis and starves the throttle head. Raise only if you also "
-                             "lower the brake_weight in custom_driving_loss_beta.")
+                             "lower the brake_weight in custom_driving_loss.")
     # Option-3 turn / ego-noise improvements
     parser.add_argument("--turn_boost", type=float, default=1.0,
                         help="Multiplicative sampling boost for sharp-turn frames (|steer|>=0.2). "
