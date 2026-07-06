@@ -114,8 +114,8 @@ def parse_args():
     p.add_argument("--backbone_lr",    type=float, default=5e-6,
                    help="LR for the IL backbone (much lower to avoid forgetting)")
     p.add_argument("--dist_head_lr",   type=float, default=3e-5,
-                   help="LR for Beta distribution heads (steer/throttle mu/nu). "
-                        "Lower than value_head lr to prevent entropy collapse after warmup.")
+                   help="LR for the steer/throttle regression heads (shared with IL). "
+                        "Lower than value_head lr so the fine-tuned mean doesn't drift too fast.")
     p.add_argument("--warmup_updates", type=int,   default=20,
                    help="Freeze backbone + action heads for this many PPO updates (critic-only warmup)")
     p.add_argument("--rollout",        type=int,   default=2048,
@@ -240,8 +240,6 @@ def main():
 
     if args.il_checkpoint and os.path.exists(args.il_checkpoint):
         policy.load_from_il_checkpoint(args.il_checkpoint, device)
-        # Reset nu heads to maximum entropy state before PPO fine-tuning
-        policy.reset_nu_heads_for_ppo()
     elif args.il_checkpoint:
         print(f"[WARNING] IL checkpoint not found: {args.il_checkpoint}")
 
@@ -287,10 +285,10 @@ def main():
 
     # Four LR groups:
     #   cnn_params       — CNN backbone + projection + ego MLP: backbone_lr (preserve visual features)
-    #   dist_head_params — Beta distribution heads: dist_head_lr (IL-trained, must update slowly
-    #                      to avoid entropy collapse; much lower than value_head lr)
+    #   dist_head_params — steer_head/throttle_head: dist_head_lr (IL-trained, must update slowly
+    #                      so the fine-tuned point estimate doesn't drift too fast)
     #   head_params      — value_head: lr (random init, must learn fast)
-    _DIST_HEAD_NAMES = {"steer_mu_head", "steer_nu_head", "throttle_mu_head", "throttle_nu_head"}
+    _DIST_HEAD_NAMES = {"steer_head", "throttle_head"}
     dist_head_params = []
     cnn_params       = []
     for name, param in policy.il_model.named_parameters():
@@ -456,8 +454,8 @@ def main():
             with torch.no_grad():
                 actions, log_probs, _, values = policy.get_action_and_value(imgs_t, egos_t)
 
-            actions_01  = actions.cpu().numpy()          # (k, 2) in [0, 1] — stored in buffer
-            actions_env = actions_01 * 2.0 - 1.0         # (k, 2) in [-1, 1] — sent to env
+            actions_raw = actions.cpu().numpy()          # (k, 2) unbounded — stored in buffer (exact log-prob)
+            actions_env = actions_raw.clip(-1.0, 1.0)    # (k, 2) in [-1, 1] — sent to env
 
             # ── Step the ready envs — done workers dispatch RESET immediately ─
             step_results = vec_env.step(ready, actions_env)
@@ -477,7 +475,7 @@ def main():
                 # Write directly into the (T, N, ...) buffer arrays by env index.
                 buffer.imgs[t, i]      = imgs_np[i]       # obs that produced the action
                 buffer.egos[t, i]      = egos[i]
-                buffer.actions[t, i]   = actions_01[k]
+                buffer.actions[t, i]   = actions_raw[k]
                 buffer.rewards[t, i]   = reward
                 buffer.dones[t, i]     = float(done)
                 buffer.log_probs[t, i] = log_probs[k].item()
@@ -571,23 +569,14 @@ def main():
             with torch.no_grad():
                 _merged = policy._get_merged(_imgs_d, _egos_d)
                 _il = policy.il_model
-                _mu_s = _il.steer_mu_head(_merged)
-                _nu_s = torch.clamp(_il.steer_nu_head(_merged) + 2.0, 2.0, 10.0)
-                _mu_t = _il.throttle_mu_head(_merged)
-                _nu_t = torch.clamp(_il.throttle_nu_head(_merged) + 2.0, 2.0, 10.0)
-                _mu_sc = _mu_s.clamp(1e-6, 1.0 - 1e-6)
-                _mu_tc = _mu_t.clamp(1e-6, 1.0 - 1e-6)
-                _ent_s = torch.distributions.Beta(_mu_sc * _nu_s, (1 - _mu_sc) * _nu_s).entropy()
-                _ent_t = torch.distributions.Beta(_mu_tc * _nu_t, (1 - _mu_tc) * _nu_t).entropy()
+                _mean_s = _il.steer_head(_merged)
+                _mean_t = _il.throttle_head(_merged)
             print("\n" + "-" * 57)
-            print(f"[DiagDist] steer_mu    mean={_mu_s.mean():.4f}  std={_mu_s.std():.4f}  min={_mu_s.min():.4f}  max={_mu_s.max():.4f}")
-            print(f"[DiagDist] steer_nu    mean={_nu_s.mean():.4f}  max={_nu_s.max():.4f}")
-            print(f"[DiagDist] throttle_mu mean={_mu_t.mean():.4f}  std={_mu_t.std():.4f}  min={_mu_t.min():.4f}  max={_mu_t.max():.4f}")
-            print(f"[DiagDist] throttle_nu mean={_nu_t.mean():.4f}  max={_nu_t.max():.4f}")
-            print(f"[DiagDist] entropy     steer={_ent_s.mean():.4f}  throttle={_ent_t.mean():.4f}  "
-                  f"total={(_ent_s + _ent_t).mean():.4f}  (batch={_n}, before update {update_count + 1})")
+            print(f"[DiagDist] steer_mean    mean={_mean_s.mean():.4f}  std={_mean_s.std():.4f}  min={_mean_s.min():.4f}  max={_mean_s.max():.4f}")
+            print(f"[DiagDist] throttle_mean mean={_mean_t.mean():.4f}  std={_mean_t.std():.4f}  min={_mean_t.min():.4f}  max={_mean_t.max():.4f}")
+            print(f"[DiagDist] fixed action_std = {policy.action_std.tolist()}  (before update {update_count + 1})")
             print("-" * 57 + "\n")
-            del _merged, _il, _mu_s, _nu_s, _mu_t, _nu_t, _mu_sc, _mu_tc, _ent_s, _ent_t
+            del _merged, _il, _mean_s, _mean_t
             del _imgs_d, _egos_d
 
         # ── PPO update ────────────────────────────────────────────────────────
