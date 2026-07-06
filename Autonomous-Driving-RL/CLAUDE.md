@@ -91,8 +91,9 @@ fixed-covariance Normal — IL's learned point estimate is preserved at RL
 start, and RL adds exploration noise on top via a fixed, non-learned std.
 Only `value_head` is new.
 
-LR groups: `backbone_params = il_model.*` (all IL weights including distribution heads) at `backbone_lr`;
-`head_params = value_head.*` at `lr`.
+LR groups: `cnn_params = il_model.*` minus distribution heads, at `backbone_lr` (preserve visual features);
+`dist_head_params = steer_head/throttle_head` at `dist_head_lr` (shared with IL, must move slowly);
+`head_params = value_head.*` at `lr` (random init, learn fast).
 
 - `load_from_il_checkpoint(path, device)` — loads `ckpt["model"]` with `strict=False`; value_head stays at random init (expected and correct)
 - `get_action_and_value(image, ego, action=None)` — for rollout (sample) or update (evaluate)

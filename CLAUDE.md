@@ -138,7 +138,7 @@ Ego input (`EGO_DIM=3`): `[total_speed, last_steer, heading_delta]` from `extrac
 
 ### ILActorCritic (`rl/il_actor_critic.py`)
 Wraps any IL policy as a PPO actor-critic without modifying the IL model:
-- **Actor**: reuses IL model's `steer_head` / `throttle_head` (or `fc_out` for `DrivingPolicyNet`)
+- **Actor**: reuses IL model's `steer_head` / `throttle_head`
 - **Critic**: new `value_head = Linear(544→128→ReLU→1)` — random init, not in IL checkpoint
 - **Distribution**: `Normal(action_mean, action_std)` where `action_std` is a fixed buffer `[0.05, 0.05]` (non-learned)
 - `load_from_il_checkpoint(path)`: loads `ckpt["model"]` into `self.il_model` with `strict=False`; prints matched/missing keys

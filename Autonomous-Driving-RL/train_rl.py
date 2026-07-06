@@ -283,7 +283,7 @@ def main():
             print("[W&B] wandb not installed — logging disabled. pip install wandb\n")
             wb_run = None
 
-    # Four LR groups:
+    # Three LR groups:
     #   cnn_params       — CNN backbone + projection + ego MLP: backbone_lr (preserve visual features)
     #   dist_head_params — steer_head/throttle_head: dist_head_lr (IL-trained, must update slowly
     #                      so the fine-tuned point estimate doesn't drift too fast)
