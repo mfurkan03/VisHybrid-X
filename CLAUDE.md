@@ -78,18 +78,21 @@ There is no traditional test suite. Evaluation happens either offline (metrics c
 
 ### Policy Networks (`src/models.py`)
 
-Three architectures, selected with `--arch`:
+Four architectures, selected with `--arch`:
 
 - **`DrivingPolicyNet`** (`--arch simple`) — plain 3-layer CNN (conv 8×8/4 → 4×4/2 → 3×3/1), single fusion head. Simpler but less expressive.
 - **`ImpalaNet`** (`--arch impala`) — IMPALA-style residual CNN, no BatchNorm. Three MaxPool stages (32→64→64 ch) with pre-activation residual blocks → 512-d shared visual feature. Dual output heads: `steer_head` and `throttle_head` each specialise from the shared visual representation.
 - **`ImpalaNetV2`** (`--arch impala_v2`) — Stronger IMPALA variant for better RGB handling. Wider stages (48→96→96 ch), SE (Squeeze-and-Excitation) channel attention in every res-block, deeper vis_proj (flat→1024→512), larger heads (256-d). RGB channels (1-3) are ImageNet-normalised inside `forward()`; depth channel (0) is left as-is.
+- **`ImpalaNetV2AB`** (`--arch impala_v2_ab`) — Same backbone as `ImpalaNetV2`, but steer/throttle each get `alpha_head`/`beta_head` (Softplus) producing `Beta(alpha, beta)` concentration parameters directly instead of a Tanh point estimate. `forward()` returns `(alpha, beta)` — each `(B, 2)` — instead of a single `(B, 2)` action tensor. Trained with `custom_driving_loss_beta` (Beta NLL); the point-estimate action used for metrics/inference is the distribution mean `alpha / (alpha + beta)` mapped from `[0,1]` back to `[-1,1]`. **IL-only** — not wired into the RL pipeline (`ILActorCritic` still assumes a single Tanh action per head).
 
-All three networks:
+`DrivingPolicyNet`, `ImpalaNet`, and `ImpalaNetV2` (the plain-regression architectures):
 - Accept **4-channel input** (depth + 3-ch RGB) at `image_size × image_size`
 - Fuse a 512-d visual feature with a 32-d ego-state feature → action output `[steering, accel/brake]` ∈ [-1, 1]
 - Use `build_policy(arch, image_size)` as the factory
 - Support `forward(x, ego, return_features=True)` to expose the 544-d merged feature vector for the RL critic (backwards-compatible; default is `False`)
 - IL training fits `steer_head`/`throttle_head` directly with a regression loss (`custom_driving_loss`, Smooth L1 + asymmetric braking penalty) — the model makes a plain point-estimate prediction, no learned distribution.
+
+`ImpalaNetV2AB` shares the same input/ego/`return_features` API but returns `(alpha, beta)` from `forward()` instead of an action tensor — callers (`trainer.py::run_epoch`, `train_test_policy.py::test_policy`, `test_simulation_policy.py`) branch on `isinstance(pred, tuple)` to pick the Beta-NLL loss and Beta-mean point estimate.
 
 Ego input (`EGO_DIM=3`): `[total_speed, last_steer, heading_delta]` from `extract_ego_state()`. Three additional fields (forward/lateral speed, timestamp) are logged in `ego_state_full` but not fed to the model.
 

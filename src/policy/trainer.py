@@ -19,7 +19,7 @@ _TQDM_DISABLE = not sys.stderr.isatty()
 
 from models import EGO_DIM, EGO_MOTION_DIM, NAVI_DIM
 from policy.datasets import MetaDriveRGBDataset, PrecomputedDepthDataset
-from policy.losses import (custom_driving_loss,
+from policy.losses import (custom_driving_loss, custom_driving_loss_beta,
                            compute_offline_metrics,
                            compute_predictive_metrics, compute_heading_metrics)
 from utils.checkpoints import save_checkpoint
@@ -401,7 +401,13 @@ def run_epoch(policy_model, loader, optimizer, device,
                 optimizer.zero_grad()
 
             pred = policy_model(combined, ego_t)
-            loss = custom_driving_loss(pred, actions_t)
+            if isinstance(pred, tuple):
+                alpha, beta = pred
+                actions_01  = (actions_t + 1.0) / 2.0
+                loss = custom_driving_loss_beta(alpha, beta, actions_01,
+                                                turn_weight_scale=turn_weight_scale)
+            else:
+                loss = custom_driving_loss(pred, actions_t)
 
             if is_train:
                 loss.backward()
@@ -409,7 +415,11 @@ def run_epoch(policy_model, loader, optimizer, device,
 
             total_loss += loss.item()
             with torch.no_grad():
-                pred_mean = pred.cpu().numpy()
+                if isinstance(pred, tuple):
+                    mean_01   = alpha / (alpha + beta)
+                    pred_mean = (mean_01 * 2.0 - 1.0).cpu().numpy()
+                else:
+                    pred_mean = pred.cpu().numpy()
             all_pred.append(pred_mean)
             all_true.append(actions_np)
             all_ego.append(ego_np)

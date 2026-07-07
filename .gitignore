@@ -16,3 +16,4 @@ visualizations/*
 wandb
 rl_checkpoints/*
 logs/
+docs/*

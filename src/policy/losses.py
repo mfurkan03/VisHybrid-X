@@ -6,6 +6,46 @@ import numpy as np
 import torch
 import torch.nn as nn
 from scipy.stats import pearsonr
+from torch.distributions import Beta
+
+
+def custom_driving_loss_beta(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    target_01: torch.Tensor,
+    turn_weight_scale: float = 1.5,
+) -> torch.Tensor:
+    """
+    NLL loss for Beta-distributed policy output (e.g. ImpalaNetV2AB).
+
+    alpha, beta : (B, 2) concentration parameters
+    target_01   : (B, 2) expert actions mapped to [0, 1]
+
+    Weighted the same way as custom_driving_loss:
+      - Turn weight : proportional to |steer| magnitude, scaled by turn_weight_scale
+      - 4x weight on braking events (accel_01 < 0.45 ↔ accel < -0.1)
+
+    turn_weight_scale: multiplier on the steer-magnitude penalty term.
+      Default 1.5 → max 2.5x on full lock.
+    """
+    # Clip to (0.01, 0.99) — not just 1e-6. Expert actions occasionally exceed
+    # [-1,1] (MetaDrive raw output); after (a+1)/2 mapping they land outside
+    # [0,1] and a 1e-6 clamp silently treats them as boundary samples, which
+    # produce NLL gradients much larger than interior ones.
+    t = target_01.clamp(0.01, 0.99)
+
+    dist = Beta(alpha, beta)
+    nll  = -dist.log_prob(t)                              # (B, 2), positive
+
+    steer_mag   = (t[:, 0] - 0.5).abs() * 2.0            # |steer| in [0,1]
+    turn_weight = 1.0 + turn_weight_scale * steer_mag
+    weighted    = nll.clone()
+    weighted[:, 0] = nll[:, 0] * turn_weight
+
+    brake_weight = 1.0 + (t[:, 1] < 0.45).float() * 3.0   # 4x on braking events (accel_01 < 0.45 ↔ accel < -0.1)
+    weighted[:, 1] = nll[:, 1] * brake_weight
+
+    return weighted.mean()
 
 
 def custom_driving_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

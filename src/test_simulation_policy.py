@@ -177,7 +177,13 @@ def run_simulation(
                 ego_t = torch.tensor(ego_reading.ego_model, dtype=torch.float32, device=device).unsqueeze(0)
 
                 with torch.no_grad():
-                    pred_action = policy_model(combined_tensor, ego_t).cpu().numpy()[0]
+                    out = policy_model(combined_tensor, ego_t)
+                    if isinstance(out, tuple):
+                        alpha, beta = out
+                        mean_01     = alpha / (alpha + beta)
+                        pred_action = (mean_01 * 2.0 - 1.0).cpu().numpy()[0]
+                    else:
+                        pred_action = out.cpu().numpy()[0]
                 pred_action[0] = steer_momentum * last_steer + (1.0 - steer_momentum) * pred_action[0]
                 last_steer = float(pred_action[0])
 
@@ -332,7 +338,7 @@ if __name__ == "__main__":
     parser.add_argument("--episodes",   type=int,   default=1)
     parser.add_argument("--image_size",         type=int,   default=84)
     parser.add_argument("--arch",               type=str,   default="simple",
-                        choices=["simple", "impala", "impala_v2", "expert"])
+                        choices=["simple", "impala", "impala_v2", "impala_v2_ab", "expert"])
     parser.add_argument("--always_lane_masked", action="store_true",
                         help="Force alpha=0 (fully lane-masked) during simulation")
     parser.add_argument("--seed", type=int, default=42,

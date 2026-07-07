@@ -517,10 +517,97 @@ class ImpalaNetV2(nn.Module):
         return torch.cat([steer, accel], dim=1)
 
 
+class ImpalaNetV2AB(nn.Module):
+    """
+    ImpalaNetV2 backbone with a Beta(alpha, beta) action head. Use --arch impala_v2_ab.
+
+    Same visual/ego backbone as ImpalaNetV2 (SE res-blocks, 48→96→96 stages,
+    ImageNet-normalised RGB). Instead of a single Tanh point estimate, each of
+    steer/throttle gets a pair of Softplus heads producing Beta distribution
+    concentration parameters directly (no mu/nu reparameterisation):
+
+        alpha = softplus(head_a(merged))
+        beta  = softplus(head_b(merged))
+
+    forward() returns (alpha, beta), each (B, 2) with columns [steer, throttle].
+    The Beta support is [0, 1]; callers map targets/predictions to/from [-1, 1]
+    via x_01 = (x + 1) / 2 and back via x = 2 * x_01 - 1 (see
+    policy/losses.py::custom_driving_loss_beta and the point-estimate mean
+    alpha / (alpha + beta) used wherever a single action is needed).
+
+    A 1e-3 floor is added to both alpha and beta purely so torch.distributions.
+    Beta never sees an exact zero concentration (log_prob would be -inf) — it
+    is a numerical-safety clamp, not a distribution-shape choice.
+
+    Same API as ImpalaNetV2 otherwise: forward(x, ego, return_features=True)
+    exposes the shared 544-d merged feature. No BatchNorm — safe at
+    batch_size=1 for RL rollouts (though this arch is IL-only; see
+    build_policy()).
+    """
+
+    _RGB_MEAN = [0.485, 0.456, 0.406]
+    _RGB_STD  = [0.229, 0.224, 0.225]
+    _CONC_EPS = 1e-3
+
+    def __init__(self, in_channels: int = 4, out_dim: int = 2,
+                 ego_dim: int = EGO_DIM, p: float = 0.3, image_size: int = None):
+        super().__init__()
+
+        self.register_buffer('rgb_mean', torch.tensor(self._RGB_MEAN).view(1, 3, 1, 1))
+        self.register_buffer('rgb_std',  torch.tensor(self._RGB_STD).view(1, 3, 1, 1))
+
+        self.cnn = nn.Sequential(
+            _impala_stage_se(in_channels, 48),
+            _impala_stage_se(48, 96),
+            _impala_stage_se(96, 96),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        with torch.no_grad():
+            dummy         = torch.zeros(1, in_channels, image_size, image_size)
+            flattened_dim = self.cnn(dummy).shape[1]
+
+        self.vis_proj = nn.Sequential(
+            nn.Linear(flattened_dim, 1024), nn.ReLU(),
+            nn.Linear(1024, 512),           nn.ReLU(),
+        )
+
+        self.ego_encoder = _EgoNavEncoder(ego_dim)
+
+        merged_dim      = 512 + self.ego_encoder.out_dim
+        self.merged_dim = merged_dim   # exposed so the RL value head can size itself
+        self.steer_alpha_head    = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
+        self.steer_beta_head     = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
+        self.throttle_alpha_head = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
+        self.throttle_beta_head  = nn.Sequential(nn.Linear(merged_dim, 1), nn.Softplus())
+        # Brake-biased prior: push throttle's beta up (mean = a/(a+b) shifts toward 0,
+        # i.e. toward -1/brake after the 2*mean-1 mapping) — mirrors the old
+        # throttle_mu_head bias trick without a mu head to bias directly.
+        nn.init.constant_(self.throttle_beta_head[-2].bias, 1.0)
+
+    def forward(self, x: torch.Tensor, ego: torch.Tensor, return_features: bool = False):
+        x = torch.cat([
+            x[:, :1],
+            (x[:, 1:] - self.rgb_mean) / self.rgb_std,
+        ], dim=1)
+        v = self.vis_proj(self.cnn(x))
+        e = self.ego_encoder(ego)
+        merged = torch.cat([v, e], dim=1)
+        if return_features:
+            return merged
+        alpha = torch.cat([self.steer_alpha_head(merged), self.throttle_alpha_head(merged)], dim=1) + self._CONC_EPS
+        beta  = torch.cat([self.steer_beta_head(merged),  self.throttle_beta_head(merged)],  dim=1) + self._CONC_EPS
+        return alpha, beta
+
+
 def build_policy(arch: str = "simple", image_size: int = None) -> nn.Module:
-    """Factory: 'simple' → DrivingPolicyNet, 'impala' → ImpalaNet, 'impala_v2' → ImpalaNetV2."""
+    """Factory: 'simple' → DrivingPolicyNet, 'impala' → ImpalaNet, 'impala_v2' → ImpalaNetV2,
+    'impala_v2_ab' → ImpalaNetV2AB (Beta-distribution head, IL only)."""
     if arch == "impala":
         return ImpalaNet(image_size=image_size)
     if arch == "impala_v2":
         return ImpalaNetV2(image_size=image_size)
+    if arch == "impala_v2_ab":
+        return ImpalaNetV2AB(image_size=image_size)
     return DrivingPolicyNet(image_size=image_size)

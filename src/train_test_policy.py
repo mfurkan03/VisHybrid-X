@@ -59,7 +59,8 @@ def _curriculum_lr_lambda(fully_masked_epochs: int, total_epochs: int, eta_min_r
     return lr_lambda
 
 from policy.datasets import PrecomputedDepthDataset, MetaDriveRGBDataset
-from policy.losses import (custom_driving_loss, compute_offline_metrics,
+from policy.losses import (custom_driving_loss, custom_driving_loss_beta,
+                           compute_offline_metrics,
                            compute_predictive_metrics, compute_heading_metrics)
 from policy.trainer import build_loaders, train_loop, extract_features_frozen
 from utils.checkpoints import (
@@ -254,6 +255,7 @@ def test_policy(
     arch: str = "simple",
     always_lane_masked: bool = False,
     seed: int = 42,
+    turn_weight_scale: float = 1.5,
 ):
     print("--- Phase 3: Offline Testing Driving Policy ---")
     seed_everything(seed)
@@ -319,8 +321,16 @@ def test_policy(
 
             pred = policy_model(combined, ego_t)
             target = actions_t.clamp(-1.0, 1.0)
-            test_loss += custom_driving_loss(pred, target).item()
-            pred_mean = pred.cpu().numpy()
+            if isinstance(pred, tuple):
+                alpha, beta = pred
+                target_01   = (target + 1.0) / 2.0
+                test_loss  += custom_driving_loss_beta(alpha, beta, target_01,
+                                                        turn_weight_scale=turn_weight_scale).item()
+                mean_01    = alpha / (alpha + beta)
+                pred_mean  = (mean_01 * 2.0 - 1.0).cpu().numpy()
+            else:
+                test_loss += custom_driving_loss(pred, target).item()
+                pred_mean = pred.cpu().numpy()
             test_pred.append(pred_mean)
             test_true.append(actions_np)
             test_ego.append(ego_np)
@@ -383,7 +393,8 @@ if __name__ == "__main__":
     parser.add_argument("--curriculum_epochs", type=int, default=30)
     parser.add_argument("--fully_masked_epochs", type=int, default=8)
     parser.add_argument("--image_size", type=int, default=84)
-    parser.add_argument("--arch", type=str, default="simple", choices=["simple", "impala", "impala_v2"])
+    parser.add_argument("--arch", type=str, default="simple",
+                        choices=["simple", "impala", "impala_v2", "impala_v2_ab"])
     parser.add_argument("--always_lane_masked", action="store_true",
                         help="Force alpha=0 (fully lane-masked) for every batch, skipping curriculum")
     parser.add_argument("--early_stopping_patience", type=int, default=8,
@@ -517,4 +528,5 @@ if __name__ == "__main__":
         test_policy(args.model_path, args.dpt_path, args.data_dir,
                     pred_dir=args.pred_dir,
                     image_size=args.image_size, arch=args.arch,
-                    always_lane_masked=args.always_lane_masked, seed=args.seed)
+                    always_lane_masked=args.always_lane_masked, seed=args.seed,
+                    turn_weight_scale=args.turn_weight_scale)
